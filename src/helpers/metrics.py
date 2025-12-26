@@ -10,6 +10,7 @@ import torch
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from src.helpers.preprocessing import create_exogene
 from sklearn.metrics import (
@@ -177,7 +178,8 @@ class REGmetrics:
 def eval_win_energy_aggregation(
     input_data_test,
     input_st_date_test,
-    model_trainer,
+    model,
+    device,
     scaler,
     metrics,
     window_size,
@@ -185,10 +187,10 @@ def eval_win_energy_aggregation(
     cosinbase=True,
     new_range=(-1, 1),
     mask_metric="test_metrics",
-    list_exo_variables=[],
+    list_exo_variables=None,
     threshold_small_values=0,
     use_temperature=False,
-    save_results=True,
+    log_dict=None,
 ):
     data_test = input_data_test.copy()
     st_date_test = input_st_date_test.copy()
@@ -205,7 +207,7 @@ def eval_win_energy_aggregation(
         true_ratio = []
         pred_ratio = []
 
-        for pdl in list_pdl_test:
+        for pdl in tqdm(list_pdl_test, desc=mask_metric + "_" + freq_agg, leave=False):
             tmp_st_date_test = st_date_test.loc[st_date_test["ID_PDL"] == pdl]
 
             list_index = tmp_st_date_test.index
@@ -251,7 +253,7 @@ def eval_win_energy_aggregation(
                             )
                         )
 
-                pred = model_trainer.model(input_seq.to(model_trainer.device))
+                pred = model(input_seq.to(device))
 
                 pred = scaler.inverse_transform_appliance(pred)
 
@@ -307,9 +309,10 @@ def eval_win_energy_aggregation(
 
             df = df_inst if not df.size else pd.concat((df, df_inst), axis=0)
 
-        model_trainer.log[mask_metric + "_" + freq_agg] = metrics(
-            np.array(true_app_power), np.array(pred_app_power)
-        )
+        if log_dict is not None:
+            log_dict[mask_metric + "_" + freq_agg] = metrics(
+                np.array(true_app_power), np.array(pred_app_power)
+            )
 
         true_ratio = np.nan_to_num(
             np.array(true_ratio, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
@@ -317,17 +320,15 @@ def eval_win_energy_aggregation(
         pred_ratio = np.nan_to_num(
             np.array(pred_ratio, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
         )
-        tmp_dict_ratio = metrics(true_ratio, pred_ratio)
+        if log_dict is not None:
+            tmp_dict_ratio = metrics(true_ratio, pred_ratio)
 
-        for name_m, values in tmp_dict_ratio.items():
-            tmp_dict_ratio[name_m] = values * 100
+            for name_m, values in tmp_dict_ratio.items():
+                tmp_dict_ratio[name_m] = values * 100
 
-        model_trainer.log[mask_metric + "_ratio_" + freq_agg] = tmp_dict_ratio
-        model_trainer.log[mask_metric + "_ratio_" + freq_agg]["True_Ratio"] = (
-            np.mean(np.array(true_ratio)) * 100
-        )
-
-    if save_results:
-        model_trainer.save()
+            log_dict[mask_metric + "_ratio_" + freq_agg] = tmp_dict_ratio
+            log_dict[mask_metric + "_ratio_" + freq_agg]["True_Ratio"] = (
+                np.mean(np.array(true_ratio)) * 100
+            )
 
     return

@@ -186,21 +186,21 @@ def launch_one_experiment(expes_config: OmegaConf):
     return launch_models_training(tuple_data, scaler, expes_config)
 
 
-def main(dataset, sampling_rate, window_size, appliance, name_model, seed):
+def main(dataset, sampling_rate, window_size, appliance, name_model, resume, no_final_eval):
     """
     Main function to load configuration, update it with parameters,
     and launch an experiment.
 
     Args:
-        dataset (str): Name of the dataset (UKDALE or REFIT).
-        sampling_rate (int): Selected sampling rate.
+        dataset (str): Name of the dataset (case-insensitive, e.g. UKDALE or REFIT).
+        sampling_rate (str): Selected sampling rate (case-insensitive, e.g. 30s, 1min).
         window_size (int or str): Size of the window (converted to int if possible not day, week or month).
-        appliance (str): Selected appliance.
-        name_model (str): Name of the model to use for the experiment.
-        seed (int): Random seed for reproducibility.
+        appliance (str): Selected appliance (case-insensitive).
+        name_model (str): Name of the model to use for the experiment (case-insensitive).
     """
 
-    # Attempt to convert window_size to int
+    seed = 42
+
     try:
         window_size = int(window_size)
     except ValueError:
@@ -209,92 +209,121 @@ def main(dataset, sampling_rate, window_size, appliance, name_model, seed):
             window_size,
         )
 
-    # Load configurations
     with open("configs/expes.yaml", "r") as f:
         expes_config = yaml.safe_load(f)
 
     with open("configs/datasets.yaml", "r") as f:
-        datasets_config = yaml.safe_load(f)
-
-        # Dataset name check
-        if dataset in datasets_config:
-            datasets_config = datasets_config[dataset]
-        else:
+        datasets_all = yaml.safe_load(f)
+        dataset_key_map = {k.lower(): k for k in datasets_all.keys()}
+        dataset_key = dataset_key_map.get(str(dataset).strip().lower())
+        if dataset_key is None:
+            available = ", ".join(sorted(datasets_all.keys()))
             raise ValueError(
-                "Dataset {} unknown. Only 'UKDALE' and 'REFIT' available.".format(
-                    dataset
+                "Dataset {} unknown. Available datasets (case-insensitive): {}. Use -h to see argument help.".format(
+                    dataset, available
                 )
             )
+        datasets_config = datasets_all[dataset_key]
 
     with open("configs/models.yaml", "r") as f:
         baselines_config = yaml.safe_load(f)
 
-        # Selected baseline check
-        if name_model in baselines_config:
-            expes_config.update(baselines_config[name_model])
-        else:
+        model_key_map = {k.lower(): k for k in baselines_config.keys()}
+        model_key = model_key_map.get(str(name_model).strip().lower())
+        if model_key is None:
+            available = ", ".join(sorted(baselines_config.keys()))
             raise ValueError(
-                "Model {} unknown. List of implemented baselines: {}".format(
-                    name_model, list(baselines_config.keys())
+                "Model {} unknown. Available models (case-insensitive): {}. Use -h to see argument help.".format(
+                    name_model, available
                 )
             )
+        expes_config.update(baselines_config[model_key])
 
-    # Selected appliance check
-    if appliance in datasets_config:
-        expes_config.update(datasets_config[appliance])
-    else:
+    appliance_key_map = {k.lower(): k for k in datasets_config.keys()}
+    appliance_key = appliance_key_map.get(str(appliance).strip().lower())
+    if appliance_key is None:
+        available = ", ".join(sorted(datasets_config.keys()))
         logging.error("Appliance '%s' not found in datasets_config.", appliance)
         raise ValueError(
-            "Appliance {} unknown. List of available appliances (for selected {} dataset): {}, ".format(
-                appliance, dataset, list(datasets_config.keys())
+            "Appliance {} unknown for dataset {}. Available appliances (case-insensitive): {}. Use -h to see argument help.".format(
+                appliance, dataset_key, available
             )
         )
+    expes_config.update(datasets_config[appliance_key])
 
-    # Display experiment config with passed parameters
+    sampling_rate = str(sampling_rate).strip().lower()
+
     logging.info("---- Run experiments with provided parameters ----")
-    logging.info("      Dataset: %s", dataset)
+    logging.info("      Dataset: %s", dataset_key)
     logging.info("      Sampling Rate: %s", sampling_rate)
     logging.info("      Window Size: %s", window_size)
-    logging.info("      Appliance : %s", appliance)
-    logging.info("      Model: %s", name_model)
+    logging.info("      Appliance : %s", appliance_key)
+    logging.info("      Model: %s", model_key)
     logging.info("      Seed: %s", seed)
     logging.info("--------------------------------------------------")
 
-    # Update experiment config with passed parameters
-    expes_config["dataset"] = dataset
-    expes_config["appliance"] = appliance
+    expes_config["dataset"] = dataset_key
+    expes_config["appliance"] = appliance_key
     expes_config["window_size"] = window_size
     expes_config["sampling_rate"] = sampling_rate
     expes_config["seed"] = seed
-    expes_config["name_model"] = name_model
+    expes_config["name_model"] = model_key
+    expes_config["resume"] = bool(resume)
+    expes_config["skip_final_eval"] = bool(no_final_eval)
 
-    # Create directories for results
     result_path = create_dir(expes_config["result_path"])
-    result_path = create_dir(f"{result_path}{dataset}_{appliance}_{sampling_rate}/")
+    result_path = create_dir(f"{result_path}{dataset_key}_{sampling_rate}/")
     result_path = create_dir(f"{result_path}{window_size}/")
 
-    # Cast to OmegaConf
     expes_config = OmegaConf.create(expes_config)
 
-    # Define the path to save experiment results
     expes_config.result_path = (
         f"{result_path}{expes_config.name_model}_{expes_config.seed}"
     )
 
-    # Launch experiments
+    if torch.cuda.is_available():
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
     launch_one_experiment(expes_config)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="NILMFormer Experiments.")
+    with open("configs/datasets.yaml", "r") as f:
+        _datasets_all = yaml.safe_load(f)
+    with open("configs/models.yaml", "r") as f:
+        _models_all = yaml.safe_load(f)
+    _dataset_choices = ", ".join(sorted(_datasets_all.keys()))
+    _model_choices = ", ".join(sorted(_models_all.keys()))
+    _appliance_hints = []
+    if "REFIT" in _datasets_all:
+        _appliance_hints.append(
+            "REFIT: " + ", ".join(sorted(_datasets_all["REFIT"].keys()))
+        )
+    if "UKDALE" in _datasets_all:
+        _appliance_hints.append(
+            "UKDALE: " + ", ".join(sorted(_datasets_all["UKDALE"].keys()))
+        )
+    _appliance_help = " | ".join(_appliance_hints) if _appliance_hints else ""
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "NILMFormer Experiments. Use -h to see valid options for each argument."
+        )
+    )
     parser.add_argument(
-        "--dataset", required=True, type=str, help="Dataset name (UKDALE or REFIT)."
+        "--dataset",
+        required=True,
+        type=str,
+        help="Dataset name (non-case-insensitive). Choices: {}.".format(_dataset_choices),
     )
     parser.add_argument(
         "--sampling_rate",
         required=True,
         type=str,
-        help="Sampling rate, e.g. '30s', '1min', '10min', etc.).",
+        help="Sampling rate (non-case-insensitive), e.g. '30s', '1min', '10min'.",
     )
     parser.add_argument(
         "--window_size",
@@ -306,13 +335,29 @@ if __name__ == "__main__":
         "--appliance",
         required=True,
         type=str,
-        help="Selected appliance, e.g., 'WashingMachine'.",
+        help=(
+            "Selected appliance (non-case-insensitive). Available by dataset: {}.".format(
+                _appliance_help
+            )
+        ),
     )
     parser.add_argument(
-        "--name_model", required=True, type=str, help="Name of the model for training."
+        "--name_model",
+        required=True,
+        type=str,
+        help="Name of the model for training (non-case-insensitive). Choices: {}.".format(
+            _model_choices
+        ),
     )
     parser.add_argument(
-        "--seed", required=True, type=int, help="Random seed for reproducibility."
+        "--resume",
+        action="store_true",
+        help="Resume training from existing checkpoint for the same experiment if available.",
+    )
+    parser.add_argument(
+        "--no_final_eval",
+        action="store_true",
+        help="Skip final full evaluation (keep visualization HTML only).",
     )
 
     args = parser.parse_args()
@@ -322,5 +367,6 @@ if __name__ == "__main__":
         window_size=args.window_size,
         appliance=args.appliance,
         name_model=args.name_model,
-        seed=args.seed,
+        resume=args.resume,
+        no_final_eval=args.no_final_eval,
     )

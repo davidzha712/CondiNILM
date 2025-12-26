@@ -4,8 +4,8 @@
 
 **CondiNILM: Feature-wise Modulated Multi-Task Learning for Non-Intrusive Load Monitoring**
 
-Research codebase by **Siyi Li**  
-M.Sc. Thesis · TU Braunschweig  
+Research codebase by ** **  
+
 
 ![Python](https://img.shields.io/badge/Python-3.9%20|%203.10%20|%203.11-blue)
 

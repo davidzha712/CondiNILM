@@ -247,10 +247,8 @@ NILMFormer:
     low: 4
     high: 16
   batch_size:
-    type: int
-    low: 32
-    high: 256
-    step: 32
+    type: categorical
+    choices: [128, 256, 512]
   epochs:
     type: int
     low: 3

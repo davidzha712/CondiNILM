@@ -79,7 +79,7 @@ def build_exp_config(
     cfg["seed"] = seed
     cfg["name_model"] = name_model
     result_path = create_dir(cfg["result_path"])
-    result_path = create_dir(f"{result_path}{dataset}_{appliance}_{sampling_rate}/")
+    result_path = create_dir(f"{result_path}{dataset}_{sampling_rate}/")
     result_path = create_dir(f"{result_path}{window_size}/")
     cfg = OmegaConf.create(cfg)
     cfg.result_path = f"{result_path}{cfg.name_model}_{cfg.seed}"
@@ -174,6 +174,8 @@ def suggest_from_space(trial, model_name, hpo_spaces, base_cfg):
                 val = trial.suggest_float(
                     key, float(spec["low"]), float(spec["high"]), log=True
                 )
+            elif spec["type"] == "categorical":
+                val = trial.suggest_categorical(key, spec["choices"])
             else:
                 val = trial.suggest_float(
                     key, float(spec["low"]), float(spec["high"])
@@ -195,6 +197,8 @@ def suggest_from_space(trial, model_name, hpo_spaces, base_cfg):
             val = trial.suggest_float(
                 key, float(spec["low"]), float(spec["high"]), log=True
             )
+        elif spec["type"] == "categorical":
+            val = trial.suggest_categorical(key, spec["choices"])
         else:
             val = trial.suggest_float(
                 key, float(spec["low"]), float(spec["high"])
@@ -206,12 +210,11 @@ def suggest_from_space(trial, model_name, hpo_spaces, base_cfg):
 
 def prepare_data(expes_config):
     np.random.seed(seed=expes_config.seed)
-    cache_key = "{}_{}_{}_{}_{}_{}_{}".format(
+    cache_key = "{}_{}_{}_{}_{}_{}".format(
         expes_config.dataset,
         expes_config.appliance,
         expes_config.sampling_rate,
         expes_config.window_size,
-        expes_config.seed,
         expes_config.power_scaling_type,
         expes_config.appliance_scaling_type,
     )
@@ -375,15 +378,18 @@ def main():
             args.sampling_rate,
             args.window_size,
         )
-    if args.storage:
-        study = optuna.create_study(
-            study_name=study_name,
-            storage=args.storage,
-            direction="minimize",
-            load_if_exists=True,
-        )
-    else:
-        study = optuna.create_study(direction="minimize")
+    storage = args.storage
+    if storage is None:
+        storage_dir = os.path.join("results", "optuna")
+        os.makedirs(storage_dir, exist_ok=True)
+        db_path = os.path.join(storage_dir, study_name + ".db")
+        storage = "sqlite:///{}".format(os.path.abspath(db_path))
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=storage,
+        direction="minimize",
+        load_if_exists=True,
+    )
     objective = objective_factory(
         base_exp,
         datasets_cfg,

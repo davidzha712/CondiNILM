@@ -13,7 +13,7 @@ import platform
 import numpy as np
 import json
 import pytorch_lightning as pl
-import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 import torch.nn as nn
 
@@ -64,6 +64,10 @@ def get_device():
         return "cpu"
     if system in ["Windows", "Linux"]:
         if torch.cuda.is_available():
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
             return "cuda"
         return "cpu"
     return "cpu"
@@ -161,31 +165,80 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
     if target_concat is None:
         return
     n_app = len(target_concat)
-    group_dir = os.path.dirname(expes_config.result_path)
-    json_path = os.path.join(group_dir, "val_compare.json")
+    result_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(expes_config.result_path))
+    )
+    group_dir = os.path.join(
+        result_root,
+        "{}_{}".format(expes_config.dataset, expes_config.sampling_rate),
+        str(expes_config.window_size),
+    )
+    os.makedirs(group_dir, exist_ok=True)
     html_path = os.path.join(group_dir, "val_compare.html")
     model_name = expes_config.name_model
     payload = {}
-    if os.path.isfile(json_path):
+    if os.path.isfile(html_path):
         try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
+            with open(html_path, "r", encoding="utf-8") as f:
+                html_text = f.read()
+            marker = "const payload = "
+            idx = html_text.find(marker)
+            if idx != -1:
+                idx += len(marker)
+                end_idx = html_text.find(";", idx)
+                if end_idx != -1:
+                    payload_str = html_text[idx:end_idx].strip()
+                    payload = json.loads(payload_str)
         except Exception:
             payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
     payload["agg"] = agg_concat
-    payload["target"] = target_concat
     appliance_name = getattr(expes_config, "appliance", None)
-    if appliance_name is not None:
-        payload["appliance_names"] = [appliance_name] * n_app
+    target_all = payload.get("target", [])
+    appliance_names = payload.get("appliance_names", [])
+    if not isinstance(target_all, list):
+        target_all = []
+    if not isinstance(appliance_names, list):
+        appliance_names = []
+    start_idx = len(target_all)
+    for j in range(n_app):
+        target_all.append(target_concat[j])
+        if appliance_name is not None:
+            appliance_names.append(appliance_name)
+        else:
+            appliance_names.append(str(start_idx + j))
+    payload["target"] = target_all
+    if appliance_names:
+        payload["appliance_names"] = appliance_names
+    total_n = len(target_all)
     models = payload.get("models", {})
-    models[model_name] = {
-        "epoch": int(epoch_idx),
-        "pred": pred_concat,
-    }
+    if not isinstance(models, dict):
+        models = {}
+    for name_m, data_m in list(models.items()):
+        if not isinstance(data_m, dict):
+            data_m = {}
+        pred_list = data_m.get("pred", [])
+        if not isinstance(pred_list, list):
+            pred_list = []
+        if len(pred_list) < total_n:
+            pred_list.extend([None] * (total_n - len(pred_list)))
+        else:
+            pred_list = pred_list[:total_n]
+        data_m["pred"] = pred_list
+        models[name_m] = data_m
+    model_data = models.get(model_name, {"epoch": int(epoch_idx), "pred": [None] * total_n})
+    pred_list = model_data.get("pred", [])
+    if not isinstance(pred_list, list):
+        pred_list = [None] * total_n
+    if len(pred_list) < total_n:
+        pred_list.extend([None] * (total_n - len(pred_list)))
+    for j in range(n_app):
+        pred_list[start_idx + j] = pred_concat[j]
+    model_data["epoch"] = int(epoch_idx)
+    model_data["pred"] = pred_list
+    models[model_name] = model_data
     payload["models"] = models
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f)
-    json_data = json.dumps(payload)
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -209,109 +262,127 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
 </div>
 <div id="plot"></div>
 <script>
-  const payload = {json_data};
-  const agg = payload.agg;
-  const target = payload.target;
-  const models = payload.models || {{}};
-  const modelNames = Object.keys(models);
-  const nApp = target.length;
-  const applianceNames = payload.appliance_names || [];
+  const payload = {json.dumps(payload)};
+  let currentLayout = null;
+  function init() {{
+    const agg = payload.agg || [];
+    const target = payload.target || [];
+    const models = payload.models || {{}};
+    const modelNames = Object.keys(models);
+    const nApp = target.length;
+    const applianceNames = payload.appliance_names || [];
 
-  const modelSelect = document.getElementById('modelSelect');
-  const appSelect = document.getElementById('appSelect');
-  const showAgg = document.getElementById('showAgg');
-  const showTarget = document.getElementById('showTarget');
-  const showPred = document.getElementById('showPred');
+    const modelSelect = document.getElementById('modelSelect');
+    const appSelect = document.getElementById('appSelect');
+    const showAgg = document.getElementById('showAgg');
+    const showTarget = document.getElementById('showTarget');
+    const showPred = document.getElementById('showPred');
 
-  const predColors = [
-    '#ff7f0e',
-    '#1f77b4',
-    '#d62728',
-    '#9467bd',
-    '#8c564b',
-    '#e377c2',
-    '#7f7f7f',
-    '#bcbd22',
-    '#17becf'
-  ];
+    const predColors = [
+      '#ff7f0e',
+      '#1f77b4',
+      '#d62728',
+      '#9467bd',
+      '#8c564b',
+      '#e377c2',
+      '#7f7f7f',
+      '#bcbd22',
+      '#17becf'
+    ];
 
-  for (let i = 0; i < modelNames.length; i++) {{
-    const opt = document.createElement('option');
-    opt.value = modelNames[i];
-    opt.text = modelNames[i];
-    modelSelect.appendChild(opt);
-  }}
-
-  for (let j = 0; j < nApp; j++) {{
-    const opt = document.createElement('option');
-    opt.value = j;
-    const name = applianceNames[j] || j.toString();
-    opt.text = name;
-    appSelect.appendChild(opt);
-  }}
-
-  function makePlot() {{
-    const aj = parseInt(appSelect.value);
-    const x = Array.from({{length: agg.length}}, (_, i) => i);
-    const data = [];
-    if (showAgg.checked) {{
-      data.push({{
-        x: x,
-        y: agg,
-        name: 'Aggregate',
-        mode: 'lines',
-        line: {{color: '#7f7f7f'}},
-      }});
+    for (let i = 0; i < modelNames.length; i++) {{
+      const opt = document.createElement('option');
+      opt.value = modelNames[i];
+      opt.text = modelNames[i];
+      modelSelect.appendChild(opt);
     }}
-    if (showTarget.checked) {{
-      data.push({{
-        x: x,
-        y: target[aj],
-        name: 'Target',
-        mode: 'lines',
-        line: {{color: '#2ca02c'}},
-      }});
+
+    for (let j = 0; j < nApp; j++) {{
+      const opt = document.createElement('option');
+      opt.value = j;
+      const name = applianceNames[j] || j.toString();
+      opt.text = name;
+      appSelect.appendChild(opt);
     }}
-    if (showPred.checked) {{
-      const selectedModels = Array.from(modelSelect.selectedOptions).map(opt => opt.value);
-      for (let k = 0; k < selectedModels.length; k++) {{
-        const mj = selectedModels[k];
-        const modelData = models[mj];
-        if (!modelData || !modelData.pred || !modelData.pred[aj]) {{
-          continue;
-        }}
+
+    function makePlot() {{
+      const aj = parseInt(appSelect.value);
+      if (Number.isNaN(aj)) {{
+        return;
+      }}
+      const x = Array.from({{length: agg.length}}, (_, i) => i);
+      const data = [];
+      if (showAgg.checked) {{
         data.push({{
           x: x,
-          y: modelData.pred[aj],
-          name: 'Prediction: ' + mj,
+          y: agg,
+          name: 'Aggregate',
           mode: 'lines',
-          line: {{color: predColors[k % predColors.length]}},
+          line: {{color: '#7f7f7f'}},
         }});
       }}
+      if (showTarget.checked && target[aj]) {{
+        data.push({{
+          x: x,
+          y: target[aj],
+          name: 'Target',
+          mode: 'lines',
+          line: {{color: '#2ca02c'}},
+        }});
+      }}
+      if (showPred.checked) {{
+        const selectedModels = Array.from(modelSelect.selectedOptions).map(opt => opt.value);
+        for (let k = 0; k < selectedModels.length; k++) {{
+          const mj = selectedModels[k];
+          const modelData = models[mj];
+          if (!modelData || !modelData.pred || !modelData.pred[aj]) {{
+            continue;
+          }}
+          data.push({{
+            x: x,
+            y: modelData.pred[aj],
+            name: 'Prediction: ' + mj,
+            mode: 'lines',
+            line: {{color: predColors[k % predColors.length]}},
+          }});
+        }}
+      }}
+      let layout;
+      if (currentLayout && currentLayout.xaxis && currentLayout.yaxis) {{
+        layout = {{
+          xaxis: {{range: currentLayout.xaxis.range}},
+          yaxis: {{range: currentLayout.yaxis.range}},
+          margin: {{t: 40}}
+        }};
+      }} else {{
+        layout = {{
+          xaxis: {{title: 'Time index'}},
+          yaxis: {{title: 'Power'}},
+          margin: {{t: 40}}
+        }};
+      }}
+      Plotly.newPlot('plot', data, layout).then(function(gd) {{
+        currentLayout = gd.layout;
+      }});
     }}
-    const layout = {{
-      xaxis: {{title: 'Time index'}},
-      yaxis: {{title: 'Power'}},
-      margin: {{t: 40}}
-    }};
-    Plotly.newPlot('plot', data, layout);
-  }}
 
-  modelSelect.addEventListener('change', makePlot);
-  appSelect.addEventListener('change', makePlot);
-  showAgg.addEventListener('change', makePlot);
-  showTarget.addEventListener('change', makePlot);
-  showPred.addEventListener('change', makePlot);
+    modelSelect.addEventListener('change', makePlot);
+    appSelect.addEventListener('change', makePlot);
+    showAgg.addEventListener('change', makePlot);
+    showTarget.addEventListener('change', makePlot);
+    showPred.addEventListener('change', makePlot);
 
-  if (nApp > 0) {{
-    appSelect.value = '0';
-  }}
-  if (nApp > 0 && modelNames.length > 0) {{
-    for (let i = 0; i < modelSelect.options.length; i++) {{
-      modelSelect.options[i].selected = true;
+    if (nApp > 0) {{
+      appSelect.value = '0';
     }}
-    makePlot();
+    if (nApp > 0 && modelNames.length > 0) {{
+      for (let i = 0; i < modelSelect.options.length; i++) {{
+        modelSelect.options[i].selected = true;
+      }}
+      makePlot();
+    }}
   }}
+  window.addEventListener('load', init);
 </script>
 </body>
 </html>
@@ -437,7 +508,13 @@ def evaluate_nilm_split(
     y_hat_win = np.array([])
     y_state = np.array([])
     with torch.no_grad():
-        for ts_agg, appl, state in data_loader:
+        iterator = data_loader
+        try:
+            total = len(data_loader)
+        except TypeError:
+            total = None
+        iterator = tqdm(iterator, total=total, desc=mask, leave=False)
+        for ts_agg, appl, state in iterator:
             model.eval()
             ts_agg_t = ts_agg.float().to(device)
             target = appl.float().to(device)
@@ -489,59 +566,9 @@ def evaluate_nilm_split(
     return metrics_timestamp, metrics_win
 
 
-def _plot_loss_history(loss_train, loss_valid, path_prefix):
-    if not loss_train and not loss_valid:
-        return
-    epochs = range(len(loss_train))
-    plt.figure()
-    if loss_train:
-        plt.plot(epochs, loss_train, label="Train loss")
-    if loss_valid:
-        plt.plot(range(len(loss_valid)), loss_valid, label="Valid loss")
-    plt.ylabel("Loss")
-    plt.xlabel("Epochs")
-    plt.legend()
-    path_fig = path_prefix + "_loss.png"
-    try:
-        plt.savefig(path_fig)
-    finally:
-        plt.close()
-
-
 def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     expes_config.device = get_device()
     ckpt_path = expes_config.result_path + ".pt"
-    previous_best_loss = None
-    previous_ckpt = None
-    if os.path.isfile(ckpt_path):
-        try:
-            previous_ckpt = torch.load(ckpt_path, weights_only=False)
-        except Exception as e:
-            logging.warning(
-                "Could not load existing checkpoint %s, start from scratch: %s",
-                ckpt_path,
-                e,
-            )
-            previous_ckpt = None
-        else:
-            state_dict = None
-            if "best_model_state_dict" in previous_ckpt:
-                state_dict = previous_ckpt["best_model_state_dict"]
-            elif "model_state_dict" in previous_ckpt:
-                state_dict = previous_ckpt["model_state_dict"]
-            if state_dict is not None:
-                try:
-                    inst_model.load_state_dict(state_dict)
-                except RuntimeError as e:
-                    logging.warning(
-                        "Checkpoint %s is incompatible with current model, skip warm-start: %s",
-                        ckpt_path,
-                        e,
-                    )
-                    previous_ckpt = None
-                else:
-                    if "value_best_loss" in previous_ckpt:
-                        previous_best_loss = float(previous_ckpt["value_best_loss"])
 
     if expes_config.name_model == "DiffNILM":
         train_dataset = NILMDataset(
@@ -592,23 +619,31 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         )
 
     num_workers = getattr(expes_config, "num_workers", 0)
+    persistent_workers = num_workers > 0
+    pin_memory = expes_config.device == "cuda"
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=expes_config.batch_size,
         shuffle=False,
         num_workers=num_workers,
+        persistent_workers=persistent_workers,
+        pin_memory=pin_memory,
     )
     valid_loader = torch.utils.data.DataLoader(
         valid_dataset,
         batch_size=expes_config.batch_size,
         shuffle=False,
         num_workers=num_workers,
+        persistent_workers=persistent_workers,
+        pin_memory=pin_memory,
     )
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
         batch_size=expes_config.batch_size,
         shuffle=False,
         num_workers=num_workers,
+        persistent_workers=persistent_workers,
+        pin_memory=pin_memory,
     )
 
     metric_callback = ValidationNILMMetricCallback(valid_loader, scaler, expes_config)
@@ -619,6 +654,24 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                 monitor="val_loss", patience=expes_config.p_es, mode="min"
             )
         )
+    ckpt_root = os.path.join(
+        "checkpoint",
+        "{}_{}".format(expes_config.dataset, expes_config.sampling_rate),
+        str(expes_config.window_size),
+        expes_config.appliance,
+        "{}_{}".format(expes_config.name_model, expes_config.seed),
+    )
+    os.makedirs(ckpt_root, exist_ok=True)
+    ckpt_name = "ckpt"
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        monitor="val_loss",
+        mode="min",
+        save_top_k=1,
+        save_last=True,
+        dirpath=ckpt_root,
+        filename=ckpt_name + "_{epoch:03d}",
+    )
+    callbacks.append(checkpoint_callback)
     if expes_config.name_model == "DiffNILM":
         lightning_module = DiffNILMLightningModule(inst_model)
     elif expes_config.name_model == "STNILM":
@@ -646,141 +699,149 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         accelerator = "gpu"
     elif expes_config.device == "mps":
         accelerator = "mps"
+    precision = "32"
+    if accelerator == "gpu":
+        if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+            precision = "bf16-mixed"
+        else:
+            precision = "16-mixed"
     tb_root = os.path.join("log", "tensorboard")
     os.makedirs(tb_root, exist_ok=True)
-    tb_logger = pl.loggers.TensorBoardLogger(save_dir=tb_root, name="")
+    tb_name = "{}_{}_{}_{}_{}".format(
+        expes_config.dataset,
+        expes_config.appliance,
+        expes_config.sampling_rate,
+        expes_config.window_size,
+        expes_config.name_model,
+    )
+    tb_logger = pl.loggers.TensorBoardLogger(save_dir=tb_root, name=tb_name)
+    resume_flag = getattr(expes_config, "resume", False)
+    ckpt_path_resume = None
+    if resume_flag:
+        ckpt_last = os.path.join(ckpt_root, ckpt_name + "_last.ckpt")
+        if os.path.isfile(ckpt_last):
+            ckpt_path_resume = ckpt_last
     trainer = pl.Trainer(
         max_epochs=expes_config.epochs,
         accelerator=accelerator,
         devices=devices,
+        precision=precision,
         log_every_n_steps=1,
         callbacks=callbacks,
-        enable_checkpointing=False,
+        enable_checkpointing=True,
         logger=tb_logger,
     )
     logging.info("Model training...")
-    trainer.fit(
-        lightning_module,
-        train_dataloaders=train_loader,
-        val_dataloaders=valid_loader,
-    )
-    if lightning_module.best_model_state_dict is not None:
-        inst_model.load_state_dict(lightning_module.best_model_state_dict)
+    if ckpt_path_resume is not None:
+        trainer.fit(
+            lightning_module,
+            train_dataloaders=train_loader,
+            val_dataloaders=valid_loader,
+            ckpt_path=ckpt_path_resume,
+        )
+    else:
+        trainer.fit(
+            lightning_module,
+            train_dataloaders=train_loader,
+            val_dataloaders=valid_loader,
+        )
+    best_model_path = getattr(checkpoint_callback, "best_model_path", None)
+    if best_model_path:
+        try:
+            ckpt = torch.load(best_model_path, weights_only=False)
+            lightning_module.load_state_dict(ckpt["state_dict"])
+        except Exception as e:
+            logging.warning(
+                "Could not load best checkpoint %s, keeping latest weights: %s",
+                best_model_path,
+                e,
+            )
     inst_model.to(expes_config.device)
-    ckpt_root = os.path.join("checkpoint")
-    os.makedirs(ckpt_root, exist_ok=True)
-    ckpt_path = os.path.join(
-        ckpt_root,
-        "{}_{}_{}_{}_{}".format(
-            expes_config.dataset,
-            expes_config.appliance,
-            expes_config.sampling_rate,
-            expes_config.window_size,
-            expes_config.name_model,
-        ),
-    )
-    class EvalContainer:
-        def __init__(self, model, device, path_checkpoint):
-            self.model = model
-            self.device = device
-            self.log = {}
-            self.path_checkpoint = path_checkpoint
-            self.best_loss = lightning_module.best_val_loss
-            self.loss_train_history = lightning_module.loss_train_history
-            self.loss_valid_history = lightning_module.loss_valid_history
-            self.passed_epochs = len(lightning_module.loss_train_history)
-
-        def save(self):
-            torch.save(self.log, self.path_checkpoint + ".pt")
-
-    eval_trainer = EvalContainer(inst_model, expes_config.device, ckpt_path)
-    eval_trainer.log["best_model_state_dict"] = inst_model.state_dict()
-    logging.info("Eval model...")
-    evaluate_nilm_split(
-        inst_model,
-        valid_loader,
-        scaler,
-        expes_config.threshold,
-        expes_config.device,
-        True,
-        "valid_metrics",
-        eval_trainer.log,
-    )
-    evaluate_nilm_split(
-        inst_model,
-        test_loader,
-        scaler,
-        expes_config.threshold,
-        expes_config.device,
-        True,
-        "test_metrics",
-        eval_trainer.log,
-    )
-
-    if expes_config.name_model == "DiffNILM":
-        eval_win_energy_aggregation(
-            tuple_data[2],
-            tuple_data[6],
-            eval_trainer,
-            scaler=scaler,
-            metrics=NILMmetrics(round_to=5),
-            window_size=expes_config.window_size,
-            freq=expes_config.sampling_rate,
-            cosinbase=False,
-            new_range=(-0.5, 0.5),
-            mask_metric="test_metrics",
-            list_exo_variables=["hour", "dow", "month"],
-            threshold_small_values=expes_config.threshold,
-            save_results=False,
-        )
+    if getattr(checkpoint_callback, "best_model_score", None) is not None:
+        best_loss = float(checkpoint_callback.best_model_score)
     else:
-        eval_win_energy_aggregation(
-            tuple_data[2],
-            tuple_data[6],
-            eval_trainer,
-            scaler=scaler,
-            metrics=NILMmetrics(round_to=5),
-            window_size=expes_config.window_size,
-            freq=expes_config.sampling_rate,
-            mask_metric="test_metrics",
-            list_exo_variables=expes_config.list_exo_variables,
-            threshold_small_values=expes_config.threshold,
-            save_results=False,
+        best_loss = float("inf")
+    eval_log = {}
+    skip_final_eval = getattr(expes_config, "skip_final_eval", False)
+    if not skip_final_eval:
+        logging.info("Eval model...")
+        logging.info("Eval valid split metrics...")
+        evaluate_nilm_split(
+            inst_model,
+            valid_loader,
+            scaler,
+            expes_config.threshold,
+            expes_config.device,
+            True,
+            "valid_metrics",
+            eval_log,
         )
+        logging.info("Eval test split metrics...")
+        evaluate_nilm_split(
+            inst_model,
+            test_loader,
+            scaler,
+            expes_config.threshold,
+            expes_config.device,
+            True,
+            "test_metrics",
+            eval_log,
+        )
+        if expes_config.name_model == "DiffNILM":
+            eval_win_energy_aggregation(
+                tuple_data[2],
+                tuple_data[6],
+                inst_model,
+                expes_config.device,
+                scaler=scaler,
+                metrics=NILMmetrics(round_to=5),
+                window_size=expes_config.window_size,
+                freq=expes_config.sampling_rate,
+                cosinbase=False,
+                new_range=(-0.5, 0.5),
+                mask_metric="test_metrics",
+                list_exo_variables=["hour", "dow", "month"],
+                threshold_small_values=expes_config.threshold,
+                log_dict=eval_log,
+            )
+        else:
+            eval_win_energy_aggregation(
+                tuple_data[2],
+                tuple_data[6],
+                inst_model,
+                expes_config.device,
+                scaler=scaler,
+                metrics=NILMmetrics(round_to=5),
+                window_size=expes_config.window_size,
+                freq=expes_config.sampling_rate,
+                mask_metric="test_metrics",
+                list_exo_variables=expes_config.list_exo_variables,
+                threshold_small_values=expes_config.threshold,
+                log_dict=eval_log,
+            )
 
-    writer = tb_logger.experiment
-    if hasattr(lightning_module, "best_epoch") and lightning_module.best_epoch >= 0:
-        epoch_idx = int(lightning_module.best_epoch)
+        writer = tb_logger.experiment
+        if hasattr(lightning_module, "best_epoch") and lightning_module.best_epoch >= 0:
+            epoch_idx = int(lightning_module.best_epoch)
+        else:
+            epoch_idx = int(lightning_module.current_epoch)
+        for log_key, log_val in eval_log.items():
+            if not (
+                log_key.startswith("valid_metrics") or log_key.startswith("test_metrics")
+            ):
+                continue
+            if isinstance(log_val, dict):
+                if log_key.startswith("valid_"):
+                    split = "valid"
+                else:
+                    split = "test"
+                sub = log_key[len(split + "_metrics") :]
+                for name, value in log_val.items():
+                    if isinstance(value, (int, float, np.floating)):
+                        tag = split + sub + "/" + name
+                        writer.add_scalar(tag, float(value), epoch_idx)
     else:
-        epoch_idx = int(lightning_module.current_epoch)
-    for log_key, log_val in eval_trainer.log.items():
-        if not (
-            log_key.startswith("valid_metrics") or log_key.startswith("test_metrics")
-        ):
-            continue
-        if isinstance(log_val, dict):
-            if log_key.startswith("valid_"):
-                split = "valid"
-            else:
-                split = "test"
-            sub = log_key[len(split + "_metrics") :]
-            for name, value in log_val.items():
-                if isinstance(value, (int, float, np.floating)):
-                    tag = split + sub + "/" + name
-                    writer.add_scalar(tag, float(value), epoch_idx)
-    new_best_loss = eval_trainer.best_loss
-    if previous_best_loss is None or new_best_loss < previous_best_loss:
-        eval_trainer.save()
-    elif previous_ckpt is not None:
-        torch.save(previous_ckpt, ckpt_path)
-    try:
-        _plot_loss_history(
-            eval_trainer.loss_train_history,
-            eval_trainer.loss_valid_history,
-            expes_config.result_path,
-        )
-    except Exception as e:
-        logging.warning("Could not plot NILM loss history: %s", e)
+        logging.info("Skip final eval metrics, only save visualization HTML.")
     try:
         if hasattr(lightning_module, "best_epoch") and lightning_module.best_epoch >= 0:
             epoch_idx_html = int(lightning_module.best_epoch) + 1
@@ -795,17 +856,27 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         )
     except Exception as e:
         logging.warning("Could not save NILM validation HTML: %s", e)
+    result_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(expes_config.result_path))
+    )
+    html_path = os.path.join(
+        result_root,
+        "{}_{}".format(expes_config.dataset, expes_config.sampling_rate),
+        str(expes_config.window_size),
+        "val_compare.html",
+    )
     logging.info(
-        "Training and eval completed! Model weights and log save at: {}.pt".format(
-            expes_config.result_path
-        )
+        "Training and eval completed! Best checkpoint: %s, TensorBoard logdir: %s, HTML: %s",
+        best_model_path,
+        os.path.join(tb_root, tb_name),
+        html_path,
     )
     result = {
-        "best_loss": float(eval_trainer.best_loss),
-        "valid_timestamp": eval_trainer.log.get("valid_metrics_timestamp", {}),
-        "valid_win": eval_trainer.log.get("valid_metrics_win", {}),
-        "test_timestamp": eval_trainer.log.get("test_metrics_timestamp", {}),
-        "test_win": eval_trainer.log.get("test_metrics_win", {}),
+        "best_loss": float(best_loss),
+        "valid_timestamp": eval_log.get("valid_metrics_timestamp", {}),
+        "valid_win": eval_log.get("valid_metrics_win", {}),
+        "test_timestamp": eval_log.get("test_metrics_timestamp", {}),
+        "test_win": eval_log.get("test_metrics_win", {}),
     }
     return result
 
@@ -817,23 +888,31 @@ def tser_model_training(inst_model, tuple_data, expes_config):
     test_dataset = TSDatasetScaling(tuple_data[2][0], tuple_data[2][1])
 
     num_workers = getattr(expes_config, "num_workers", 0)
+    persistent_workers = num_workers > 0
+    pin_memory = expes_config.device == "cuda"
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=expes_config.batch_size,
         shuffle=False,
         num_workers=num_workers,
+        persistent_workers=persistent_workers,
+        pin_memory=pin_memory,
     )
     valid_loader = torch.utils.data.DataLoader(
         valid_dataset,
         batch_size=expes_config.batch_size,
         shuffle=False,
         num_workers=num_workers,
+        persistent_workers=persistent_workers,
+        pin_memory=pin_memory,
     )
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
         batch_size=expes_config.batch_size,
         shuffle=False,
         num_workers=num_workers,
+        persistent_workers=persistent_workers,
+        pin_memory=pin_memory,
     )
 
     lightning_module = TserLightningModule(
@@ -851,9 +930,22 @@ def tser_model_training(inst_model, tuple_data, expes_config):
         accelerator = "gpu"
     elif expes_config.device == "mps":
         accelerator = "mps"
+    precision = "32"
+    if accelerator == "gpu":
+        if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+            precision = "bf16-mixed"
+        else:
+            precision = "16-mixed"
     tb_root = os.path.join("log", "tensorboard")
     os.makedirs(tb_root, exist_ok=True)
-    tb_logger = pl.loggers.TensorBoardLogger(save_dir=tb_root, name="")
+    tb_name = "{}_{}_{}_{}_{}".format(
+        expes_config.dataset,
+        expes_config.appliance,
+        expes_config.sampling_rate,
+        expes_config.window_size,
+        expes_config.name_model,
+    )
+    tb_logger = pl.loggers.TensorBoardLogger(save_dir=tb_root, name=tb_name)
     callbacks = []
     if expes_config.p_es is not None:
         callbacks.append(
@@ -861,103 +953,70 @@ def tser_model_training(inst_model, tuple_data, expes_config):
                 monitor="val_loss", patience=expes_config.p_es, mode="min"
             )
         )
+    ckpt_root = os.path.join(
+        "checkpoint",
+        "{}_{}".format(expes_config.dataset, expes_config.sampling_rate),
+        str(expes_config.window_size),
+        expes_config.appliance,
+        "{}_{}".format(expes_config.name_model, expes_config.seed),
+    )
+    os.makedirs(ckpt_root, exist_ok=True)
+    ckpt_name = "ckpt"
+    checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        monitor="val_loss",
+        mode="min",
+        save_top_k=1,
+        save_last=True,
+        dirpath=ckpt_root,
+        filename=ckpt_name + "_{epoch:03d}",
+    )
+    callbacks.append(checkpoint_callback)
+    resume_flag = getattr(expes_config, "resume", False)
+    ckpt_path_resume = None
+    if resume_flag:
+        ckpt_last = os.path.join(ckpt_root, ckpt_name + "_last.ckpt")
+        if os.path.isfile(ckpt_last):
+            ckpt_path_resume = ckpt_last
     trainer = pl.Trainer(
         max_epochs=expes_config.epochs,
         accelerator=accelerator,
         devices=devices,
+        precision=precision,
         log_every_n_steps=1,
         callbacks=callbacks,
-        enable_checkpointing=False,
+        enable_checkpointing=True,
         logger=tb_logger,
     )
     logging.info("Model training...")
-    trainer.fit(
-        lightning_module,
-        train_dataloaders=train_loader,
-        val_dataloaders=valid_loader,
-    )
-    if lightning_module.best_model_state_dict is not None:
-        inst_model.load_state_dict(lightning_module.best_model_state_dict)
+    if ckpt_path_resume is not None:
+        trainer.fit(
+            lightning_module,
+            train_dataloaders=train_loader,
+            val_dataloaders=valid_loader,
+            ckpt_path=ckpt_path_resume,
+        )
+    else:
+        trainer.fit(
+            lightning_module,
+            train_dataloaders=train_loader,
+            val_dataloaders=valid_loader,
+        )
+    best_model_path = getattr(checkpoint_callback, "best_model_path", None)
+    if best_model_path:
+        try:
+            ckpt = torch.load(best_model_path, weights_only=False)
+            lightning_module.load_state_dict(ckpt["state_dict"])
+        except Exception as e:
+            logging.warning(
+                "Could not load best checkpoint %s, keeping latest weights: %s",
+                best_model_path,
+                e,
+            )
     inst_model.to(expes_config.device)
-    ckpt_root = os.path.join("checkpoint")
-    os.makedirs(ckpt_root, exist_ok=True)
-    ckpt_path = os.path.join(
-        ckpt_root,
-        "{}_{}_{}_{}_{}".format(
-            expes_config.dataset,
-            expes_config.appliance,
-            expes_config.sampling_rate,
-            expes_config.window_size,
-            expes_config.name_model,
-        ),
-    )
-
-    class EvalContainer:
-        def __init__(self, model, device, path_checkpoint):
-            self.model = model
-            self.device = device
-            self.log = {}
-            self.path_checkpoint = path_checkpoint
-            self.best_loss = lightning_module.best_val_loss
-            self.loss_train_history = lightning_module.loss_train_history
-            self.loss_valid_history = lightning_module.loss_valid_history
-            self.passed_epochs = len(lightning_module.loss_train_history)
-
-        def save(self):
-            torch.save(self.log, self.path_checkpoint + ".pt")
-
-    eval_trainer = EvalContainer(inst_model, expes_config.device, ckpt_path)
-
-    def evaluate_tser_split(data_loader, mask):
-        y = np.array([])
-        y_hat = np.array([])
-        with torch.no_grad():
-            for ts_agg, target in data_loader:
-                inst_model.eval()
-                ts_agg_t = ts_agg.float().to(expes_config.device)
-                target_t = target.float().to(expes_config.device)
-                if target_t.dim() == 1:
-                    target_t = target_t.unsqueeze(1)
-                pred = inst_model(ts_agg_t)
-                target_flat = torch.flatten(target_t).detach().cpu().numpy()
-                pred_flat = torch.flatten(pred).detach().cpu().numpy()
-                y_local = target_flat
-                y_hat_local = pred_flat
-                y_nonlocal = y
-                y_hat_nonlocal = y_hat
-                y_nonlocal = (
-                    np.concatenate((y_nonlocal, y_local)) if y_nonlocal.size else y_local
-                )
-                y_hat_nonlocal = (
-                    np.concatenate((y_hat_nonlocal, y_hat_local))
-                    if y_hat_nonlocal.size
-                    else y_hat_local
-                )
-                y = y_nonlocal
-                y_hat = y_hat_nonlocal
-        if not y.size:
-            return
-        metrics_helper = NILMmetrics()
-        metrics_win = metrics_helper(y=y, y_hat=y_hat)
-        eval_trainer.log[mask + "_win"] = metrics_win
-
-    logging.info("Eval model...")
-    evaluate_tser_split(valid_loader, "valid_metrics")
-    evaluate_tser_split(test_loader, "test_metrics")
-    eval_trainer.log["best_model_state_dict"] = inst_model.state_dict()
-    eval_trainer.save()
-    try:
-        _plot_loss_history(
-            eval_trainer.loss_train_history,
-            eval_trainer.loss_valid_history,
-            expes_config.result_path,
-        )
-    except Exception as e:
-        logging.warning("Could not plot TSER loss history: %s", e)
     logging.info(
-        "Training and eval completed! Model weights and log save at: {}".format(
-            expes_config.result_path
-        )
+        "Training and eval completed! Best checkpoint: %s, TensorBoard logdir: %s",
+        best_model_path,
+        os.path.join(tb_root, tb_name),
     )
     return None
 
