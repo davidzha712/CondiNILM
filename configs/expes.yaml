@@ -12,7 +12,7 @@ list_exo_variables:
 power_scaling_type: !!str MaxScaling
 appliance_scaling_type: !!str MaxScaling
 batch_size: !!int 64
-epochs: !!int 1
+epochs: !!int 15
 p_es: !!int 5
 p_rlr: !!int 3
 n_warmup_epochs: !!int 0

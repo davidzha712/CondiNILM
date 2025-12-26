@@ -201,13 +201,27 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
         target_all = []
     if not isinstance(appliance_names, list):
         appliance_names = []
-    start_idx = len(target_all)
-    for j in range(n_app):
-        target_all.append(target_concat[j])
-        if appliance_name is not None:
-            appliance_names.append(appliance_name)
-        else:
-            appliance_names.append(str(start_idx + j))
+    if appliance_name is not None:
+        existing_indices = [
+            i for i, name in enumerate(appliance_names) if name == appliance_name
+        ]
+    else:
+        existing_indices = []
+    if existing_indices:
+        start_idx = existing_indices[0]
+        required_len = start_idx + n_app
+        if len(target_all) < required_len:
+            target_all.extend([[] for _ in range(required_len - len(target_all))])
+        for j in range(n_app):
+            target_all[start_idx + j] = target_concat[j]
+    else:
+        start_idx = len(target_all)
+        for j in range(n_app):
+            target_all.append(target_concat[j])
+            if appliance_name is not None:
+                appliance_names.append(appliance_name)
+            else:
+                appliance_names.append(str(start_idx + j))
     payload["target"] = target_all
     if appliance_names:
         payload["appliance_names"] = appliance_names
@@ -218,25 +232,64 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
     for name_m, data_m in list(models.items()):
         if not isinstance(data_m, dict):
             data_m = {}
-        pred_list = data_m.get("pred", [])
+        runs = data_m.get("runs")
+        if isinstance(runs, list):
+            new_runs = []
+            for run in runs:
+                if not isinstance(run, dict):
+                    continue
+                pred_list = run.get("pred", [])
+                if not isinstance(pred_list, list):
+                    pred_list = []
+                if len(pred_list) < total_n:
+                    pred_list.extend([None] * (total_n - len(pred_list)))
+                else:
+                    pred_list = pred_list[:total_n]
+                run["pred"] = pred_list
+                new_runs.append(run)
+            data_m["runs"] = new_runs
+        else:
+            epoch_val = data_m.get("epoch")
+            if isinstance(epoch_val, (int, float)):
+                epoch_val = int(epoch_val)
+            else:
+                epoch_val = -1
+            pred_list = data_m.get("pred", [])
+            if not isinstance(pred_list, list):
+                pred_list = []
+            if len(pred_list) < total_n:
+                pred_list.extend([None] * (total_n - len(pred_list)))
+            else:
+                pred_list = pred_list[:total_n]
+            data_m["runs"] = [{"epoch": epoch_val, "pred": pred_list}]
+        models[name_m] = data_m
+    epoch_int = int(epoch_idx)
+    model_data = models.get(model_name, {})
+    runs = model_data.get("runs", [])
+    if not isinstance(runs, list):
+        runs = []
+    target_run = None
+    for run in runs:
+        if isinstance(run, dict) and run.get("epoch") == epoch_int:
+            target_run = run
+            break
+    if target_run is None:
+        pred_list = [None] * total_n
+        target_run = {"epoch": epoch_int, "pred": pred_list}
+        runs.append(target_run)
+    else:
+        pred_list = target_run.get("pred", [])
         if not isinstance(pred_list, list):
-            pred_list = []
+            pred_list = [None] * total_n
         if len(pred_list) < total_n:
             pred_list.extend([None] * (total_n - len(pred_list)))
         else:
             pred_list = pred_list[:total_n]
-        data_m["pred"] = pred_list
-        models[name_m] = data_m
-    model_data = models.get(model_name, {"epoch": int(epoch_idx), "pred": [None] * total_n})
-    pred_list = model_data.get("pred", [])
-    if not isinstance(pred_list, list):
-        pred_list = [None] * total_n
-    if len(pred_list) < total_n:
-        pred_list.extend([None] * (total_n - len(pred_list)))
+        target_run["pred"] = pred_list
     for j in range(n_app):
         pred_list[start_idx + j] = pred_concat[j]
-    model_data["epoch"] = int(epoch_idx)
-    model_data["pred"] = pred_list
+    target_run["pred"] = pred_list
+    model_data["runs"] = runs
     models[model_name] = model_data
     payload["models"] = models
     html = f"""<!DOCTYPE html>
@@ -254,6 +307,9 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
 </label>
 <label>Appliance:
 <select id="appSelect"></select>
+</label>
+<label>Epoch:
+<select id="epochSelect"></select>
 </label>
 <div>
   <label><input type="checkbox" id="showAgg" checked> Agg</label>
@@ -274,6 +330,7 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
 
     const modelSelect = document.getElementById('modelSelect');
     const appSelect = document.getElementById('appSelect');
+    const epochSelect = document.getElementById('epochSelect');
     const showAgg = document.getElementById('showAgg');
     const showTarget = document.getElementById('showTarget');
     const showPred = document.getElementById('showPred');
@@ -290,6 +347,22 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
       '#17becf'
     ];
 
+    const epochsSet = new Set();
+    for (let i = 0; i < modelNames.length; i++) {{
+      const mData = models[modelNames[i]];
+      if (!mData || !Array.isArray(mData.runs)) {{
+        continue;
+      }}
+      for (let r = 0; r < mData.runs.length; r++) {{
+        const run = mData.runs[r];
+        if (!run || typeof run.epoch !== 'number') {{
+          continue;
+        }}
+        epochsSet.add(run.epoch);
+      }}
+    }}
+    const epochs = Array.from(epochsSet).sort((a, b) => a - b);
+
     for (let i = 0; i < modelNames.length; i++) {{
       const opt = document.createElement('option');
       opt.value = modelNames[i];
@@ -305,9 +378,20 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
       appSelect.appendChild(opt);
     }}
 
+    for (let i = 0; i < epochs.length; i++) {{
+      const opt = document.createElement('option');
+      opt.value = epochs[i];
+      opt.text = 'epoch ' + epochs[i];
+      epochSelect.appendChild(opt);
+    }}
+
     function makePlot() {{
       const aj = parseInt(appSelect.value);
       if (Number.isNaN(aj)) {{
+        return;
+      }}
+      const epochValue = parseInt(epochSelect.value);
+      if (Number.isNaN(epochValue)) {{
         return;
       }}
       const x = Array.from({{length: agg.length}}, (_, i) => i);
@@ -335,13 +419,24 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
         for (let k = 0; k < selectedModels.length; k++) {{
           const mj = selectedModels[k];
           const modelData = models[mj];
-          if (!modelData || !modelData.pred || !modelData.pred[aj]) {{
+          if (!modelData || !Array.isArray(modelData.runs)) {{
+            continue;
+          }}
+          let run = null;
+          for (let r = 0; r < modelData.runs.length; r++) {{
+            const candidate = modelData.runs[r];
+            if (candidate && candidate.epoch === epochValue) {{
+              run = candidate;
+              break;
+            }}
+          }}
+          if (!run || !run.pred || !run.pred[aj]) {{
             continue;
           }}
           data.push({{
             x: x,
-            y: modelData.pred[aj],
-            name: 'Prediction: ' + mj,
+            y: run.pred[aj],
+            name: 'Prediction: ' + mj + ' (epoch ' + epochValue + ')',
             mode: 'lines',
             line: {{color: predColors[k % predColors.length]}},
           }});
@@ -366,6 +461,7 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
       }});
     }}
 
+    epochSelect.addEventListener('change', makePlot);
     modelSelect.addEventListener('change', makePlot);
     appSelect.addEventListener('change', makePlot);
     showAgg.addEventListener('change', makePlot);
@@ -375,7 +471,10 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
     if (nApp > 0) {{
       appSelect.value = '0';
     }}
-    if (nApp > 0 && modelNames.length > 0) {{
+    if (epochs.length > 0) {{
+      epochSelect.value = String(epochs[epochs.length - 1]);
+    }}
+    if (nApp > 0 && modelNames.length > 0 && epochs.length > 0) {{
       for (let i = 0; i < modelSelect.options.length; i++) {{
         modelSelect.options[i].selected = true;
       }}
