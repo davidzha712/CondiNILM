@@ -1,0 +1,21 @@
+data_path: !!str data/
+result_path: !!str result/
+dataset: !!str UKDALE
+name_model: !!str NILMFormer
+sampling_rate: !!str 1min
+window_size: 256
+list_exo_variables:
+  - minute
+  - hour
+  - dow
+  - month
+power_scaling_type: !!str MaxScaling
+appliance_scaling_type: !!str MaxScaling
+batch_size: !!int 64
+epochs: !!int 1
+p_es: !!int 5
+p_rlr: !!int 3
+n_warmup_epochs: !!int 0
+device: !!str cuda
+all_gpu: false
+num_workers: 4
