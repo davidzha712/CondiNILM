@@ -9,6 +9,9 @@ import argparse
 import os
 import yaml
 import logging
+
+logging.getLogger("torch.utils.flop_counter").disabled = True
+
 import numpy as np
 import torch
 

@@ -8,6 +8,8 @@ import argparse
 import logging
 import os
 
+logging.getLogger("torch.utils.flop_counter").disabled = True
+
 import numpy as np
 import optuna
 import torch
