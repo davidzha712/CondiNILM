@@ -29,6 +29,97 @@ from src.helpers.dataset import NILMscaler
 from src.helpers.expes import launch_models_training
 
 
+def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
+    try:
+        if data.ndim != 4 or data.shape[1] < 2:
+            return
+        power = data[:, 1, 0, :].astype(np.float32)
+        flat = power.reshape(-1)
+    except Exception:
+        return
+    if flat.size == 0:
+        return
+    thr = float(threshold)
+    on_mask = flat > thr
+    duty_cycle = float(on_mask.mean())
+    if flat.size > 1:
+        diff_all = np.abs(np.diff(flat))
+    else:
+        diff_all = np.zeros(1, dtype=np.float32)
+    on_values = flat[on_mask]
+    off_values = flat[~on_mask]
+    if on_values.size > 1:
+        diff_on = np.abs(np.diff(on_values))
+    else:
+        diff_on = diff_all
+    if off_values.size > 1:
+        diff_off = np.abs(np.diff(off_values))
+    else:
+        diff_off = diff_all
+    if diff_off.size > 0:
+        noise_level = float(np.quantile(diff_off, 0.9))
+    else:
+        noise_level = float(np.quantile(diff_all, 0.9))
+    if diff_on.size > 0:
+        edge_level = float(np.quantile(diff_on, 0.9))
+    else:
+        edge_level = float(np.quantile(diff_all, 0.9))
+    ratio = edge_level / (noise_level + 1e-6)
+    if not np.isfinite(ratio):
+        ratio = 1.0
+    ratio_clipped = min(max(ratio, 1.0), 10.0)
+    lambda_grad = 0.2 + (0.8 - 0.2) * (ratio_clipped - 1.0) / 9.0
+    if duty_cycle < 0.01:
+        alpha_on = 4.0
+        alpha_off = 0.5
+    elif duty_cycle < 0.03:
+        alpha_on = 3.5
+        alpha_off = 0.7
+    elif duty_cycle < 0.10:
+        alpha_on = 3.0
+        alpha_off = 1.0
+    else:
+        alpha_on = 2.0
+        alpha_off = 1.0
+    if duty_cycle < 0.01:
+        lambda_energy = 0.02
+    elif duty_cycle < 0.03:
+        lambda_energy = 0.05
+    elif duty_cycle < 0.10:
+        lambda_energy = 0.10
+    else:
+        lambda_energy = 0.20
+
+    soft_temp_raw = max(0.25 * thr, 2.0 * noise_level, 1.0)
+    edge_eps_raw = max(3.0 * noise_level, 0.5 * edge_level, 0.1 * thr, 1.0)
+
+    try:
+        energy_all = power.sum(axis=-1)
+        if energy_all.size > 0:
+            window_on = (power > thr).any(axis=-1)
+            energy_on = energy_all[window_on]
+            if energy_on.size > 0:
+                base_floor = float(np.quantile(energy_on, 0.1))
+            else:
+                base_floor = float(np.quantile(energy_all, 0.5))
+            energy_floor_raw = max(
+                0.1 * thr * power.shape[-1],
+                0.05 * base_floor,
+            )
+        else:
+            energy_floor_raw = thr * power.shape[-1] * 0.1
+    except Exception:
+        energy_floor_raw = thr * power.shape[-1] * 0.1
+
+    expes_config["loss_alpha_on"] = float(alpha_on)
+    expes_config["loss_alpha_off"] = float(alpha_off)
+    expes_config["loss_lambda_grad"] = float(lambda_grad)
+    expes_config["loss_lambda_energy"] = float(lambda_energy)
+    expes_config["loss_soft_temp_raw"] = float(soft_temp_raw)
+    expes_config["loss_edge_eps_raw"] = float(edge_eps_raw)
+    expes_config["loss_energy_floor_raw"] = float(energy_floor_raw)
+
+
 def get_cache_path(expes_config: OmegaConf):
     if getattr(expes_config, "name_model", None) == "DiffNILM":
         key_elements = [
@@ -130,6 +221,10 @@ def launch_one_experiment(expes_config: OmegaConf):
 
     logging.info("             ... Done.")
 
+    threshold = data_builder.appliance_param[expes_config.app]["min_threshold"]
+    expes_config.threshold = threshold
+    _configure_nilm_loss_hyperparams(expes_config, data, threshold)
+
     scaler = NILMscaler(
         power_scaling_type=expes_config.power_scaling_type,
         appliance_scaling_type=expes_config.appliance_scaling_type,
@@ -137,9 +232,18 @@ def launch_one_experiment(expes_config: OmegaConf):
     data = scaler.fit_transform(data)
 
     expes_config.cutoff = float(scaler.appliance_stat2[0])
-    expes_config.threshold = data_builder.appliance_param[expes_config.app][
-        "min_threshold"
-    ]
+    if expes_config.cutoff and expes_config.cutoff > 0:
+        expes_config["loss_threshold"] = float(expes_config.threshold) / float(
+            expes_config.cutoff
+        )
+        if "loss_soft_temp_raw" in expes_config:
+            expes_config["loss_soft_temp"] = float(expes_config.loss_soft_temp_raw) / float(
+                expes_config.cutoff
+            )
+        if "loss_edge_eps_raw" in expes_config:
+            expes_config["loss_edge_eps"] = float(expes_config.loss_edge_eps_raw) / float(
+                expes_config.cutoff
+            )
 
     if expes_config.name_model in ["ConvNet", "ResNet", "Inception"]:
         X, y = nilmdataset_to_tser(data)
@@ -186,7 +290,16 @@ def launch_one_experiment(expes_config: OmegaConf):
     return launch_models_training(tuple_data, scaler, expes_config)
 
 
-def main(dataset, sampling_rate, window_size, appliance, name_model, resume, no_final_eval):
+def main(
+    dataset,
+    sampling_rate,
+    window_size,
+    appliance,
+    name_model,
+    resume,
+    no_final_eval,
+    loss_type=None,
+):
     """
     Main function to load configuration, update it with parameters,
     and launch an experiment.
@@ -270,6 +383,8 @@ def main(dataset, sampling_rate, window_size, appliance, name_model, resume, no_
     expes_config["name_model"] = model_key
     expes_config["resume"] = bool(resume)
     expes_config["skip_final_eval"] = bool(no_final_eval)
+    if loss_type is not None:
+        expes_config["loss_type"] = str(loss_type)
 
     result_path = create_dir(expes_config["result_path"])
     result_path = create_dir(f"{result_path}{dataset_key}_{sampling_rate}/")
@@ -359,6 +474,15 @@ if __name__ == "__main__":
         action="store_true",
         help="Skip final full evaluation (keep visualization HTML only).",
     )
+    parser.add_argument(
+        "--loss_type",
+        type=str,
+        default=None,
+        help=(
+            "Loss type for NILM baselines. Choices: "
+            "'nilm_composite', 'eaec', 'smoothl1', 'mse', 'mae'."
+        ),
+    )
 
     args = parser.parse_args()
     main(
@@ -369,4 +493,5 @@ if __name__ == "__main__":
         name_model=args.name_model,
         resume=args.resume,
         no_final_eval=args.no_final_eval,
+        loss_type=args.loss_type,
     )

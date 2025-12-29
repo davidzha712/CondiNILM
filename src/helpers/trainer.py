@@ -12,6 +12,96 @@ import torch.optim as optim
 import pytorch_lightning as pl
 
 
+class NILMCompositeLoss(nn.Module):
+    def __init__(
+        self,
+        threshold=10.0,
+        alpha_on=3.0,
+        alpha_off=1.0,
+        lambda_grad=0.5,
+    ):
+        super().__init__()
+        self.threshold = threshold
+        self.alpha_on = alpha_on
+        self.alpha_off = alpha_off
+        self.lambda_grad = lambda_grad
+        self.base_loss = nn.SmoothL1Loss(reduction="none")
+        self.grad_loss = nn.SmoothL1Loss(reduction="mean")
+
+    def forward(self, pred, target):
+        pred = pred.float()
+        target = target.float()
+        loss_point = self.base_loss(pred, target)
+        mask_on = (target > self.threshold).float()
+        mask_off = 1.0 - mask_on
+        eps = 1e-6
+        loss_on = (loss_point * mask_on).sum() / (mask_on.sum() + eps)
+        loss_off = (loss_point * mask_off).sum() / (mask_off.sum() + eps)
+        loss_main = self.alpha_on * loss_on + self.alpha_off * loss_off
+        if pred.size(-1) > 1:
+            pred_diff = pred[..., 1:] - pred[..., :-1]
+            target_diff = target[..., 1:] - target[..., :-1]
+            loss_grad = self.grad_loss(pred_diff, target_diff)
+        else:
+            loss_grad = pred.new_tensor(0.0)
+        return loss_main + self.lambda_grad * loss_grad
+
+
+class EAECLoss(nn.Module):
+    def __init__(
+        self,
+        threshold=10.0,
+        alpha_on=3.0,
+        alpha_off=1.0,
+        lambda_grad=0.5,
+        lambda_energy=0.5,
+        soft_temp=10.0,
+        edge_eps=5.0,
+        energy_floor=1.0,
+    ):
+        super().__init__()
+        self.threshold = threshold
+        self.alpha_on = alpha_on
+        self.alpha_off = alpha_off
+        self.lambda_grad = lambda_grad
+        self.lambda_energy = lambda_energy
+        self.soft_temp = soft_temp
+        self.edge_eps = edge_eps
+        self.energy_floor = energy_floor
+        self.base_loss = nn.SmoothL1Loss(reduction="none")
+        self.grad_loss = nn.SmoothL1Loss(reduction="none")
+
+    def forward(self, pred, target):
+        pred = pred.float()
+        target = target.float()
+        loss_point = self.base_loss(pred, target)
+        eps = 1e-6
+        temp = max(self.soft_temp, eps)
+        p_on = torch.sigmoid((target - self.threshold) / temp)
+        p_off = 1.0 - p_on
+        loss_on = (loss_point * p_on).sum() / (p_on.sum() + eps)
+        loss_off = (loss_point * p_off).sum() / (p_off.sum() + eps)
+        loss_main = self.alpha_on * loss_on + self.alpha_off * loss_off
+        if pred.size(-1) > 1:
+            pred_diff = pred[..., 1:] - pred[..., :-1]
+            target_diff = target[..., 1:] - target[..., :-1]
+            edge_mask = (target_diff.abs() > self.edge_eps).float()
+            loss_grad_point = self.grad_loss(pred_diff, target_diff)
+            loss_grad = (loss_grad_point * edge_mask).sum() / (
+                edge_mask.sum() + eps
+            )
+        else:
+            loss_grad = pred.new_tensor(0.0)
+        energy_pred = pred.sum(dim=-1)
+        energy_target = target.sum(dim=-1)
+        floor = max(float(self.energy_floor), 1e-6)
+        denom = energy_target.abs() + floor
+        weight = energy_target.abs() / denom
+        loss_energy = ((energy_pred - energy_target).abs() / denom) * weight
+        loss_energy = loss_energy.mean()
+        return loss_main + self.lambda_grad * loss_grad + self.lambda_energy * loss_energy
+
+
 class SeqToSeqLightningModule(pl.LightningModule):
     def __init__(
         self,
@@ -23,11 +113,13 @@ class SeqToSeqLightningModule(pl.LightningModule):
         n_warmup_epochs=0,
         warmup_type="linear",
         neg_penalty_weight=0.1,
+        rlr_factor=0.1,
+        rlr_min_lr=0.0,
     ):
         super().__init__()
         self.model = model
-        self.learning_rate = learning_rate
-        self.weight_decay = weight_decay
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
         if criterion is None:
             self.criterion = nn.SmoothL1Loss()
         else:
@@ -35,7 +127,9 @@ class SeqToSeqLightningModule(pl.LightningModule):
         self.patience_rlr = patience_rlr
         self.n_warmup_epochs = n_warmup_epochs
         self.warmup_type = warmup_type
-        self.neg_penalty_weight = neg_penalty_weight
+        self.neg_penalty_weight = float(neg_penalty_weight)
+        self.rlr_factor = float(rlr_factor)
+        self.rlr_min_lr = float(rlr_min_lr)
         self.best_val_loss = float("inf")
         self.best_epoch = -1
         self.best_model_state_dict = None
@@ -100,6 +194,8 @@ class SeqToSeqLightningModule(pl.LightningModule):
                 optimizer,
                 "min",
                 patience=self.patience_rlr,
+                factor=self.rlr_factor,
+                min_lr=self.rlr_min_lr,
                 eps=1e-7,
             )
             schedulers.append(
@@ -157,8 +253,8 @@ class TserLightningModule(pl.LightningModule):
     ):
         super().__init__()
         self.model = model
-        self.learning_rate = learning_rate
-        self.weight_decay = weight_decay
+        self.learning_rate = float(learning_rate)
+        self.weight_decay = float(weight_decay)
         if criterion is None:
             self.criterion = nn.MSELoss()
         else:

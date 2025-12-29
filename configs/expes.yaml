@@ -18,3 +18,11 @@ p_rlr: !!int 3
 n_warmup_epochs: !!int 0
 device: !!str cuda
 num_workers: 8
+p_es_eaec: !!int 7
+p_rlr_eaec: !!int 5
+n_warmup_epochs_eaec: !!int 5
+warmup_type_eaec: !!str linear
+neg_penalty_weight_eaec: 0.02
+rlr_factor_eaec: 0.5
+rlr_min_lr_eaec: 1e-6
+gradient_clip_val_eaec: 1.0

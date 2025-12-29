@@ -12,12 +12,15 @@ import logging
 import platform
 import numpy as np
 import json
+import pandas as pd
 import pytorch_lightning as pl
 from tqdm import tqdm
 
 import torch.nn as nn
 
 from src.helpers.trainer import (
+    NILMCompositeLoss,
+    EAECLoss,
     SeqToSeqLightningModule,
     TserLightningModule,
     DiffNILMLightningModule,
@@ -115,7 +118,7 @@ def get_model_instance(name_model, c_in, window_size, **kwargs):
     return inst
 
 
-def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx):
+def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx):
     device = getattr(model_trainer, "device", None)
     if device is None and hasattr(model_trainer, "model"):
         try:
@@ -136,6 +139,15 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
     agg_concat = []
     target_concat = None
     pred_concat = None
+    timestamps_concat = []
+    dataset = getattr(valid_loader, "dataset", None)
+    has_time = (
+        dataset is not None
+        and hasattr(dataset, "st_date")
+        and getattr(dataset, "freq", None) is not None
+        and hasattr(dataset, "L")
+    )
+    sample_idx = 0
     with torch.no_grad():
         for ts_agg, appl, _ in valid_loader:
             model.eval()
@@ -153,6 +165,19 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
                 pred_t.detach().cpu().numpy()
             )
             batch_size = agg_np.shape[0]
+            if has_time:
+                for b in range(batch_size):
+                    idx = sample_idx + b
+                    start = dataset.st_date[idx]
+                    tmp = pd.date_range(
+                        start=start,
+                        periods=agg_np.shape[2],
+                        freq=dataset.freq,
+                    )
+                    timestamps_concat.extend(
+                        tmp.strftime("%Y-%m-%d %H:%M:%S").tolist()
+                    )
+            sample_idx += batch_size
             if target_concat is None:
                 n_app = target_np.shape[1]
                 target_concat = [[] for _ in range(n_app)]
@@ -194,6 +219,8 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
     if not isinstance(payload, dict):
         payload = {}
     payload["agg"] = agg_concat
+    if timestamps_concat:
+        payload["timestamps"] = timestamps_concat
     appliance_name = getattr(expes_config, "appliance", None)
     target_all = payload.get("target", [])
     appliance_names = payload.get("appliance_names", [])
@@ -327,6 +354,7 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
     const modelNames = Object.keys(models);
     const nApp = target.length;
     const applianceNames = payload.appliance_names || [];
+    const timestamps = payload.timestamps || [];
 
     const modelSelect = document.getElementById('modelSelect');
     const appSelect = document.getElementById('appSelect');
@@ -395,6 +423,10 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
         return;
       }}
       const x = Array.from({{length: agg.length}}, (_, i) => i);
+      const hasTs = timestamps.length === agg.length;
+      const hoverTemplate = hasTs
+        ? '%{{customdata}}<br>%{{y}}<extra>%{{fullData.name}}</extra>'
+        : '%{{x}}<br>%{{y}}<extra>%{{fullData.name}}</extra>';
       const data = [];
       if (showAgg.checked) {{
         data.push({{
@@ -403,6 +435,8 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
           name: 'Aggregate',
           mode: 'lines',
           line: {{color: '#7f7f7f'}},
+          customdata: hasTs ? timestamps : null,
+          hovertemplate: hoverTemplate,
         }});
       }}
       if (showTarget.checked && target[aj]) {{
@@ -412,6 +446,8 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
           name: 'Target',
           mode: 'lines',
           line: {{color: '#2ca02c'}},
+          customdata: hasTs ? timestamps : null,
+          hovertemplate: hoverTemplate,
         }});
       }}
       if (showPred.checked) {{
@@ -439,6 +475,8 @@ def _save_val_streamlit_data(model_trainer, valid_loader, scaler, expes_config, 
             name: 'Prediction: ' + mj + ' (epoch ' + epochValue + ')',
             mode: 'lines',
             line: {{color: predColors[k % predColors.length]}},
+            customdata: hasTs ? timestamps : null,
+            hovertemplate: hoverTemplate,
           }});
         }}
       }}
@@ -499,7 +537,7 @@ class ValidationHTMLCallback(pl.Callback):
 
     def on_validation_epoch_end(self, trainer, pl_module):
         epoch_idx = trainer.current_epoch + 1
-        _save_val_streamlit_data(
+        _save_val_data(
             pl_module, self.valid_loader, self.scaler, self.expes_config, epoch_idx
         )
 
@@ -717,13 +755,40 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             freq=expes_config.sampling_rate,
         )
 
+    loss_type = str(getattr(expes_config, "loss_type", "nilm_composite"))
+    if loss_type == "eaec" and expes_config.name_model == "NILMFormer":
+        p_es_eaec = getattr(expes_config, "p_es_eaec", None)
+        if p_es_eaec is not None:
+            expes_config.p_es = p_es_eaec
+        p_rlr_eaec = getattr(expes_config, "p_rlr_eaec", None)
+        if p_rlr_eaec is not None:
+            expes_config.p_rlr = p_rlr_eaec
+        n_warmup_eaec = getattr(expes_config, "n_warmup_epochs_eaec", None)
+        if n_warmup_eaec is not None:
+            expes_config.n_warmup_epochs = n_warmup_eaec
+        training_param_eaec = getattr(expes_config, "model_training_param_eaec", None)
+        if training_param_eaec is not None:
+            expes_config.model_training_param = training_param_eaec
+        warmup_type_eaec = getattr(expes_config, "warmup_type_eaec", None)
+        if warmup_type_eaec is not None:
+            expes_config.warmup_type = warmup_type_eaec
+        neg_penalty_weight_eaec = getattr(expes_config, "neg_penalty_weight_eaec", None)
+        if neg_penalty_weight_eaec is not None:
+            expes_config.neg_penalty_weight = neg_penalty_weight_eaec
+        rlr_factor_eaec = getattr(expes_config, "rlr_factor_eaec", None)
+        if rlr_factor_eaec is not None:
+            expes_config.rlr_factor = rlr_factor_eaec
+        rlr_min_lr_eaec = getattr(expes_config, "rlr_min_lr_eaec", None)
+        if rlr_min_lr_eaec is not None:
+            expes_config.rlr_min_lr = rlr_min_lr_eaec
+
     num_workers = getattr(expes_config, "num_workers", 0)
     persistent_workers = num_workers > 0
     pin_memory = expes_config.device == "cuda"
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=expes_config.batch_size,
-        shuffle=False,
+        shuffle=True,
         num_workers=num_workers,
         persistent_workers=persistent_workers,
         pin_memory=pin_memory,
@@ -746,7 +811,8 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     )
 
     metric_callback = ValidationNILMMetricCallback(valid_loader, scaler, expes_config)
-    callbacks = [metric_callback]
+    html_callback = ValidationHTMLCallback(valid_loader, scaler, expes_config)
+    callbacks = [metric_callback, html_callback]
     if expes_config.p_es is not None:
         callbacks.append(
             pl.callbacks.EarlyStopping(
@@ -776,21 +842,72 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     elif expes_config.name_model == "STNILM":
         lightning_module = STNILMLightningModule(
             inst_model,
-            learning_rate=expes_config.model_training_param.lr,
-            weight_decay=expes_config.model_training_param.wd,
+            learning_rate=float(expes_config.model_training_param.lr),
+            weight_decay=float(expes_config.model_training_param.wd),
             patience_rlr=expes_config.p_rlr,
             n_warmup_epochs=expes_config.n_warmup_epochs,
             warmup_type=getattr(expes_config, "warmup_type", "linear"),
         )
     else:
+        loss_type = str(getattr(expes_config, "loss_type", "nilm_composite"))
+        threshold_loss = float(getattr(expes_config, "loss_threshold", expes_config.threshold))
+        if loss_type == "nilm_composite":
+            alpha_on = float(getattr(expes_config, "loss_alpha_on", 3.0))
+            alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
+            lambda_grad = float(getattr(expes_config, "loss_lambda_grad", 0.5))
+            criterion = NILMCompositeLoss(
+                threshold=threshold_loss,
+                alpha_on=alpha_on,
+                alpha_off=alpha_off,
+                lambda_grad=lambda_grad,
+            )
+        elif loss_type == "eaec":
+            alpha_on = float(getattr(expes_config, "loss_alpha_on", 3.0))
+            alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
+            lambda_grad = float(getattr(expes_config, "loss_lambda_grad", 0.5))
+            lambda_energy = float(getattr(expes_config, "loss_lambda_energy", 0.5))
+            soft_temp = float(getattr(expes_config, "loss_soft_temp", 10.0))
+            edge_eps = float(getattr(expes_config, "loss_edge_eps", 5.0))
+            energy_floor_default = threshold_loss * float(expes_config.window_size) * 0.1
+            if hasattr(expes_config, "loss_energy_floor"):
+                energy_floor = float(expes_config.loss_energy_floor)
+            elif hasattr(expes_config, "loss_energy_floor_raw") and getattr(
+                expes_config, "cutoff", None
+            ):
+                energy_floor = float(expes_config.loss_energy_floor_raw) / float(
+                    expes_config.cutoff
+                )
+            else:
+                energy_floor = energy_floor_default
+            criterion = EAECLoss(
+                threshold=threshold_loss,
+                alpha_on=alpha_on,
+                alpha_off=alpha_off,
+                lambda_grad=lambda_grad,
+                lambda_energy=lambda_energy,
+                soft_temp=soft_temp,
+                edge_eps=edge_eps,
+                energy_floor=energy_floor,
+            )
+        elif loss_type == "smoothl1":
+            criterion = nn.SmoothL1Loss()
+        elif loss_type == "mse":
+            criterion = nn.MSELoss()
+        elif loss_type == "mae":
+            criterion = nn.L1Loss()
+        else:
+            raise ValueError(f"Unsupported loss_type: {loss_type}")
         lightning_module = SeqToSeqLightningModule(
             inst_model,
-            learning_rate=expes_config.model_training_param.lr,
-            weight_decay=expes_config.model_training_param.wd,
-            criterion=nn.MSELoss(),
+            learning_rate=float(expes_config.model_training_param.lr),
+            weight_decay=float(expes_config.model_training_param.wd),
+            criterion=criterion,
             patience_rlr=expes_config.p_rlr,
             n_warmup_epochs=expes_config.n_warmup_epochs,
             warmup_type=getattr(expes_config, "warmup_type", "linear"),
+            neg_penalty_weight=float(getattr(expes_config, "neg_penalty_weight", 0.1)),
+            rlr_factor=float(getattr(expes_config, "rlr_factor", 0.1)),
+            rlr_min_lr=float(getattr(expes_config, "rlr_min_lr", 0.0)),
         )
     accelerator = "cpu"
     devices = 1
@@ -820,6 +937,10 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         ckpt_last = os.path.join(ckpt_root, ckpt_name + "_last.ckpt")
         if os.path.isfile(ckpt_last):
             ckpt_path_resume = ckpt_last
+    loss_type = str(getattr(expes_config, "loss_type", "nilm_composite"))
+    gradient_clip_val = 0.0
+    if loss_type == "eaec":
+        gradient_clip_val = float(getattr(expes_config, "gradient_clip_val_eaec", 1.0))
     trainer = pl.Trainer(
         max_epochs=expes_config.epochs,
         accelerator=accelerator,
@@ -829,6 +950,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         callbacks=callbacks,
         enable_checkpointing=True,
         logger=tb_logger,
+        gradient_clip_val=gradient_clip_val,
     )
     logging.info("Model training...")
     if ckpt_path_resume is not None:
@@ -946,7 +1068,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             epoch_idx_html = int(lightning_module.best_epoch) + 1
         else:
             epoch_idx_html = int(lightning_module.current_epoch) + 1
-        _save_val_streamlit_data(
+        _save_val_data(
             inst_model,
             valid_loader,
             scaler,
@@ -1016,8 +1138,8 @@ def tser_model_training(inst_model, tuple_data, expes_config):
 
     lightning_module = TserLightningModule(
         inst_model,
-        learning_rate=expes_config.model_training_param.lr,
-        weight_decay=expes_config.model_training_param.wd,
+        learning_rate=float(expes_config.model_training_param.lr),
+        weight_decay=float(expes_config.model_training_param.wd),
         criterion=nn.MSELoss(),
         patience_rlr=expes_config.p_rlr,
         n_warmup_epochs=expes_config.n_warmup_epochs,

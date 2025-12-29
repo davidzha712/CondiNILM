@@ -27,3 +27,21 @@ class NILMFormerConfig:
     pffn_ratio: int = 4
     n_head: int = 8
     norm_eps: float = 1e-5
+
+    def __post_init__(self):
+        self.c_in = int(self.c_in)
+        self.c_embedding = int(self.c_embedding)
+        self.c_out = int(self.c_out)
+
+        self.kernel_size = int(self.kernel_size)
+        self.kernel_size_head = int(self.kernel_size_head)
+        self.dilations = [int(x) for x in list(self.dilations)]
+        self.conv_bias = bool(self.conv_bias)
+
+        self.use_efficient_attention = bool(self.use_efficient_attention)
+        self.n_encoder_layers = int(self.n_encoder_layers)
+        self.d_model = int(self.d_model)
+        self.dp_rate = float(self.dp_rate)
+        self.pffn_ratio = int(self.pffn_ratio)
+        self.n_head = int(self.n_head)
+        self.norm_eps = float(self.norm_eps)

@@ -5,16 +5,16 @@ BiGRU:
     return_values: "power"
     verbose_loss: false
   model_training_param:
-    lr: !!float 1e-4
-    wd: !!float 0
+    lr: 1e-4
+    wd: 0
     training_in_model: false
 
 BiLSTM:
   model_kwargs:
     downstreamtask : "seq2seq"
   model_training_param:
-    lr: !!float 1e-4
-    wd: !!float 0
+    lr: 1e-4
+    wd: 0
     training_in_model: false
 
 CNN1D:
@@ -22,13 +22,13 @@ CNN1D:
     quantiles:
       - 0.5
     num_classes: 1
-    dropout: !!float 0.1
+    dropout: 0.1
     pooling_size: 16
     return_values: "power"
     verbose_loss: false
   model_training_param:
-    lr: !!float 1e-4
-    wd: !!float 0
+    lr: 1e-4
+    wd: 0
     training_in_model: false
 
 UNET_NILM:
@@ -43,7 +43,7 @@ UNET_NILM:
     return_values: "power"
     verbose_loss: false
   model_training_param:
-    lr: !!float 1e-4
+    lr: 1e-4
     wd: 0
     training_in_model: false
 
@@ -51,24 +51,24 @@ FCN:
   model_kwargs:
     downstreamtask: "seq2seq"
   model_training_param:
-    lr: !!float 1e-4
-    wd: !!float 0
+    lr: 1e-4
+    wd: 0
     training_in_model: false
 
 DResNet:
   model_kwargs:
     kernel_size: 3
   model_training_param:
-    lr: !!float 1e-4
-    wd: !!float 0
+    lr: 1e-4
+    wd: 0
     training_in_model: false
 
 DAResNet:
   model_kwargs:
     kernel_size: 3
   model_training_param:
-    lr: !!float 1e-4
-    wd: !!float 0
+    lr: 1e-4
+    wd: 0
     training_in_model: false
 
 BERT4NILM:
@@ -82,15 +82,15 @@ BERT4NILM:
     threshold: null
     return_values: !!str "power"
   model_training_param:
-    lr: !!float 1e-4
-    wd: !!float 0
+    lr: 1e-4
+    wd: 0
     training_in_model: false
 
 DiffNILM:
   model_kwargs: {}
   model_training_param:
-    lr: !!float 1e-3
-    wd: !!float 0
+    lr: 1e-3
+    wd: 0
     training_in_model: true
 
 STNILM:
@@ -100,8 +100,8 @@ STNILM:
     dp_rate: 0.1
     weight_moe: 0.1
   model_training_param:
-    lr: !!float 1e-3
-    wd: !!float 0
+    lr: 1e-3
+    wd: 0
     training_in_model: true
 
 TSILNet:
@@ -116,8 +116,8 @@ TSILNet:
     head_ffn_dim: 512
     head_dropout: 0.2
   model_training_param:
-    lr: !!float 1e-4
-    wd: !!float 0
+    lr: 1e-4
+    wd: 0
     training_in_model: false
 
 Energformer:
@@ -131,22 +131,22 @@ Energformer:
     att_dropout: 0.2
     ffn_dropout: 0.2
   model_training_param:
-    lr: !!float 1e-4
-    wd: !!float 0
+    lr: 1e-4
+    wd: 0
     training_in_model: false
 
 ConvNet:
   model_kwargs: {}
   model_training_param:
-    lr: !!float 1e-3
-    wd: !!float 0
+    lr: 1e-3
+    wd: 0
 
 ResNet:
   model_kwargs:
     mid_channels: 64
   model_training_param:
-    lr: !!float 1e-3
-    wd: !!float 0
+    lr: 1e-3
+    wd: 0
 
 Inception:
   model_kwargs:
@@ -155,8 +155,8 @@ Inception:
     kernel_sizes: [9, 19, 39]
     bottleneck_channels: 32
   model_training_param:
-    lr: !!float 1e-3
-    wd: !!float 0
+    lr: 1e-3
+    wd: 0
 
 NILMFormer:
   model_kwargs:
@@ -173,8 +173,12 @@ NILMFormer:
     dp_rate: 0.2
     pffn_ratio: 4
     n_head: 8
-    norm_eps: !!float 1e-5
+    norm_eps: 1e-5
   model_training_param:
-    lr: !!float 1e-4
-    wd: !!float 0
+    lr: 1e-4
+    wd: 0
+    training_in_model: false
+  model_training_param_eaec:
+    lr: 5e-5
+    wd: 0
     training_in_model: false
