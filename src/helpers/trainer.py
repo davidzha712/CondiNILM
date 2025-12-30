@@ -21,6 +21,7 @@ class NILMCompositeLoss(nn.Module):
         lambda_grad=0.5,
         lambda_sparse=0.0,
         lambda_zero=0.0,
+        center_ratio=1.0,
     ):
         super().__init__()
         self.threshold = threshold
@@ -29,12 +30,21 @@ class NILMCompositeLoss(nn.Module):
         self.lambda_grad = lambda_grad
         self.lambda_sparse = lambda_sparse
         self.lambda_zero = lambda_zero
+        self.center_ratio = float(center_ratio)
         self.base_loss = nn.SmoothL1Loss(reduction="none")
-        self.grad_loss = nn.SmoothL1Loss(reduction="mean")
+        self.grad_loss = nn.L1Loss(reduction="mean")
 
     def forward(self, pred, target):
         pred = pred.float()
         target = target.float()
+        time_len = pred.size(-1)
+        ratio = float(self.center_ratio)
+        if time_len > 1 and 0.0 < ratio < 1.0:
+            center_len = max(1, int(round(time_len * ratio)))
+            start = (time_len - center_len) // 2
+            end = start + center_len
+            pred = pred[..., start:end]
+            target = target[..., start:end]
         loss_point = self.base_loss(pred, target)
         mask_on = (target > self.threshold).float()
         mask_off = 1.0 - mask_on
@@ -48,7 +58,7 @@ class NILMCompositeLoss(nn.Module):
             loss_grad = self.grad_loss(pred_diff, target_diff)
         else:
             loss_grad = pred.new_tensor(0.0)
-        sparse_penalty = pred.abs().mean()
+        sparse_penalty = (pred.abs() * mask_on).sum() / (mask_on.sum() + eps)
         zero_penalty = (pred.abs() * mask_off).sum() / (mask_off.sum() + eps)
         return (
             loss_main
@@ -71,6 +81,7 @@ class EAECLoss(nn.Module):
         energy_floor=1.0,
         lambda_sparse=0.0,
         lambda_zero=0.0,
+        center_ratio=1.0,
     ):
         super().__init__()
         self.threshold = threshold
@@ -83,12 +94,21 @@ class EAECLoss(nn.Module):
         self.energy_floor = energy_floor
         self.lambda_sparse = lambda_sparse
         self.lambda_zero = lambda_zero
+        self.center_ratio = float(center_ratio)
         self.base_loss = nn.SmoothL1Loss(reduction="none")
-        self.grad_loss = nn.SmoothL1Loss(reduction="none")
+        self.grad_loss = nn.L1Loss(reduction="none")
 
     def forward(self, pred, target):
         pred = pred.float()
         target = target.float()
+        time_len = pred.size(-1)
+        ratio = float(self.center_ratio)
+        if time_len > 1 and 0.0 < ratio < 1.0:
+            center_len = max(1, int(round(time_len * ratio)))
+            start = (time_len - center_len) // 2
+            end = start + center_len
+            pred = pred[..., start:end]
+            target = target[..., start:end]
         loss_point = self.base_loss(pred, target)
         eps = 1e-6
         temp = max(self.soft_temp, eps)
@@ -112,9 +132,17 @@ class EAECLoss(nn.Module):
         floor = max(float(self.energy_floor), 1e-6)
         denom = energy_target.abs() + floor
         weight = energy_target.abs() / denom
-        loss_energy = ((energy_pred - energy_target).abs() / denom) * weight
-        loss_energy = loss_energy.mean()
-        sparse_penalty = pred.abs().mean()
+        loss_energy_sample = ((energy_pred - energy_target).abs() / denom) * weight
+        on_coverage = p_on.sum(dim=-1)
+        min_on_steps = 0.1 * float(pred.size(-1))
+        energy_mask = (on_coverage > min_on_steps).float()
+        if energy_mask.sum() > 0:
+            loss_energy = (loss_energy_sample * energy_mask).sum() / (
+                energy_mask.sum() + eps
+            )
+        else:
+            loss_energy = pred.new_tensor(0.0)
+        sparse_penalty = (pred.abs() * p_on).sum() / (p_on.sum() + eps)
         zero_penalty = (pred.abs() * p_off).sum() / (p_off.sum() + eps)
         return (
             loss_main

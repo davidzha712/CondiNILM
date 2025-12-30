@@ -17,24 +17,24 @@ UKDALE:
     app:  washing_machine
     ind_house_train_val: [1, 3, 4, 5]
     ind_house_test: [2]
-    overlap: 0.5
+    overlap: 0.75
   Dishwasher:
     app:  dishwasher
     ind_house_train_val: [1, 3, 4, 5]
     ind_house_test: [2]
-    overlap: 0.5
+    overlap: 0.75
   Kettle:
     app:  kettle
     ind_house_train_val: [1, 3, 4, 5]
     ind_house_test: [2]
-    overlap: 0.5
+    overlap: 0.75
   Microwave:
     app:  microwave
     ind_house_train_val: [1, 3, 4, 5]
     ind_house_test: [2]
-    overlap: 0.5
+    overlap: 0.75
   Fridge:
     app:  fridge
     ind_house_train_val: [1, 3, 4, 5]
     ind_house_test: [2]
-    overlap: 0.5
+    overlap: 0.75

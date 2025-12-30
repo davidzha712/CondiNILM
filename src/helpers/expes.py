@@ -857,6 +857,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             lambda_grad = float(getattr(expes_config, "loss_lambda_grad", 0.5))
             lambda_sparse = float(getattr(expes_config, "loss_lambda_sparse", 0.0))
             lambda_zero = float(getattr(expes_config, "loss_lambda_zero", 0.0))
+            center_ratio = float(getattr(expes_config, "loss_center_ratio", 1.0))
             criterion = NILMCompositeLoss(
                 threshold=threshold_loss,
                 alpha_on=alpha_on,
@@ -864,6 +865,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                 lambda_grad=lambda_grad,
                 lambda_sparse=lambda_sparse,
                 lambda_zero=lambda_zero,
+                center_ratio=center_ratio,
             )
         elif loss_type == "eaec":
             alpha_on = float(getattr(expes_config, "loss_alpha_on", 3.0))
@@ -874,6 +876,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             edge_eps = float(getattr(expes_config, "loss_edge_eps", 5.0))
             lambda_sparse = float(getattr(expes_config, "loss_lambda_sparse", 0.0))
             lambda_zero = float(getattr(expes_config, "loss_lambda_zero", 0.0))
+            center_ratio = float(getattr(expes_config, "loss_center_ratio", 1.0))
             energy_floor_default = threshold_loss * float(expes_config.window_size) * 0.1
             if hasattr(expes_config, "loss_energy_floor"):
                 energy_floor = float(expes_config.loss_energy_floor)
@@ -896,6 +899,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                 energy_floor=energy_floor,
                 lambda_sparse=lambda_sparse,
                 lambda_zero=lambda_zero,
+                center_ratio=center_ratio,
             )
         elif loss_type == "smoothl1":
             criterion = nn.SmoothL1Loss()
@@ -919,10 +923,27 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         )
     accelerator = "cpu"
     devices = 1
-    if expes_config.device == "cuda" and torch.cuda.is_available():
-        accelerator = "gpu"
-    elif expes_config.device == "mps":
+    device_cfg = str(getattr(expes_config, "device", "auto")).lower()
+    if device_cfg == "cpu":
+        accelerator = "cpu"
+    elif device_cfg == "cuda":
+        if torch.cuda.is_available():
+            accelerator = "gpu"
+        else:
+            logging.warning(
+                "Device set to 'cuda' but CUDA is not available. Falling back to CPU."
+            )
+            accelerator = "cpu"
+    elif device_cfg == "mps":
         accelerator = "mps"
+    else:
+        if torch.cuda.is_available():
+            accelerator = "gpu"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            accelerator = "mps"
+        else:
+            accelerator = "cpu"
+    expes_config.device = accelerator if accelerator != "gpu" else "cuda"
     precision = "32"
     if accelerator == "gpu":
         if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():

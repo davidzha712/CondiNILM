@@ -112,20 +112,28 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     except Exception:
         energy_floor_raw = thr * power.shape[-1] * 0.1
 
-    expes_config["loss_alpha_on"] = float(alpha_on)
-    expes_config["loss_alpha_off"] = float(alpha_off)
-    expes_config["loss_lambda_grad"] = float(lambda_grad)
-    expes_config["loss_lambda_energy"] = float(lambda_energy)
+    if "loss_alpha_on" not in expes_config:
+        expes_config["loss_alpha_on"] = float(alpha_on)
+    if "loss_alpha_off" not in expes_config:
+        expes_config["loss_alpha_off"] = float(alpha_off)
+    if "loss_lambda_grad" not in expes_config:
+        expes_config["loss_lambda_grad"] = float(lambda_grad)
+    if "loss_lambda_energy" not in expes_config:
+        expes_config["loss_lambda_energy"] = float(lambda_energy)
     expes_config["loss_soft_temp_raw"] = float(soft_temp_raw)
     expes_config["loss_edge_eps_raw"] = float(edge_eps_raw)
     expes_config["loss_energy_floor_raw"] = float(energy_floor_raw)
     duty = float(duty_cycle)
     if duty < 0.03:
-        expes_config["loss_lambda_zero"] = float(0.1)
-        expes_config["loss_lambda_sparse"] = float(0.01)
+        if "loss_lambda_zero" not in expes_config:
+            expes_config["loss_lambda_zero"] = float(0.1)
+        if "loss_lambda_sparse" not in expes_config:
+            expes_config["loss_lambda_sparse"] = float(0.01)
     elif duty < 0.10:
-        expes_config["loss_lambda_zero"] = float(0.05)
-        expes_config["loss_lambda_sparse"] = float(0.005)
+        if "loss_lambda_zero" not in expes_config:
+            expes_config["loss_lambda_zero"] = float(0.05)
+        if "loss_lambda_sparse" not in expes_config:
+            expes_config["loss_lambda_sparse"] = float(0.005)
 
 
 def get_cache_path(expes_config: OmegaConf):
@@ -343,6 +351,7 @@ def main(
     resume,
     no_final_eval,
     loss_type=None,
+    epochs=None,
 ):
     """
     Main function to load configuration, update it with parameters,
@@ -429,6 +438,8 @@ def main(
     expes_config["skip_final_eval"] = bool(no_final_eval)
     if loss_type is not None:
         expes_config["loss_type"] = str(loss_type)
+    if epochs is not None:
+        expes_config["epochs"] = int(epochs)
 
     result_path = create_dir(expes_config["result_path"])
     result_path = create_dir(f"{result_path}{dataset_key}_{sampling_rate}/")
@@ -527,6 +538,12 @@ if __name__ == "__main__":
             "'nilm_composite', 'eaec', 'smoothl1', 'mse', 'mae'."
         ),
     )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Override number of training epochs defined in configs/expes.yaml.",
+    )
 
     args = parser.parse_args()
     main(
@@ -538,4 +555,5 @@ if __name__ == "__main__":
         resume=args.resume,
         no_final_eval=args.no_final_eval,
         loss_type=args.loss_type,
+        epochs=args.epochs,
     )

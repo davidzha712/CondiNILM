@@ -9,15 +9,21 @@ list_exo_variables:
   - hour
   - dow
   - month
+
 power_scaling_type:  MaxScaling
 appliance_scaling_type:  MaxScaling
+
 batch_size:  64
-epochs:  50
+epochs:  15
 p_es:  5
 p_rlr:  3
 n_warmup_epochs:  0
-device:  cuda
+
+device:  auto          # auto / cuda / mps / cpu
+
 num_workers: 8
+
+# EAEC Related Parameters
 p_es_eaec:  7
 p_rlr_eaec:  5
 n_warmup_epochs_eaec:  5
@@ -26,3 +32,14 @@ neg_penalty_weight_eaec: 0.02
 rlr_factor_eaec: 0.5
 rlr_min_lr_eaec: 1e-6
 gradient_clip_val_eaec: 1.0
+
+# seq2subseq Center Supervision Ratio
+loss_center_ratio: 0.8
+
+# Loss Hyperparameters
+loss_alpha_on: 3.0
+loss_alpha_off: 1.5
+loss_lambda_grad: 0.1
+loss_lambda_sparse: 0.001
+loss_lambda_zero: 0.01
+loss_lambda_energy: 0.05
