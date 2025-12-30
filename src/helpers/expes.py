@@ -855,11 +855,15 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             alpha_on = float(getattr(expes_config, "loss_alpha_on", 3.0))
             alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
             lambda_grad = float(getattr(expes_config, "loss_lambda_grad", 0.5))
+            lambda_sparse = float(getattr(expes_config, "loss_lambda_sparse", 0.0))
+            lambda_zero = float(getattr(expes_config, "loss_lambda_zero", 0.0))
             criterion = NILMCompositeLoss(
                 threshold=threshold_loss,
                 alpha_on=alpha_on,
                 alpha_off=alpha_off,
                 lambda_grad=lambda_grad,
+                lambda_sparse=lambda_sparse,
+                lambda_zero=lambda_zero,
             )
         elif loss_type == "eaec":
             alpha_on = float(getattr(expes_config, "loss_alpha_on", 3.0))
@@ -868,6 +872,8 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             lambda_energy = float(getattr(expes_config, "loss_lambda_energy", 0.5))
             soft_temp = float(getattr(expes_config, "loss_soft_temp", 10.0))
             edge_eps = float(getattr(expes_config, "loss_edge_eps", 5.0))
+            lambda_sparse = float(getattr(expes_config, "loss_lambda_sparse", 0.0))
+            lambda_zero = float(getattr(expes_config, "loss_lambda_zero", 0.0))
             energy_floor_default = threshold_loss * float(expes_config.window_size) * 0.1
             if hasattr(expes_config, "loss_energy_floor"):
                 energy_floor = float(expes_config.loss_energy_floor)
@@ -888,6 +894,8 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                 soft_temp=soft_temp,
                 edge_eps=edge_eps,
                 energy_floor=energy_floor,
+                lambda_sparse=lambda_sparse,
+                lambda_zero=lambda_zero,
             )
         elif loss_type == "smoothl1":
             criterion = nn.SmoothL1Loss()

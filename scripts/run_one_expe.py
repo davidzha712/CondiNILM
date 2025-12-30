@@ -24,6 +24,7 @@ from src.helpers.preprocessing import (
     split_train_test_nilmdataset,
     split_train_test_pdl_nilmdataset,
     nilmdataset_to_tser,
+    split_train_valid_timeblock_nilmdataset,
 )
 from src.helpers.dataset import NILMscaler
 from src.helpers.expes import launch_models_training
@@ -118,9 +119,18 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     expes_config["loss_soft_temp_raw"] = float(soft_temp_raw)
     expes_config["loss_edge_eps_raw"] = float(edge_eps_raw)
     expes_config["loss_energy_floor_raw"] = float(energy_floor_raw)
+    duty = float(duty_cycle)
+    if duty < 0.03:
+        expes_config["loss_lambda_zero"] = float(0.1)
+        expes_config["loss_lambda_sparse"] = float(0.01)
+    elif duty < 0.10:
+        expes_config["loss_lambda_zero"] = float(0.05)
+        expes_config["loss_lambda_sparse"] = float(0.005)
 
 
 def get_cache_path(expes_config: OmegaConf):
+    overlap = getattr(expes_config, "overlap", 0.0)
+    overlap_str = "ov{}".format(str(overlap).replace(".", "p"))
     if getattr(expes_config, "name_model", None) == "DiffNILM":
         key_elements = [
             expes_config.dataset,
@@ -130,6 +140,7 @@ def get_cache_path(expes_config: OmegaConf):
             str(expes_config.seed),
             expes_config.power_scaling_type,
             expes_config.appliance_scaling_type,
+            overlap_str,
             "DiffNILM",
         ]
     else:
@@ -141,6 +152,7 @@ def get_cache_path(expes_config: OmegaConf):
             str(expes_config.seed),
             expes_config.power_scaling_type,
             expes_config.appliance_scaling_type,
+            overlap_str,
         ]
     key = "_".join(str(x) for x in key_elements)
     key = key.replace("/", "-")
@@ -164,11 +176,26 @@ def launch_one_experiment(expes_config: OmegaConf):
 
     logging.info("Process data ...")
     if expes_config.dataset == "UKDALE":
+        overlap = getattr(expes_config, "overlap", 0.0)
+        if overlap == 0:
+            window_stride = expes_config.window_size
+        else:
+            if not (0 < overlap < 1):
+                raise ValueError(
+                    "Invalid overlap value {}. Expected 0 or 0 < overlap < 1.".format(
+                        overlap
+                    )
+                )
+            window_stride = max(
+                1, int(round(expes_config.window_size * (1.0 - float(overlap))))
+            )
+
         data_builder = UKDALE_DataBuilder(
             data_path=f"{expes_config.data_path}/UKDALE/",
             mask_app=expes_config.app,
             sampling_rate=expes_config.sampling_rate,
             window_size=expes_config.window_size,
+            window_stride=window_stride,
         )
 
         data, st_date = data_builder.get_nilm_dataset(house_indicies=[1, 2, 3, 4, 5])
@@ -177,20 +204,37 @@ def launch_one_experiment(expes_config: OmegaConf):
             expes_config.window_size = data_builder.window_size
 
         data_train, st_date_train = data_builder.get_nilm_dataset(
-            house_indicies=expes_config.ind_house_train
+            house_indicies=expes_config.ind_house_train_val
         )
         data_test, st_date_test = data_builder.get_nilm_dataset(
             house_indicies=expes_config.ind_house_test
         )
 
-        data_train, st_date_train, data_valid, st_date_valid = (
-            split_train_test_nilmdataset(
-                data_train,
-                st_date_train,
-                perc_house_test=0.2,
-                seed=expes_config.seed,
+        if overlap == 0:
+            data_train, st_date_train, data_valid, st_date_valid = (
+                split_train_test_nilmdataset(
+                    data_train,
+                    st_date_train,
+                    perc_house_test=0.2,
+                    seed=expes_config.seed,
+                )
             )
-        )
+        else:
+            if not (0 < overlap < 1):
+                raise ValueError(
+                    "Invalid overlap value {}. Expected 0 or 0 < overlap < 1.".format(
+                        overlap
+                    )
+                )
+            data_train, st_date_train, data_valid, st_date_valid = (
+                split_train_valid_timeblock_nilmdataset(
+                    data_train,
+                    st_date_train,
+                    perc_valid=0.2,
+                    window_size=expes_config.window_size,
+                    window_stride=data_builder.window_stride,
+                )
+            )
 
     elif expes_config.dataset == "REFIT":
         data_builder = REFIT_DataBuilder(

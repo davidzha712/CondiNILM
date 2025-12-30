@@ -1,27 +1,27 @@
-data_path: !!str data/
-result_path: !!str result/
-dataset: !!str UKDALE
-name_model: !!str NILMFormer
-sampling_rate: !!str 1min
+data_path:  data/
+result_path:  result/
+dataset:  UKDALE
+name_model:  NILMFormer
+sampling_rate:  1min
 window_size: 256
 list_exo_variables:
   - minute
   - hour
   - dow
   - month
-power_scaling_type: !!str MaxScaling
-appliance_scaling_type: !!str MaxScaling
-batch_size: !!int 64
-epochs: !!int 15
-p_es: !!int 5
-p_rlr: !!int 3
-n_warmup_epochs: !!int 0
-device: !!str cuda
+power_scaling_type:  MaxScaling
+appliance_scaling_type:  MaxScaling
+batch_size:  64
+epochs:  50
+p_es:  5
+p_rlr:  3
+n_warmup_epochs:  0
+device:  cuda
 num_workers: 8
-p_es_eaec: !!int 7
-p_rlr_eaec: !!int 5
-n_warmup_epochs_eaec: !!int 5
-warmup_type_eaec: !!str linear
+p_es_eaec:  7
+p_rlr_eaec:  5
+n_warmup_epochs_eaec:  5
+warmup_type_eaec:  linear
 neg_penalty_weight_eaec: 0.02
 rlr_factor_eaec: 0.5
 rlr_min_lr_eaec: 1e-6

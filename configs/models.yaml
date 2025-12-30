@@ -80,7 +80,7 @@ BERT4NILM:
     use_bert4nilm_postprocessing: false
     cutoff: null
     threshold: null
-    return_values: !!str "power"
+    return_values:  "power"
   model_training_param:
     lr: 1e-4
     wd: 0

@@ -226,6 +226,116 @@ def split_train_test_nilmdataset(data, st_date, perc_house_test=0.2, seed=0):
     return data_train, st_date_train, data_test, st_date_test
 
 
+def split_train_valid_timeblock_nilmdataset(
+    data,
+    st_date,
+    perc_valid=0.2,
+    window_size=None,
+    window_stride=None,
+):
+    assert len(data) == len(st_date)
+    assert isinstance(st_date, pd.DataFrame)
+    assert 0 < perc_valid < 1
+    assert window_size is not None
+    assert window_stride is not None
+
+    if len(data.shape) > 2:
+        tmp_shape = data.shape
+        flat_data = data.reshape(data.shape[0], -1)
+    else:
+        tmp_shape = None
+        flat_data = data
+
+    df = pd.concat([st_date.reset_index(), pd.DataFrame(flat_data)], axis=1).set_index(
+        "index"
+    )
+
+    house_ids = df.index.unique()
+    df_train_list = []
+    df_valid_list = []
+
+    gap_windows = int(np.ceil(float(window_size) / float(window_stride)))
+
+    for house in house_ids:
+        df_house = df.loc[house]
+        if isinstance(df_house, pd.Series):
+            df_house = df_house.to_frame().T
+
+        df_house = df_house.sort_values(by=st_date.columns[0])
+        n = len(df_house)
+        if n <= 1:
+            continue
+
+        n_valid = max(1, int(n * perc_valid))
+        n_train = n - n_valid - gap_windows
+
+        if n_train <= 0:
+            split_idx = int(n * (1 - perc_valid))
+            df_train_list.append(df_house.iloc[:split_idx])
+            df_valid_list.append(df_house.iloc[split_idx:])
+            continue
+
+        if n_train + gap_windows + n_valid > n:
+            overflow = n_train + gap_windows + n_valid - n
+            if overflow > 0:
+                reduce_train = min(overflow, max(0, n_train - 1))
+                n_train -= reduce_train
+                overflow -= reduce_train
+            if overflow > 0:
+                n_valid = max(1, n_valid - overflow)
+            if n_train <= 0 or n_valid <= 0 or n_train + gap_windows + n_valid > n:
+                split_idx = int(n * (1 - perc_valid))
+                df_train_list.append(df_house.iloc[:split_idx])
+                df_valid_list.append(df_house.iloc[split_idx:])
+                continue
+
+        start_valid = n_train + gap_windows
+        end_valid = start_valid + n_valid
+
+        if start_valid >= n:
+            split_idx = int(n * (1 - perc_valid))
+            df_train_list.append(df_house.iloc[:split_idx])
+            df_valid_list.append(df_house.iloc[split_idx:])
+            continue
+
+        end_valid = min(end_valid, n)
+
+        df_train_list.append(df_house.iloc[:n_train])
+        df_valid_list.append(df_house.iloc[start_valid:end_valid])
+
+    if not df_train_list or not df_valid_list:
+        data_train, st_date_train, data_valid, st_date_valid = split_train_test_nilmdataset(
+            data,
+            st_date,
+            perc_house_test=perc_valid,
+            seed=0,
+        )
+        return data_train, st_date_train, data_valid, st_date_valid
+
+    df_train = pd.concat(df_train_list, axis=0)
+    df_valid = pd.concat(df_valid_list, axis=0)
+
+    st_cols = st_date.shape[1]
+    st_date_train = df_train.iloc[:, :st_cols]
+    st_date_valid = df_valid.iloc[:, :st_cols]
+
+    data_train_flat = df_train.iloc[:, st_cols:].to_numpy()
+    data_valid_flat = df_valid.iloc[:, st_cols:].to_numpy()
+
+    if tmp_shape is not None:
+        data_train = data_train_flat.reshape(
+            (len(df_train), tmp_shape[1], tmp_shape[2], tmp_shape[3])
+        )
+        data_valid = data_valid_flat.reshape(
+            (len(df_valid), tmp_shape[1], tmp_shape[2], tmp_shape[3])
+        )
+    else:
+        data_train = data_train_flat
+        data_valid = data_valid_flat
+
+    return data_train, st_date_train, data_valid, st_date_valid
+
+
 def normalize_exogene(x, xmin, xmax, newRange):
     if xmin is None:
         xmin = np.min(x)

@@ -24,6 +24,7 @@ from src.helpers.preprocessing import (
     nilmdataset_to_tser,
     split_train_test_nilmdataset,
     split_train_test_pdl_nilmdataset,
+    split_train_valid_timeblock_nilmdataset,
 )
 from src.helpers.dataset import NILMscaler
 from src.helpers.utils import create_dir
@@ -210,13 +211,16 @@ def suggest_from_space(trial, model_name, hpo_spaces, base_cfg):
 
 def prepare_data(expes_config):
     np.random.seed(seed=expes_config.seed)
-    cache_key = "{}_{}_{}_{}_{}_{}".format(
+    overlap = getattr(expes_config, "overlap", 0.0)
+    overlap_str = "ov{}".format(str(overlap).replace(".", "p"))
+    cache_key = "{}_{}_{}_{}_{}_{}_{}".format(
         expes_config.dataset,
         expes_config.appliance,
         expes_config.sampling_rate,
         expes_config.window_size,
         expes_config.power_scaling_type,
         expes_config.appliance_scaling_type,
+        overlap_str,
     )
     if expes_config.name_model == "DiffNILM":
         cache_key += "_DiffNILM"
@@ -232,29 +236,62 @@ def prepare_data(expes_config):
         expes_config.threshold = cache["threshold"]
         return tuple_data, scaler
     if expes_config.dataset == "UKDALE":
+        overlap = getattr(expes_config, "overlap", 0.0)
+        if overlap == 0:
+            window_stride = expes_config.window_size
+        else:
+            if not (0 < overlap < 1):
+                raise ValueError(
+                    "Invalid overlap value {}. Expected 0 or 0 < overlap < 1.".format(
+                        overlap
+                    )
+                )
+            window_stride = max(
+                1, int(round(expes_config.window_size * (1.0 - float(overlap))))
+            )
+
         data_builder = UKDALE_DataBuilder(
             data_path=f"{expes_config.data_path}/UKDALE/",
             mask_app=expes_config.app,
             sampling_rate=expes_config.sampling_rate,
             window_size=expes_config.window_size,
+            window_stride=window_stride,
         )
         data, st_date = data_builder.get_nilm_dataset(house_indicies=[1, 2, 3, 4, 5])
         if isinstance(expes_config.window_size, str):
             expes_config.window_size = data_builder.window_size
         data_train, st_date_train = data_builder.get_nilm_dataset(
-            house_indicies=expes_config.ind_house_train
+            house_indicies=expes_config.ind_house_train_val
         )
         data_test, st_date_test = data_builder.get_nilm_dataset(
             house_indicies=expes_config.ind_house_test
         )
-        data_train, st_date_train, data_valid, st_date_valid = (
-            split_train_test_nilmdataset(
-                data_train,
-                st_date_train,
-                perc_house_test=0.2,
-                seed=expes_config.seed,
+        overlap = getattr(expes_config, "overlap", 0.0)
+        if overlap == 0:
+            data_train, st_date_train, data_valid, st_date_valid = (
+                split_train_test_nilmdataset(
+                    data_train,
+                    st_date_train,
+                    perc_house_test=0.2,
+                    seed=expes_config.seed,
+                )
             )
-        )
+        else:
+            if not (0 < overlap < 1):
+                raise ValueError(
+                    "Invalid overlap value {}. Expected 0 or 0 < overlap < 1.".format(
+                        overlap
+                    )
+                )
+            data_train, st_date_train, data_valid, st_date_valid = (
+                split_train_valid_timeblock_nilmdataset(
+                    data_train,
+                    st_date_train,
+                    perc_valid=0.2,
+                    window_size=expes_config.window_size,
+                    window_stride=data_builder.window_stride,
+                )
+            )
     elif expes_config.dataset == "REFIT":
         data_builder = REFIT_DataBuilder(
             data_path=f"{expes_config.data_path}/REFIT/RAW_DATA_CLEAN/",

@@ -19,12 +19,16 @@ class NILMCompositeLoss(nn.Module):
         alpha_on=3.0,
         alpha_off=1.0,
         lambda_grad=0.5,
+        lambda_sparse=0.0,
+        lambda_zero=0.0,
     ):
         super().__init__()
         self.threshold = threshold
         self.alpha_on = alpha_on
         self.alpha_off = alpha_off
         self.lambda_grad = lambda_grad
+        self.lambda_sparse = lambda_sparse
+        self.lambda_zero = lambda_zero
         self.base_loss = nn.SmoothL1Loss(reduction="none")
         self.grad_loss = nn.SmoothL1Loss(reduction="mean")
 
@@ -44,7 +48,14 @@ class NILMCompositeLoss(nn.Module):
             loss_grad = self.grad_loss(pred_diff, target_diff)
         else:
             loss_grad = pred.new_tensor(0.0)
-        return loss_main + self.lambda_grad * loss_grad
+        sparse_penalty = pred.abs().mean()
+        zero_penalty = (pred.abs() * mask_off).sum() / (mask_off.sum() + eps)
+        return (
+            loss_main
+            + self.lambda_grad * loss_grad
+            + self.lambda_sparse * sparse_penalty
+            + self.lambda_zero * zero_penalty
+        )
 
 
 class EAECLoss(nn.Module):
@@ -58,6 +69,8 @@ class EAECLoss(nn.Module):
         soft_temp=10.0,
         edge_eps=5.0,
         energy_floor=1.0,
+        lambda_sparse=0.0,
+        lambda_zero=0.0,
     ):
         super().__init__()
         self.threshold = threshold
@@ -68,6 +81,8 @@ class EAECLoss(nn.Module):
         self.soft_temp = soft_temp
         self.edge_eps = edge_eps
         self.energy_floor = energy_floor
+        self.lambda_sparse = lambda_sparse
+        self.lambda_zero = lambda_zero
         self.base_loss = nn.SmoothL1Loss(reduction="none")
         self.grad_loss = nn.SmoothL1Loss(reduction="none")
 
@@ -99,7 +114,15 @@ class EAECLoss(nn.Module):
         weight = energy_target.abs() / denom
         loss_energy = ((energy_pred - energy_target).abs() / denom) * weight
         loss_energy = loss_energy.mean()
-        return loss_main + self.lambda_grad * loss_grad + self.lambda_energy * loss_energy
+        sparse_penalty = pred.abs().mean()
+        zero_penalty = (pred.abs() * p_off).sum() / (p_off.sum() + eps)
+        return (
+            loss_main
+            + self.lambda_grad * loss_grad
+            + self.lambda_energy * loss_energy
+            + self.lambda_sparse * sparse_penalty
+            + self.lambda_zero * zero_penalty
+        )
 
 
 class SeqToSeqLightningModule(pl.LightningModule):
