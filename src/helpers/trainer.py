@@ -192,23 +192,31 @@ class SeqToSeqLightningModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         ts_agg, appl, _ = batch
-        ts_agg = ts_agg.float()
-        target = appl.float()
+        ts_agg = torch.nan_to_num(ts_agg.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        target = torch.nan_to_num(appl.float(), nan=0.0, posinf=0.0, neginf=0.0)
         pred = self(ts_agg)
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
         loss_main = self.criterion(pred, target)
+        loss_main = torch.nan_to_num(loss_main, nan=0.0, posinf=1e4, neginf=-1e4)
         neg_penalty = torch.relu(-pred).mean()
+        neg_penalty = torch.nan_to_num(neg_penalty, nan=0.0, posinf=1e4, neginf=-1e4)
         loss = loss_main + self.neg_penalty_weight * neg_penalty
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         ts_agg, appl, _ = batch
-        ts_agg = ts_agg.float()
-        target = appl.float()
+        ts_agg = torch.nan_to_num(ts_agg.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        target = torch.nan_to_num(appl.float(), nan=0.0, posinf=0.0, neginf=0.0)
         pred = self(ts_agg)
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
         loss_main = self.criterion(pred, target)
+        loss_main = torch.nan_to_num(loss_main, nan=0.0, posinf=1e4, neginf=-1e4)
         neg_penalty = torch.relu(-pred).mean()
+        neg_penalty = torch.nan_to_num(neg_penalty, nan=0.0, posinf=1e4, neginf=-1e4)
         loss = loss_main + self.neg_penalty_weight * neg_penalty
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
@@ -324,23 +332,27 @@ class TserLightningModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         ts_agg, target = batch
-        ts_agg = ts_agg.float()
-        target = target.float()
+        ts_agg = torch.nan_to_num(ts_agg.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        target = torch.nan_to_num(target.float(), nan=0.0, posinf=0.0, neginf=0.0)
         if target.dim() == 1:
             target = target.unsqueeze(1)
         pred = self(ts_agg)
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
         loss = self.criterion(pred, target)
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         ts_agg, target = batch
-        ts_agg = ts_agg.float()
-        target = target.float()
+        ts_agg = torch.nan_to_num(ts_agg.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        target = torch.nan_to_num(target.float(), nan=0.0, posinf=0.0, neginf=0.0)
         if target.dim() == 1:
             target = target.unsqueeze(1)
         pred = self(ts_agg)
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
         loss = self.criterion(pred, target)
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
@@ -441,21 +453,26 @@ class DiffNILMLightningModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         seqs, labels_energy, status = batch
-        seqs = seqs.float()
-        labels_energy = labels_energy.float()
-        status = status.float()
+        seqs = torch.nan_to_num(seqs.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        labels_energy = torch.nan_to_num(
+            labels_energy.float(), nan=0.0, posinf=0.0, neginf=0.0
+        )
+        status = torch.nan_to_num(status.float(), nan=0.0, posinf=0.0, neginf=0.0)
         self.model.train()
         loss = self.model((seqs, labels_energy, status))
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         ts_agg, appl, _ = batch
-        ts_agg = ts_agg.float()
-        target = appl.float()
+        ts_agg = torch.nan_to_num(ts_agg.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        target = torch.nan_to_num(appl.float(), nan=0.0, posinf=0.0, neginf=0.0)
         self.model.eval()
         pred = self.model(ts_agg)
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
         loss = self.criterion(pred, target)
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
@@ -525,23 +542,31 @@ class STNILMLightningModule(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         seqs, labels, status = batch
-        seqs = seqs.float()
-        labels = labels.float()
-        status = status.float()
+        seqs = torch.nan_to_num(seqs.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        labels = torch.nan_to_num(labels.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        status = torch.nan_to_num(status.float(), nan=0.0, posinf=0.0, neginf=0.0)
         self.model.train()
         power_logits, loss_moe = self.model(seqs)
+        power_logits = torch.nan_to_num(
+            power_logits, nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        loss_moe = torch.nan_to_num(loss_moe, nan=0.0, posinf=1e4, neginf=-1e4)
         loss_main = self.criterion(power_logits, labels)
+        loss_main = torch.nan_to_num(loss_main, nan=0.0, posinf=1e4, neginf=-1e4)
         loss = loss_main + self.weight_moe * loss_moe
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         ts_agg, appl, _ = batch
-        ts_agg = ts_agg.float()
-        target = appl.float()
+        ts_agg = torch.nan_to_num(ts_agg.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        target = torch.nan_to_num(appl.float(), nan=0.0, posinf=0.0, neginf=0.0)
         self.model.eval()
         pred = self.model(ts_agg)
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
         loss = self.criterion(pred, target)
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 

@@ -128,11 +128,15 @@ class NILMscaler:
         assert self.is_fitted, "Not fitted yet."
 
         if self.power_scaling_type == "MinMax":
-            data[:, 0, 0, :] = (data[:, 0, 0, :] - self.power_stat1) / (
-                self.power_stat2 - self.power_stat1
-            )
+            denom = self.power_stat2 - self.power_stat1
+            if denom == 0:
+                denom = 1.0
+            data[:, 0, 0, :] = (data[:, 0, 0, :] - self.power_stat1) / denom
         else:
-            data[:, 0, 0, :] = (data[:, 0, 0, :] - self.power_stat1) / self.power_stat2
+            denom = self.power_stat2
+            if denom == 0:
+                denom = 1.0
+            data[:, 0, 0, :] = (data[:, 0, 0, :] - self.power_stat1) / denom
 
         if self.appliance_scaling_type is not None:
             for n_app in range(1, self.n_appliance + 1):
@@ -140,16 +144,22 @@ class NILMscaler:
                     self.appliance_scaling_type == "SameAsPower"
                     and self.power_scaling_type == "MinMax"
                 ):
-                    data[:, n_app, 0, :] = (
-                        data[:, n_app, 0, :] - self.appliance_stat1[n_app - 1]
-                    ) / (
+                    denom = (
                         self.appliance_stat2[n_app - 1]
                         - self.appliance_stat1[n_app - 1]
                     )
-                else:
+                    if denom == 0:
+                        denom = 1.0
                     data[:, n_app, 0, :] = (
                         data[:, n_app, 0, :] - self.appliance_stat1[n_app - 1]
-                    ) / self.appliance_stat2[n_app - 1]
+                    ) / denom
+                else:
+                    denom = self.appliance_stat2[n_app - 1]
+                    if denom == 0:
+                        denom = 1.0
+                    data[:, n_app, 0, :] = (
+                        data[:, n_app, 0, :] - self.appliance_stat1[n_app - 1]
+                    ) / denom
 
         if self.scale_temperature:
             data[:, 0, 1, :] = (self.newRange_temp[1] - self.newRange_temp[0]) * (
@@ -160,6 +170,7 @@ class NILMscaler:
                 / (self.temp_max - self.temp_min)
             ) + self.newRange_temp[0]
 
+        data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
         return data
 
     def fit_transform(self, data):
@@ -470,15 +481,17 @@ class TSDatasetScaling(torch.utils.data.Dataset):
 
         if self.scale_data:
             if self.inst_scaling:
-                tmp_sample = (
-                    tmp_sample - np.mean(tmp_sample, axis=1, keepdims=True)
-                ) / (np.std(tmp_sample, axis=1, keepdims=True) + 1e-9)
+                tmp_sample = (tmp_sample - np.mean(tmp_sample, axis=1, keepdims=True)) / (
+                    np.std(tmp_sample, axis=1, keepdims=True) + 1e-9
+                )
             else:
                 tmp_sample = (tmp_sample - self.mean) / self.std
 
         if self.n_var is not None:
             exo = self._create_exogene(idx)
             tmp_sample = np.concatenate((tmp_sample, exo), axis=0)
+
+        tmp_sample = np.nan_to_num(tmp_sample, nan=0.0, posinf=0.0, neginf=0.0)
 
         if self.labels is None:
             return tmp_sample
@@ -655,11 +668,25 @@ class NILMDataset(torch.utils.data.Dataset):
         if self.cam is not None:
             tmp_sample = np.concatenate((tmp_sample, self.cam[idx, :, :]), axis=0)
 
+        tmp_sample = np.nan_to_num(tmp_sample, nan=0.0, posinf=0.0, neginf=0.0)
+        target_power = np.nan_to_num(
+            self.samples[idx, 1:2, 0, :].astype(np.float32),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        target_state = np.nan_to_num(
+            self.samples[idx, 1:2, 1, :].astype(np.float32),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+
         if self.pretraining:
             return tmp_sample.astype(np.float32)
         else:
             return (
                 tmp_sample.astype(np.float32),
-                self.samples[idx, 1:2, 0, :].astype(np.float32),
-                self.samples[idx, 1:2, 1, :].astype(np.float32),
+                target_power,
+                target_state,
             )
