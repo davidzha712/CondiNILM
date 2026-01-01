@@ -13,7 +13,7 @@ list_exo_variables:
 power_scaling_type:  MaxScaling
 appliance_scaling_type:  MaxScaling
 
-batch_size:  64
+batch_size:  256
 epochs:  15
 p_es:  5
 p_rlr:  3

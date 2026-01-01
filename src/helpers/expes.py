@@ -785,9 +785,10 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     num_workers = getattr(expes_config, "num_workers", 0)
     persistent_workers = num_workers > 0
     pin_memory = expes_config.device == "cuda"
+    batch_size = expes_config.batch_size
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
-        batch_size=expes_config.batch_size,
+        batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         persistent_workers=persistent_workers,
@@ -795,7 +796,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     )
     valid_loader = torch.utils.data.DataLoader(
         valid_dataset,
-        batch_size=expes_config.batch_size,
+        batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         persistent_workers=persistent_workers,
@@ -803,7 +804,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     )
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
-        batch_size=expes_config.batch_size,
+        batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         persistent_workers=persistent_workers,
@@ -970,7 +971,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     gradient_clip_val = 0.0
     if loss_type == "eaec":
         gradient_clip_val = float(getattr(expes_config, "gradient_clip_val_eaec", 1.0))
-    trainer = pl.Trainer(
+    trainer_kwargs = dict(
         max_epochs=expes_config.epochs,
         accelerator=accelerator,
         devices=devices,
@@ -981,6 +982,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         logger=tb_logger,
         gradient_clip_val=gradient_clip_val,
     )
+    trainer = pl.Trainer(**trainer_kwargs)
     logging.info("Model training...")
     if ckpt_path_resume is not None:
         trainer.fit(

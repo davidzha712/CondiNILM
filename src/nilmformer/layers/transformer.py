@@ -2,11 +2,8 @@
 #
 # @author : Siyi Li (TU Braunschweig)
 # @description : NILMFormer - Transformer Layers
-
 #
 #################################################################################################################
-
-import numpy as np
 
 import torch
 import torch.nn as nn
@@ -15,18 +12,6 @@ import torch.nn.functional as F
 from typing import Any
 
 from src.nilmformer.congif import NILMFormerConfig
-
-
-class DiagonalMaskFromSeqlen:
-    def __init__(self, B, L, device="cpu"):
-        with torch.no_grad():
-            self._mask = torch.diag(
-                torch.ones(L, dtype=torch.bool, device=device)
-            ).repeat(B, 1, 1, 1)
-
-    @property
-    def mask(self) -> torch.Tensor:
-        return self._mask
 
 
 class DiagonnalyMaskedSelfAttention(nn.Module):
@@ -62,22 +47,31 @@ class DiagonnalyMaskedSelfAttention(nn.Module):
         x: torch.Tensor,
     ) -> torch.Tensor:
         batch, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
-        xq = xq.view(batch, seqlen, self.n_heads, self.head_dim)
-        xk = xk.view(batch, seqlen, self.n_heads, self.head_dim)
-        xv = xv.view(batch, seqlen, self.n_heads, self.head_dim)
-        xq = xq.permute(0, 2, 1, 3)
-        xk = xk.permute(0, 2, 1, 3)
-        xv = xv.permute(0, 2, 1, 3)
-        diag_mask = DiagonalMaskFromSeqlen(batch, seqlen, device=xq.device)
-        scale = 1.0 / xq.shape[-1] ** 0.5
+        xq = self.wq(x)
+        xk = self.wk(x)
+        xv = self.wv(x)
+
+        xq = xq.view(batch, seqlen, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        xk = xk.view(batch, seqlen, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+        xv = xv.view(batch, seqlen, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
+
         scores = torch.einsum("bhle,bhse->bhls", xq, xk)
-        attn = self.attn_dropout(
-            torch.softmax(
-                scale * scores.masked_fill_(diag_mask.mask.repeat(1, self.n_heads, 1, 1), -np.inf),
-                dim=-1,
-            )
-        )
+        scores = scores * self.scale
+
+        diag_mask = torch.eye(
+            seqlen, dtype=torch.bool, device=xq.device
+        ).unsqueeze(0).unsqueeze(0)
+        scores = scores.masked_fill(diag_mask, float("-inf"))
+
+        max_scores = scores.max(dim=-1, keepdim=True).values
+        scores = scores - max_scores
+        scores = torch.exp(scores)
+        scores = scores.masked_fill(diag_mask, 0.0)
+        denom = scores.sum(dim=-1, keepdim=True)
+        attn = scores / (denom + 1e-9)
+        attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
+        attn = self.attn_dropout(attn)
+
         output = torch.einsum("bhls,bhsd->bhld", attn, xv)
         output = output.permute(0, 2, 1, 3)
         return self.out_dropout(self.wo(output.reshape(batch, seqlen, -1)))
@@ -131,16 +125,13 @@ class EncoderLayer(nn.Module):
         )
 
     def forward(self, x) -> torch.Tensor:
-        # x input and output shape [batch, seq_length, d_model] to meet Transformer Convention
-
-        # Attention Block
         x = self.norm1(x)
         new_x = self.attention_layer(x)
         x = torch.add(x, new_x)
 
-        # PFFN Block
         x = self.norm2(x)
         new_x = self.pffn(x)
+        new_x = torch.nan_to_num(new_x, nan=0.0, posinf=1e4, neginf=-1e4)
         x = torch.add(x, self.dropout(new_x))
 
         return x
