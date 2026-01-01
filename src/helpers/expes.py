@@ -148,6 +148,7 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
         and hasattr(dataset, "L")
     )
     sample_idx = 0
+    timestamps_set = set()
     with torch.no_grad():
         for ts_agg, appl, _ in valid_loader:
             model.eval()
@@ -165,8 +166,12 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
                 pred_t.detach().cpu().numpy()
             )
             batch_size = agg_np.shape[0]
-            if has_time:
-                for b in range(batch_size):
+            if target_concat is None:
+                n_app = target_np.shape[1]
+                target_concat = [[] for _ in range(n_app)]
+                pred_concat = [[] for _ in range(n_app)]
+            for b in range(batch_size):
+                if has_time:
                     idx = sample_idx + b
                     start = dataset.st_date[idx]
                     tmp = pd.date_range(
@@ -174,19 +179,23 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
                         periods=agg_np.shape[2],
                         freq=dataset.freq,
                     )
-                    timestamps_concat.extend(
-                        tmp.strftime("%Y-%m-%d %H:%M:%S").tolist()
-                    )
+                    ts_list = tmp.strftime("%Y-%m-%d %H:%M:%S").tolist()
+                    for t, ts_str in enumerate(ts_list):
+                        if ts_str in timestamps_set:
+                            continue
+                        timestamps_set.add(ts_str)
+                        timestamps_concat.append(ts_str)
+                        agg_concat.append(float(agg_np[b, 0, t]))
+                        for j in range(target_np.shape[1]):
+                            target_concat[j].append(float(target_np[b, j, t]))
+                            pred_concat[j].append(float(pred_np[b, j, t]))
+                else:
+                    for t in range(agg_np.shape[2]):
+                        agg_concat.append(float(agg_np[b, 0, t]))
+                        for j in range(target_np.shape[1]):
+                            target_concat[j].append(float(target_np[b, j, t]))
+                            pred_concat[j].append(float(pred_np[b, j, t]))
             sample_idx += batch_size
-            if target_concat is None:
-                n_app = target_np.shape[1]
-                target_concat = [[] for _ in range(n_app)]
-                pred_concat = [[] for _ in range(n_app)]
-            for b in range(batch_size):
-                agg_concat.extend(agg_np[b, 0, :].tolist())
-                for j in range(target_np.shape[1]):
-                    target_concat[j].extend(target_np[b, j, :].tolist())
-                    pred_concat[j].extend(pred_np[b, j, :].tolist())
     if target_concat is None:
         return
     n_app = len(target_concat)
