@@ -71,23 +71,23 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     ratio_clipped = min(max(ratio, 1.0), 10.0)
     lambda_grad = 0.2 + (0.8 - 0.2) * (ratio_clipped - 1.0) / 9.0
     if duty_cycle < 0.01:
-        alpha_on = 4.0
-        alpha_off = 1.0
-    elif duty_cycle < 0.03:
-        alpha_on = 3.5
-        alpha_off = 1.0
-    elif duty_cycle < 0.10:
+        alpha_on = 6.0
+        alpha_off = 0.5
+    elif duty_cycle < 0.05:
+        alpha_on = 4.5
+        alpha_off = 0.8
+    elif duty_cycle < 0.15:
         alpha_on = 3.0
         alpha_off = 1.0
     else:
         alpha_on = 2.0
         alpha_off = 1.0
     if duty_cycle < 0.01:
-        lambda_energy = 0.02
-    elif duty_cycle < 0.03:
-        lambda_energy = 0.05
-    elif duty_cycle < 0.10:
-        lambda_energy = 0.10
+        lambda_energy = 0.01
+    elif duty_cycle < 0.05:
+        lambda_energy = 0.03
+    elif duty_cycle < 0.15:
+        lambda_energy = 0.08
     else:
         lambda_energy = 0.20
 
@@ -121,20 +121,20 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     expes_config["loss_energy_floor_raw"] = float(energy_floor_raw)
     duty = float(duty_cycle)
     if duty <= 0.002:
-        lambda_zero = 0.7
-        lambda_sparse = 0.07
+        lambda_zero = 1.0
+        lambda_sparse = 0.10
     elif duty <= 0.01:
-        lambda_zero = 0.45
-        lambda_sparse = 0.045
+        lambda_zero = 0.8
+        lambda_sparse = 0.08
     elif duty <= 0.05:
-        lambda_zero = 0.25
-        lambda_sparse = 0.025
+        lambda_zero = 0.5
+        lambda_sparse = 0.05
     elif duty <= 0.3:
-        lambda_zero = 0.12
-        lambda_sparse = 0.012
+        lambda_zero = 0.2
+        lambda_sparse = 0.02
     else:
-        lambda_zero = 0.05
-        lambda_sparse = 0.005
+        lambda_zero = 0.08
+        lambda_sparse = 0.008
     expes_config["loss_lambda_zero"] = float(lambda_zero)
     expes_config["loss_lambda_sparse"] = float(lambda_sparse)
 

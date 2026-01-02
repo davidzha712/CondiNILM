@@ -13,15 +13,16 @@ list_exo_variables:
 power_scaling_type:  MaxScaling
 appliance_scaling_type:  MaxScaling
 
-batch_size:  256
+batch_size:  64
 epochs:  15
 p_es:  5
 p_rlr:  3
 n_warmup_epochs:  0
 
 device:  auto          # auto / cuda / mps / cpu
+accumulate_grad_batches: 1
 
-num_workers: 8
+num_workers: 16
 
 # EAEC Related Parameters
 p_es_eaec:  7
@@ -35,3 +36,12 @@ gradient_clip_val_eaec: 1.0
 
 # seq2subseq Center Supervision Ratio
 loss_center_ratio: 0.8
+
+# Zero-run penalty for target=0 segments
+state_zero_penalty_weight: 0.1
+state_zero_kernel: 48
+state_zero_ratio: 0.9
+
+postprocess_min_on_steps: 3
+
+off_high_agg_penalty_weight: 0.3

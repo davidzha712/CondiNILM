@@ -569,6 +569,7 @@ class ValidationNILMMetricCallback(pl.Callback):
     def on_validation_epoch_end(self, trainer, pl_module):
         device = pl_module.device
         threshold_small_values = self.expes_config.threshold
+        min_on_steps = int(getattr(self.expes_config, "postprocess_min_on_steps", 0))
         y = np.array([])
         y_hat = np.array([])
         y_win = np.array([])
@@ -584,6 +585,10 @@ class ValidationNILMMetricCallback(pl.Callback):
                 target_inv = self.scaler.inverse_transform_appliance(target)
                 pred_inv = self.scaler.inverse_transform_appliance(pred)
                 pred_inv[pred_inv < threshold_small_values] = 0
+                if min_on_steps > 1:
+                    pred_inv = suppress_short_activations(
+                        pred_inv, threshold_small_values, min_on_steps
+                    )
                 target_win = target_inv.sum(dim=-1)
                 pred_win = pred_inv.sum(dim=-1)
                 target_flat = torch.flatten(target_inv).detach().cpu().numpy()
@@ -644,6 +649,29 @@ class ValidationNILMMetricCallback(pl.Callback):
             writer.add_scalar("valid_win/" + name, float(value), epoch_idx)
 
 
+def suppress_short_activations(pred_inv, threshold_small_values, min_on_steps):
+    if min_on_steps <= 1:
+        return pred_inv
+    if pred_inv.dim() != 3:
+        return pred_inv
+    pred_np = pred_inv.detach().cpu().numpy()
+    b, c, t = pred_np.shape
+    for i in range(b):
+        for j in range(c):
+            series = pred_np[i, j]
+            on_mask = series >= float(threshold_small_values)
+            if not on_mask.any():
+                continue
+            idx = np.nonzero(on_mask)[0]
+            if idx.size == 0:
+                continue
+            splits = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
+            for seg in splits:
+                if seg.size < min_on_steps:
+                    series[seg] = 0.0
+    return torch.from_numpy(pred_np).to(pred_inv.device)
+
+
 def evaluate_nilm_split(
     model,
     data_loader,
@@ -653,6 +681,7 @@ def evaluate_nilm_split(
     save_outputs,
     mask,
     log_dict,
+    min_on_duration_steps=0,
 ):
     metrics_helper = NILMmetrics()
     y = np.array([])
@@ -676,6 +705,10 @@ def evaluate_nilm_split(
             target_inv = scaler.inverse_transform_appliance(target)
             pred_inv = scaler.inverse_transform_appliance(pred)
             pred_inv[pred_inv < threshold_small_values] = 0
+            if min_on_duration_steps and min_on_duration_steps > 1:
+                pred_inv = suppress_short_activations(
+                    pred_inv, threshold_small_values, min_on_duration_steps
+                )
             target_win = target_inv.sum(dim=-1)
             pred_win = pred_inv.sum(dim=-1)
             target_flat = torch.flatten(target_inv).detach().cpu().numpy()
@@ -867,7 +900,9 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         )
     else:
         loss_type = str(getattr(expes_config, "loss_type", "eaec"))
-        threshold_loss = float(getattr(expes_config, "loss_threshold", expes_config.threshold))
+        threshold_loss = float(
+            getattr(expes_config, "loss_threshold", expes_config.threshold)
+        )
         if loss_type == "eaec":
             alpha_on = float(getattr(expes_config, "loss_alpha_on", 3.0))
             alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
@@ -910,6 +945,14 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             criterion = nn.L1Loss()
         else:
             raise ValueError(f"Unsupported loss_type: {loss_type}")
+        state_zero_penalty_weight = float(
+            getattr(expes_config, "state_zero_penalty_weight", 0.0)
+        )
+        zero_run_kernel = int(getattr(expes_config, "state_zero_kernel", 0))
+        zero_run_ratio = float(getattr(expes_config, "state_zero_ratio", 0.8))
+        off_high_agg_penalty_weight = float(
+            getattr(expes_config, "off_high_agg_penalty_weight", 0.0)
+        )
         lightning_module = SeqToSeqLightningModule(
             inst_model,
             learning_rate=float(expes_config.model_training_param.lr),
@@ -921,6 +964,11 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             neg_penalty_weight=float(getattr(expes_config, "neg_penalty_weight", 0.1)),
             rlr_factor=float(getattr(expes_config, "rlr_factor", 0.1)),
             rlr_min_lr=float(getattr(expes_config, "rlr_min_lr", 0.0)),
+            state_zero_penalty_weight=state_zero_penalty_weight,
+            zero_run_kernel=zero_run_kernel,
+            zero_run_ratio=zero_run_ratio,
+            loss_threshold=threshold_loss,
+            off_high_agg_penalty_weight=off_high_agg_penalty_weight,
         )
     accelerator = "cpu"
     devices = 1
@@ -977,6 +1025,11 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     gradient_clip_val = 0.0
     if loss_type == "eaec":
         gradient_clip_val = float(getattr(expes_config, "gradient_clip_val_eaec", 1.0))
+    accumulate_grad_batches = int(
+        getattr(expes_config, "accumulate_grad_batches", 1)
+    )
+    if accumulate_grad_batches < 1:
+        accumulate_grad_batches = 1
     trainer_kwargs = dict(
         max_epochs=expes_config.epochs,
         accelerator=accelerator,
@@ -987,6 +1040,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         enable_checkpointing=True,
         logger=tb_logger,
         gradient_clip_val=gradient_clip_val,
+        accumulate_grad_batches=accumulate_grad_batches,
     )
     trainer = pl.Trainer(**trainer_kwargs)
     if ckpt_path_resume is not None:
@@ -1025,6 +1079,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     if not skip_final_eval:
         logging.info("Eval model...")
         logging.info("Eval valid split metrics...")
+        min_on_steps = int(getattr(expes_config, "postprocess_min_on_steps", 0))
         evaluate_nilm_split(
             inst_model,
             valid_loader,
@@ -1034,6 +1089,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             True,
             "valid_metrics",
             eval_log,
+            min_on_steps,
         )
         logging.info("Eval test split metrics...")
         evaluate_nilm_split(
@@ -1045,6 +1101,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             True,
             "test_metrics",
             eval_log,
+            min_on_steps,
         )
         if expes_config.name_model == "DiffNILM":
             eval_win_energy_aggregation(

@@ -8,6 +8,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import pytorch_lightning as pl
 
@@ -110,6 +111,11 @@ class SeqToSeqLightningModule(pl.LightningModule):
         neg_penalty_weight=0.1,
         rlr_factor=0.1,
         rlr_min_lr=0.0,
+        state_zero_penalty_weight=0.0,
+        zero_run_kernel=0,
+        zero_run_ratio=0.8,
+        loss_threshold=0.0,
+        off_high_agg_penalty_weight=0.0,
     ):
         super().__init__()
         self.model = model
@@ -125,6 +131,11 @@ class SeqToSeqLightningModule(pl.LightningModule):
         self.neg_penalty_weight = float(neg_penalty_weight)
         self.rlr_factor = float(rlr_factor)
         self.rlr_min_lr = float(rlr_min_lr)
+        self.state_zero_penalty_weight = float(state_zero_penalty_weight)
+        self.zero_run_kernel = int(zero_run_kernel)
+        self.zero_run_ratio = float(zero_run_ratio)
+        self.loss_threshold = float(loss_threshold)
+        self.off_high_agg_penalty_weight = float(off_high_agg_penalty_weight)
         self.best_val_loss = float("inf")
         self.best_epoch = -1
         self.best_model_state_dict = None
@@ -133,6 +144,88 @@ class SeqToSeqLightningModule(pl.LightningModule):
 
     def forward(self, ts_agg):
         return self.model(ts_agg)
+
+    def _zero_run_penalty(self, pred, target):
+        if self.state_zero_penalty_weight <= 0.0 or self.zero_run_kernel <= 1:
+            return pred.new_tensor(0.0)
+        eps = 1e-6
+        thr = max(float(self.loss_threshold), 0.0)
+        target = target.float()
+        target_abs = target.abs()
+        if thr > 0.0:
+            zero_mask = (target_abs <= thr).float()
+        else:
+            zero_mask = (target_abs < eps).float()
+        min_len = min(int(self.zero_run_kernel), target.size(-1))
+        if min_len <= 1:
+            return pred.new_tensor(0.0)
+        long_zero_mask = torch.zeros_like(zero_mask)
+        B, C, L = zero_mask.shape
+        for b in range(B):
+            for c in range(C):
+                row = zero_mask[b, c]  # [L]
+                if row.sum() <= 0:
+                    continue
+                diff = row[1:] - row[:-1]
+                starts = (diff == 1).nonzero(as_tuple=False).flatten() + 1
+                ends = (diff == -1).nonzero(as_tuple=False).flatten() + 1
+                if row[0] > 0.5:
+                    starts = torch.cat(
+                        [torch.tensor([0], device=row.device, dtype=starts.dtype), starts]
+                    )
+                if row[-1] > 0.5:
+                    ends = torch.cat(
+                        [ends, torch.tensor([L], device=row.device, dtype=ends.dtype)]
+                    )
+                if starts.numel() == 0 or ends.numel() == 0:
+                    continue
+                n_seg = min(starts.numel(), ends.numel())
+                starts = starts[:n_seg]
+                ends = ends[:n_seg]
+                for s, e in zip(starts.tolist(), ends.tolist()):
+                    if e - s >= min_len:
+                        long_zero_mask[b, c, s:e] = 1.0
+        if long_zero_mask.sum() <= 0:
+            return pred.new_tensor(0.0)
+        p_abs = pred.float().abs()
+        if thr > 0.0:
+            p_above = torch.relu(p_abs - thr)
+        else:
+            p_above = p_abs
+        penalty = (p_above * long_zero_mask).sum() / (long_zero_mask.sum() + eps)
+        return self.state_zero_penalty_weight * penalty
+
+    def _off_high_agg_penalty(self, pred, target, ts_agg):
+        if self.off_high_agg_penalty_weight <= 0.0:
+            return pred.new_tensor(0.0)
+        eps = 1e-6
+        thr_t = max(float(self.loss_threshold), 0.0)
+        target = target.float()
+        target_abs = target.abs()
+        if thr_t > 0.0:
+            off_mask = (target_abs <= thr_t).float()
+        else:
+            off_mask = (target_abs < eps).float()
+        ts_agg = ts_agg.float().abs()
+        if ts_agg.ndim == 3:
+            agg_main = ts_agg[:, 0, :]
+        else:
+            agg_main = ts_agg
+        max_per = agg_main.amax(dim=-1, keepdim=True)
+        high_thr = 0.5 * max_per
+        high_mask = (agg_main >= high_thr).float()
+        if off_mask.ndim == 3 and high_mask.ndim == 2:
+            high_mask = high_mask.unsqueeze(1)
+        joint_mask = off_mask * high_mask
+        if joint_mask.sum() <= 0:
+            return pred.new_tensor(0.0)
+        p_abs = pred.float().abs()
+        if thr_t > 0.0:
+            excess = torch.relu(p_abs - thr_t)
+        else:
+            excess = p_abs
+        penalty = (excess * joint_mask).sum() / (joint_mask.sum() + eps)
+        return self.off_high_agg_penalty_weight * penalty
 
     def training_step(self, batch, batch_idx):
         ts_agg, appl, _ = batch
@@ -144,7 +237,20 @@ class SeqToSeqLightningModule(pl.LightningModule):
         loss_main = torch.nan_to_num(loss_main, nan=0.0, posinf=1e4, neginf=-1e4)
         neg_penalty = torch.relu(-pred).mean()
         neg_penalty = torch.nan_to_num(neg_penalty, nan=0.0, posinf=1e4, neginf=-1e4)
-        loss = loss_main + self.neg_penalty_weight * neg_penalty
+        zero_run_penalty = self._zero_run_penalty(pred, target)
+        zero_run_penalty = torch.nan_to_num(
+            zero_run_penalty, nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        off_high_agg_penalty = self._off_high_agg_penalty(pred, target, ts_agg)
+        off_high_agg_penalty = torch.nan_to_num(
+            off_high_agg_penalty, nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        loss = (
+            loss_main
+            + zero_run_penalty
+            + off_high_agg_penalty
+            + self.neg_penalty_weight * neg_penalty
+        )
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
@@ -159,7 +265,20 @@ class SeqToSeqLightningModule(pl.LightningModule):
         loss_main = torch.nan_to_num(loss_main, nan=0.0, posinf=1e4, neginf=-1e4)
         neg_penalty = torch.relu(-pred).mean()
         neg_penalty = torch.nan_to_num(neg_penalty, nan=0.0, posinf=1e4, neginf=-1e4)
-        loss = loss_main + self.neg_penalty_weight * neg_penalty
+        zero_run_penalty = self._zero_run_penalty(pred, target)
+        zero_run_penalty = torch.nan_to_num(
+            zero_run_penalty, nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        off_high_agg_penalty = self._off_high_agg_penalty(pred, target, ts_agg)
+        off_high_agg_penalty = torch.nan_to_num(
+            off_high_agg_penalty, nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        loss = (
+            loss_main
+            + zero_run_penalty
+            + off_high_agg_penalty
+            + self.neg_penalty_weight * neg_penalty
+        )
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
