@@ -35,11 +35,3 @@ gradient_clip_val_eaec: 1.0
 
 # seq2subseq Center Supervision Ratio
 loss_center_ratio: 0.8
-
-# Loss Hyperparameters
-loss_alpha_on: 3.0
-loss_alpha_off: 1.5
-loss_lambda_grad: 0.1
-loss_lambda_sparse: 0.001
-loss_lambda_zero: 0.01
-loss_lambda_energy: 0.05

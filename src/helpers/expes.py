@@ -19,7 +19,6 @@ from tqdm import tqdm
 import torch.nn as nn
 
 from src.helpers.trainer import (
-    NILMCompositeLoss,
     EAECLoss,
     SeqToSeqLightningModule,
     TserLightningModule,
@@ -270,7 +269,7 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
             data_m = {}
         runs = data_m.get("runs")
         if isinstance(runs, list):
-            new_runs = []
+            epoch_to_run = {}
             for run in runs:
                 if not isinstance(run, dict):
                     continue
@@ -282,8 +281,14 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
                 else:
                     pred_list = pred_list[:total_n]
                 run["pred"] = pred_list
-                new_runs.append(run)
-            data_m["runs"] = new_runs
+                epoch_val = run.get("epoch")
+                if isinstance(epoch_val, (int, float)):
+                    epoch_val = int(epoch_val)
+                else:
+                    epoch_val = -1
+                run["epoch"] = epoch_val
+                epoch_to_run[epoch_val] = run
+            data_m["runs"] = list(epoch_to_run.values())
         else:
             epoch_val = data_m.get("epoch")
             if isinstance(epoch_val, (int, float)):
@@ -545,7 +550,9 @@ class ValidationHTMLCallback(pl.Callback):
         self.expes_config = expes_config
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        epoch_idx = trainer.current_epoch + 1
+        if getattr(trainer, "sanity_checking", False):
+            return
+        epoch_idx = int(trainer.current_epoch)
         _save_val_data(
             pl_module, self.valid_loader, self.scaler, self.expes_config, epoch_idx
         )
@@ -764,7 +771,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             freq=expes_config.sampling_rate,
         )
 
-    loss_type = str(getattr(expes_config, "loss_type", "nilm_composite"))
+    loss_type = str(getattr(expes_config, "loss_type", "eaec"))
     if loss_type == "eaec" and expes_config.name_model == "NILMFormer":
         p_es_eaec = getattr(expes_config, "p_es_eaec", None)
         if p_es_eaec is not None:
@@ -859,25 +866,9 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             warmup_type=getattr(expes_config, "warmup_type", "linear"),
         )
     else:
-        loss_type = str(getattr(expes_config, "loss_type", "nilm_composite"))
+        loss_type = str(getattr(expes_config, "loss_type", "eaec"))
         threshold_loss = float(getattr(expes_config, "loss_threshold", expes_config.threshold))
-        if loss_type == "nilm_composite":
-            alpha_on = float(getattr(expes_config, "loss_alpha_on", 3.0))
-            alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
-            lambda_grad = float(getattr(expes_config, "loss_lambda_grad", 0.5))
-            lambda_sparse = float(getattr(expes_config, "loss_lambda_sparse", 0.0))
-            lambda_zero = float(getattr(expes_config, "loss_lambda_zero", 0.0))
-            center_ratio = float(getattr(expes_config, "loss_center_ratio", 1.0))
-            criterion = NILMCompositeLoss(
-                threshold=threshold_loss,
-                alpha_on=alpha_on,
-                alpha_off=alpha_off,
-                lambda_grad=lambda_grad,
-                lambda_sparse=lambda_sparse,
-                lambda_zero=lambda_zero,
-                center_ratio=center_ratio,
-            )
-        elif loss_type == "eaec":
+        if loss_type == "eaec":
             alpha_on = float(getattr(expes_config, "loss_alpha_on", 3.0))
             alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
             lambda_grad = float(getattr(expes_config, "loss_lambda_grad", 0.5))
@@ -970,13 +961,19 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         expes_config.name_model,
     )
     tb_logger = pl.loggers.TensorBoardLogger(save_dir=tb_root, name=tb_name)
-    resume_flag = getattr(expes_config, "resume", False)
+    resume_flag = bool(getattr(expes_config, "resume", False))
     ckpt_path_resume = None
     if resume_flag:
         ckpt_last = os.path.join(ckpt_root, ckpt_name + "_last.ckpt")
         if os.path.isfile(ckpt_last):
             ckpt_path_resume = ckpt_last
-    loss_type = str(getattr(expes_config, "loss_type", "nilm_composite"))
+            logging.info("Resume training from last checkpoint: %s", ckpt_last)
+        else:
+            logging.info(
+                "Resume flag is set but no last checkpoint found at %s, train from scratch.",
+                ckpt_last,
+            )
+    loss_type = str(getattr(expes_config, "loss_type", "eaec"))
     gradient_clip_val = 0.0
     if loss_type == "eaec":
         gradient_clip_val = float(getattr(expes_config, "gradient_clip_val_eaec", 1.0))
@@ -992,8 +989,8 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         gradient_clip_val=gradient_clip_val,
     )
     trainer = pl.Trainer(**trainer_kwargs)
-    logging.info("Model training...")
     if ckpt_path_resume is not None:
+        logging.info("Start model training with explicit resume.")
         trainer.fit(
             lightning_module,
             train_dataloaders=train_loader,
@@ -1001,6 +998,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             ckpt_path=ckpt_path_resume,
         )
     else:
+        logging.info("Start model training from scratch (no resume).")
         trainer.fit(
             lightning_module,
             train_dataloaders=train_loader,
@@ -1102,21 +1100,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                         tag = split + sub + "/" + name
                         writer.add_scalar(tag, float(value), epoch_idx)
     else:
-        logging.info("Skip final eval metrics, only save visualization HTML.")
-    try:
-        if hasattr(lightning_module, "best_epoch") and lightning_module.best_epoch >= 0:
-            epoch_idx_html = int(lightning_module.best_epoch) + 1
-        else:
-            epoch_idx_html = int(lightning_module.current_epoch) + 1
-        _save_val_data(
-            inst_model,
-            valid_loader,
-            scaler,
-            expes_config,
-            epoch_idx_html,
-        )
-    except Exception as e:
-        logging.warning("Could not save NILM validation HTML: %s", e)
+        logging.info("Skip final eval metrics.")
     result_root = os.path.dirname(
         os.path.dirname(os.path.dirname(expes_config.result_path))
     )
@@ -1232,12 +1216,18 @@ def tser_model_training(inst_model, tuple_data, expes_config):
         filename=ckpt_name + "_{epoch:03d}",
     )
     callbacks.append(checkpoint_callback)
-    resume_flag = getattr(expes_config, "resume", False)
+    resume_flag = bool(getattr(expes_config, "resume", False))
     ckpt_path_resume = None
     if resume_flag:
         ckpt_last = os.path.join(ckpt_root, ckpt_name + "_last.ckpt")
         if os.path.isfile(ckpt_last):
             ckpt_path_resume = ckpt_last
+            logging.info("Resume TSER training from last checkpoint: %s", ckpt_last)
+        else:
+            logging.info(
+                "Resume flag is set for TSER but no last checkpoint found at %s, train from scratch.",
+                ckpt_last,
+            )
     trainer = pl.Trainer(
         max_epochs=expes_config.epochs,
         accelerator=accelerator,
@@ -1248,8 +1238,8 @@ def tser_model_training(inst_model, tuple_data, expes_config):
         enable_checkpointing=True,
         logger=tb_logger,
     )
-    logging.info("Model training...")
     if ckpt_path_resume is not None:
+        logging.info("Start TSER model training with explicit resume.")
         trainer.fit(
             lightning_module,
             train_dataloaders=train_loader,
@@ -1257,6 +1247,7 @@ def tser_model_training(inst_model, tuple_data, expes_config):
             ckpt_path=ckpt_path_resume,
         )
     else:
+        logging.info("Start TSER model training from scratch (no resume).")
         trainer.fit(
             lightning_module,
             train_dataloaders=train_loader,

@@ -92,7 +92,7 @@ def main():
         default=None,
         help=(
             "Forwarded to scripts.run_one_expe. Choices: "
-            "'nilm_composite', 'eaec', 'smoothl1', 'mse', 'mae'."
+            "'eaec', 'smoothl1', 'mse', 'mae'."
         ),
     )
     args = parser.parse_args()

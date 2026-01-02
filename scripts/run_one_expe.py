@@ -72,10 +72,10 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     lambda_grad = 0.2 + (0.8 - 0.2) * (ratio_clipped - 1.0) / 9.0
     if duty_cycle < 0.01:
         alpha_on = 4.0
-        alpha_off = 0.5
+        alpha_off = 1.0
     elif duty_cycle < 0.03:
         alpha_on = 3.5
-        alpha_off = 0.7
+        alpha_off = 1.0
     elif duty_cycle < 0.10:
         alpha_on = 3.0
         alpha_off = 1.0
@@ -112,28 +112,31 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     except Exception:
         energy_floor_raw = thr * power.shape[-1] * 0.1
 
-    if "loss_alpha_on" not in expes_config:
-        expes_config["loss_alpha_on"] = float(alpha_on)
-    if "loss_alpha_off" not in expes_config:
-        expes_config["loss_alpha_off"] = float(alpha_off)
-    if "loss_lambda_grad" not in expes_config:
-        expes_config["loss_lambda_grad"] = float(lambda_grad)
-    if "loss_lambda_energy" not in expes_config:
-        expes_config["loss_lambda_energy"] = float(lambda_energy)
+    expes_config["loss_alpha_on"] = float(alpha_on)
+    expes_config["loss_alpha_off"] = float(alpha_off)
+    expes_config["loss_lambda_grad"] = float(lambda_grad)
+    expes_config["loss_lambda_energy"] = float(lambda_energy)
     expes_config["loss_soft_temp_raw"] = float(soft_temp_raw)
     expes_config["loss_edge_eps_raw"] = float(edge_eps_raw)
     expes_config["loss_energy_floor_raw"] = float(energy_floor_raw)
     duty = float(duty_cycle)
-    if duty < 0.03:
-        if "loss_lambda_zero" not in expes_config:
-            expes_config["loss_lambda_zero"] = float(0.1)
-        if "loss_lambda_sparse" not in expes_config:
-            expes_config["loss_lambda_sparse"] = float(0.01)
-    elif duty < 0.10:
-        if "loss_lambda_zero" not in expes_config:
-            expes_config["loss_lambda_zero"] = float(0.05)
-        if "loss_lambda_sparse" not in expes_config:
-            expes_config["loss_lambda_sparse"] = float(0.005)
+    if duty <= 0.002:
+        lambda_zero = 0.7
+        lambda_sparse = 0.07
+    elif duty <= 0.01:
+        lambda_zero = 0.45
+        lambda_sparse = 0.045
+    elif duty <= 0.05:
+        lambda_zero = 0.25
+        lambda_sparse = 0.025
+    elif duty <= 0.3:
+        lambda_zero = 0.12
+        lambda_sparse = 0.012
+    else:
+        lambda_zero = 0.05
+        lambda_sparse = 0.005
+    expes_config["loss_lambda_zero"] = float(lambda_zero)
+    expes_config["loss_lambda_sparse"] = float(lambda_sparse)
 
 
 def get_cache_path(expes_config: OmegaConf):
@@ -535,7 +538,7 @@ if __name__ == "__main__":
         default=None,
         help=(
             "Loss type for NILM baselines. Choices: "
-            "'nilm_composite', 'eaec', 'smoothl1', 'mse', 'mae'."
+            "'eaec', 'smoothl1', 'mse', 'mae'."
         ),
     )
     parser.add_argument(

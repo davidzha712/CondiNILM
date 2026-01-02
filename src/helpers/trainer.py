@@ -12,62 +12,6 @@ import torch.optim as optim
 import pytorch_lightning as pl
 
 
-class NILMCompositeLoss(nn.Module):
-    def __init__(
-        self,
-        threshold=10.0,
-        alpha_on=3.0,
-        alpha_off=1.0,
-        lambda_grad=0.5,
-        lambda_sparse=0.0,
-        lambda_zero=0.0,
-        center_ratio=1.0,
-    ):
-        super().__init__()
-        self.threshold = threshold
-        self.alpha_on = alpha_on
-        self.alpha_off = alpha_off
-        self.lambda_grad = lambda_grad
-        self.lambda_sparse = lambda_sparse
-        self.lambda_zero = lambda_zero
-        self.center_ratio = float(center_ratio)
-        self.base_loss = nn.SmoothL1Loss(reduction="none")
-        self.grad_loss = nn.L1Loss(reduction="mean")
-
-    def forward(self, pred, target):
-        pred = pred.float()
-        target = target.float()
-        time_len = pred.size(-1)
-        ratio = float(self.center_ratio)
-        if time_len > 1 and 0.0 < ratio < 1.0:
-            center_len = max(1, int(round(time_len * ratio)))
-            start = (time_len - center_len) // 2
-            end = start + center_len
-            pred = pred[..., start:end]
-            target = target[..., start:end]
-        loss_point = self.base_loss(pred, target)
-        mask_on = (target > self.threshold).float()
-        mask_off = 1.0 - mask_on
-        eps = 1e-6
-        loss_on = (loss_point * mask_on).sum() / (mask_on.sum() + eps)
-        loss_off = (loss_point * mask_off).sum() / (mask_off.sum() + eps)
-        loss_main = self.alpha_on * loss_on + self.alpha_off * loss_off
-        if pred.size(-1) > 1:
-            pred_diff = pred[..., 1:] - pred[..., :-1]
-            target_diff = target[..., 1:] - target[..., :-1]
-            loss_grad = self.grad_loss(pred_diff, target_diff)
-        else:
-            loss_grad = pred.new_tensor(0.0)
-        sparse_penalty = (pred.abs() * mask_on).sum() / (mask_on.sum() + eps)
-        zero_penalty = (pred.abs() * mask_off).sum() / (mask_off.sum() + eps)
-        return (
-            loss_main
-            + self.lambda_grad * loss_grad
-            + self.lambda_sparse * sparse_penalty
-            + self.lambda_zero * zero_penalty
-        )
-
-
 class EAECLoss(nn.Module):
     def __init__(
         self,
