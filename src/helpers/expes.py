@@ -197,6 +197,7 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
             sample_idx += batch_size
     if target_concat is None:
         return
+    appliance_name = getattr(expes_config, "appliance", None)
     n_app = len(target_concat)
     result_root = os.path.dirname(
         os.path.dirname(os.path.dirname(expes_config.result_path))
@@ -206,6 +207,8 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
         "{}_{}".format(expes_config.dataset, expes_config.sampling_rate),
         str(expes_config.window_size),
     )
+    if appliance_name is not None:
+        group_dir = os.path.join(group_dir, str(appliance_name))
     os.makedirs(group_dir, exist_ok=True)
     html_path = os.path.join(group_dir, "val_compare.html")
     model_name = expes_config.name_model
@@ -229,7 +232,6 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
     payload["agg"] = agg_concat
     if timestamps_concat:
         payload["timestamps"] = timestamps_concat
-    appliance_name = getattr(expes_config, "appliance", None)
     target_all = payload.get("target", [])
     appliance_names = payload.get("appliance_names", [])
     if not isinstance(target_all, list):

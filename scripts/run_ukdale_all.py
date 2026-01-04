@@ -1,8 +1,10 @@
 import argparse
 import logging
+import os
+import sys
+import subprocess
+import platform
 import yaml
-
-from scripts.run_one_expe import main as run_one_experiment
 
 
 def get_ukdale_appliances():
@@ -115,16 +117,36 @@ def main():
         logging.info(
             "Start training appliance %s for dataset %s.", appliance, dataset_key
         )
-        run_one_experiment(
-            dataset=dataset_key,
-            sampling_rate=args.sampling_rate,
-            window_size=args.window_size,
-            appliance=appliance,
-            name_model=args.name_model,
-            resume=args.resume,
-            no_final_eval=args.no_final_eval,
-            loss_type=args.loss_type,
-        )
+        cmd = [
+            sys.executable,
+            "-m",
+            "scripts.run_one_expe",
+            "--dataset",
+            dataset_key,
+            "--sampling_rate",
+            args.sampling_rate,
+            "--window_size",
+            args.window_size,
+            "--appliance",
+            appliance,
+            "--name_model",
+            args.name_model,
+        ]
+        if args.resume:
+            cmd.append("--resume")
+        if args.no_final_eval:
+            cmd.append("--no_final_eval")
+        if args.loss_type is not None:
+            cmd.extend(["--loss_type", args.loss_type])
+        logging.info("Launch subprocess: %s", " ".join(cmd))
+        result = subprocess.run(cmd, check=False)
+        if result.returncode != 0:
+            logging.error(
+                "Subprocess for appliance %s exited with code %s. Stop batch.",
+                appliance,
+                result.returncode,
+            )
+            break
 
 
 if __name__ == "__main__":
