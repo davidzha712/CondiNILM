@@ -22,7 +22,7 @@ n_warmup_epochs:  0
 device:  auto          # auto / cuda / mps / cpu
 accumulate_grad_batches: 1
 
-num_workers: 16
+num_workers: 10
 
 # EAEC Related Parameters
 p_es_eaec:  7
@@ -33,6 +33,9 @@ neg_penalty_weight_eaec: 0.02
 rlr_factor_eaec: 0.5
 rlr_min_lr_eaec: 1e-6
 gradient_clip_val_eaec: 1.0
+gate_cls_weight_eaec: 1.0
+gate_window_weight_eaec: 0.5
+gate_focal_gamma_eaec: 2.0
 
 # seq2subseq Center Supervision Ratio
 loss_center_ratio: 0.8

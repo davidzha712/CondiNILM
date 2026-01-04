@@ -20,6 +20,7 @@ import torch.nn as nn
 
 from src.helpers.trainer import (
     EAECLoss,
+    GAEAECLoss,
     SeqToSeqLightningModule,
     TserLightningModule,
     DiffNILMLightningModule,
@@ -807,7 +808,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         )
 
     loss_type = str(getattr(expes_config, "loss_type", "eaec"))
-    if loss_type == "eaec" and expes_config.name_model == "NILMFormer":
+    if loss_type in ["eaec", "ga_eaec"] and expes_config.name_model == "NILMFormer":
         p_es_eaec = getattr(expes_config, "p_es_eaec", None)
         if p_es_eaec is not None:
             expes_config.p_es = p_es_eaec
@@ -832,6 +833,17 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         rlr_min_lr_eaec = getattr(expes_config, "rlr_min_lr_eaec", None)
         if rlr_min_lr_eaec is not None:
             expes_config.rlr_min_lr = rlr_min_lr_eaec
+        gate_cls_weight_eaec = getattr(expes_config, "gate_cls_weight_eaec", None)
+        if gate_cls_weight_eaec is not None:
+            expes_config.gate_cls_weight = gate_cls_weight_eaec
+        gate_window_weight_eaec = getattr(
+            expes_config, "gate_window_weight_eaec", None
+        )
+        if gate_window_weight_eaec is not None:
+            expes_config.gate_window_weight = gate_window_weight_eaec
+        gate_focal_gamma_eaec = getattr(expes_config, "gate_focal_gamma_eaec", None)
+        if gate_focal_gamma_eaec is not None:
+            expes_config.gate_focal_gamma = gate_focal_gamma_eaec
 
     num_workers = getattr(expes_config, "num_workers", 0)
     persistent_workers = num_workers > 0
@@ -905,7 +917,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         threshold_loss = float(
             getattr(expes_config, "loss_threshold", expes_config.threshold)
         )
-        if loss_type == "eaec":
+        if loss_type in ["eaec", "ga_eaec"]:
             alpha_on = float(getattr(expes_config, "loss_alpha_on", 3.0))
             alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
             lambda_grad = float(getattr(expes_config, "loss_lambda_grad", 0.5))
@@ -926,19 +938,34 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                 )
             else:
                 energy_floor = energy_floor_default
-            criterion = EAECLoss(
-                threshold=threshold_loss,
-                alpha_on=alpha_on,
-                alpha_off=alpha_off,
-                lambda_grad=lambda_grad,
-                lambda_energy=lambda_energy,
-                soft_temp=soft_temp,
-                edge_eps=edge_eps,
-                energy_floor=energy_floor,
-                lambda_sparse=lambda_sparse,
-                lambda_zero=lambda_zero,
-                center_ratio=center_ratio,
-            )
+            if loss_type == "eaec":
+                criterion = EAECLoss(
+                    threshold=threshold_loss,
+                    alpha_on=alpha_on,
+                    alpha_off=alpha_off,
+                    lambda_grad=lambda_grad,
+                    lambda_energy=lambda_energy,
+                    soft_temp=soft_temp,
+                    edge_eps=edge_eps,
+                    energy_floor=energy_floor,
+                    lambda_sparse=lambda_sparse,
+                    lambda_zero=lambda_zero,
+                    center_ratio=center_ratio,
+                )
+            else:
+                criterion = GAEAECLoss(
+                    threshold=threshold_loss,
+                    alpha_on=alpha_on,
+                    alpha_off=alpha_off,
+                    lambda_grad=lambda_grad,
+                    lambda_energy=lambda_energy,
+                    soft_temp=soft_temp,
+                    edge_eps=edge_eps,
+                    energy_floor=energy_floor,
+                    lambda_sparse=lambda_sparse,
+                    lambda_zero=lambda_zero,
+                    center_ratio=center_ratio,
+                )
         elif loss_type == "smoothl1":
             criterion = nn.SmoothL1Loss()
         elif loss_type == "mse":
@@ -971,6 +998,11 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             zero_run_ratio=zero_run_ratio,
             loss_threshold=threshold_loss,
             off_high_agg_penalty_weight=off_high_agg_penalty_weight,
+            gate_cls_weight=float(getattr(expes_config, "gate_cls_weight", 0.0)),
+            gate_window_weight=float(
+                getattr(expes_config, "gate_window_weight", 0.0)
+            ),
+            gate_focal_gamma=float(getattr(expes_config, "gate_focal_gamma", 2.0)),
         )
     accelerator = "cpu"
     devices = 1
@@ -1025,7 +1057,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             )
     loss_type = str(getattr(expes_config, "loss_type", "eaec"))
     gradient_clip_val = 0.0
-    if loss_type == "eaec":
+    if loss_type in ["eaec", "ga_eaec"]:
         gradient_clip_val = float(getattr(expes_config, "gradient_clip_val_eaec", 1.0))
     accumulate_grad_batches = int(
         getattr(expes_config, "accumulate_grad_batches", 1)

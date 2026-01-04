@@ -98,6 +98,80 @@ class EAECLoss(nn.Module):
         )
 
 
+class GAEAECLoss(nn.Module):
+    def __init__(
+        self,
+        threshold=10.0,
+        alpha_on=3.0,
+        alpha_off=1.0,
+        lambda_grad=0.0,
+        lambda_energy=0.5,
+        soft_temp=10.0,
+        edge_eps=5.0,
+        energy_floor=1.0,
+        lambda_sparse=0.0,
+        lambda_zero=0.0,
+        center_ratio=1.0,
+    ):
+        super().__init__()
+        self.threshold = threshold
+        self.alpha_on = alpha_on
+        self.alpha_off = alpha_off
+        self.lambda_energy = lambda_energy
+        self.soft_temp = soft_temp
+        self.energy_floor = energy_floor
+        self.lambda_zero = lambda_zero
+        self.center_ratio = float(center_ratio)
+        self.base_loss = nn.SmoothL1Loss(reduction="none")
+
+    def forward(self, pred, target, gate=None):
+        pred = pred.float()
+        target = target.float()
+        time_len = pred.size(-1)
+        ratio = float(self.center_ratio)
+        if time_len > 1 and 0.0 < ratio < 1.0:
+            center_len = max(1, int(round(time_len * ratio)))
+            start = (time_len - center_len) // 2
+            end = start + center_len
+            pred = pred[..., start:end]
+            target = target[..., start:end]
+            if gate is not None:
+                gate = gate[..., start:end]
+        loss_point = self.base_loss(pred, target)
+        eps = 1e-6
+        thr = float(self.threshold)
+        if gate is not None:
+            gate = gate.float()
+            p_on = torch.sigmoid(gate)
+        else:
+            temp = max(self.soft_temp, eps)
+            p_on = torch.sigmoid((target - thr) / temp)
+        p_off = 1.0 - p_on
+        loss_on = (loss_point * p_on).sum() / (p_on.sum() + eps)
+        loss_off = (loss_point * p_off).sum() / (p_off.sum() + eps)
+        loss_main = self.alpha_on * loss_on + self.alpha_off * loss_off
+        energy_pred_on = (pred * p_on).sum(dim=-1)
+        energy_target_on = (target * p_on).sum(dim=-1)
+        floor = max(float(self.energy_floor), 1e-6)
+        denom = energy_target_on.abs() + floor
+        loss_energy_sample = (energy_pred_on - energy_target_on).abs() / denom
+        on_coverage = p_on.sum(dim=-1)
+        min_on_steps = 0.1 * float(pred.size(-1))
+        energy_mask = (on_coverage > min_on_steps).float()
+        if energy_mask.sum() > 0:
+            loss_energy = (loss_energy_sample * energy_mask).sum() / (
+                energy_mask.sum() + eps
+            )
+        else:
+            loss_energy = pred.new_tensor(0.0)
+        off_mask = (target <= thr).float()
+        if off_mask.sum() > 0:
+            zero_penalty = (pred.abs() * off_mask).sum() / (off_mask.sum() + eps)
+        else:
+            zero_penalty = pred.new_tensor(0.0)
+        return loss_main + self.lambda_energy * loss_energy + self.lambda_zero * zero_penalty
+
+
 class SeqToSeqLightningModule(pl.LightningModule):
     def __init__(
         self,
@@ -116,6 +190,9 @@ class SeqToSeqLightningModule(pl.LightningModule):
         zero_run_ratio=0.8,
         loss_threshold=0.0,
         off_high_agg_penalty_weight=0.0,
+        gate_cls_weight=0.0,
+        gate_window_weight=0.0,
+        gate_focal_gamma=2.0,
     ):
         super().__init__()
         self.model = model
@@ -136,6 +213,9 @@ class SeqToSeqLightningModule(pl.LightningModule):
         self.zero_run_ratio = float(zero_run_ratio)
         self.loss_threshold = float(loss_threshold)
         self.off_high_agg_penalty_weight = float(off_high_agg_penalty_weight)
+        self.gate_cls_weight = float(gate_cls_weight)
+        self.gate_window_weight = float(gate_window_weight)
+        self.gate_focal_gamma = float(gate_focal_gamma)
         self.best_val_loss = float("inf")
         self.best_epoch = -1
         self.best_model_state_dict = None
@@ -144,6 +224,33 @@ class SeqToSeqLightningModule(pl.LightningModule):
 
     def forward(self, ts_agg):
         return self.model(ts_agg)
+
+    def _gate_focal_bce(self, logits, targets):
+        if self.gate_cls_weight <= 0.0:
+            return logits.new_tensor(0.0)
+        logits = logits.float()
+        targets = targets.float()
+        probs = torch.sigmoid(logits)
+        eps = 1e-6
+        probs = torch.clamp(probs, eps, 1.0 - eps)
+        pt = probs * targets + (1.0 - probs) * (1.0 - targets)
+        alpha_pos = 1.5
+        alpha_neg = 1.0
+        alpha = alpha_pos * targets + alpha_neg * (1.0 - targets)
+        gamma = max(self.gate_focal_gamma, 0.0)
+        loss = -alpha * ((1.0 - pt) ** gamma) * torch.log(pt)
+        return loss.mean()
+
+    def _gate_window_bce(self, logits, state):
+        if self.gate_window_weight <= 0.0:
+            return logits.new_tensor(0.0)
+        logits = logits.float()
+        state = state.float()
+        window_label = (state.sum(dim=-1, keepdim=True) > 0.5).float()
+        pooled = logits.mean(dim=-1, keepdim=True)
+        pooled = pooled.view(pooled.size(0), -1)
+        window_label = window_label.view(window_label.size(0), -1)
+        return F.binary_cross_entropy_with_logits(pooled, window_label)
 
     def _zero_run_penalty(self, pred, target):
         if self.state_zero_penalty_weight <= 0.0 or self.zero_run_kernel <= 1:
@@ -228,12 +335,24 @@ class SeqToSeqLightningModule(pl.LightningModule):
         return self.off_high_agg_penalty_weight * penalty
 
     def training_step(self, batch, batch_idx):
-        ts_agg, appl, _ = batch
+        ts_agg, appl, state = batch
         ts_agg = torch.nan_to_num(ts_agg.float(), nan=0.0, posinf=0.0, neginf=0.0)
         target = torch.nan_to_num(appl.float(), nan=0.0, posinf=0.0, neginf=0.0)
-        pred = self(ts_agg)
-        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
-        loss_main = self.criterion(pred, target)
+        if isinstance(self.criterion, GAEAECLoss) and hasattr(
+            self.model, "forward_with_gate"
+        ):
+            pred, gate = self.model.forward_with_gate(ts_agg)
+            pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+            gate = torch.nan_to_num(gate, nan=0.0, posinf=1e4, neginf=-1e4)
+            loss_main = self.criterion(pred, target, gate=gate)
+            gate_cls_loss = self._gate_focal_bce(gate, state)
+            gate_window_loss = self._gate_window_bce(gate, state)
+        else:
+            pred = self(ts_agg)
+            pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+            loss_main = self.criterion(pred, target)
+            gate_cls_loss = pred.new_tensor(0.0)
+            gate_window_loss = pred.new_tensor(0.0)
         loss_main = torch.nan_to_num(loss_main, nan=0.0, posinf=1e4, neginf=-1e4)
         neg_penalty = torch.relu(-pred).mean()
         neg_penalty = torch.nan_to_num(neg_penalty, nan=0.0, posinf=1e4, neginf=-1e4)
@@ -250,6 +369,8 @@ class SeqToSeqLightningModule(pl.LightningModule):
             + zero_run_penalty
             + off_high_agg_penalty
             + self.neg_penalty_weight * neg_penalty
+            + self.gate_cls_weight * gate_cls_loss
+            + self.gate_window_weight * gate_window_loss
         )
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
@@ -259,9 +380,17 @@ class SeqToSeqLightningModule(pl.LightningModule):
         ts_agg, appl, _ = batch
         ts_agg = torch.nan_to_num(ts_agg.float(), nan=0.0, posinf=0.0, neginf=0.0)
         target = torch.nan_to_num(appl.float(), nan=0.0, posinf=0.0, neginf=0.0)
-        pred = self(ts_agg)
-        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
-        loss_main = self.criterion(pred, target)
+        if isinstance(self.criterion, GAEAECLoss) and hasattr(
+            self.model, "forward_with_gate"
+        ):
+            pred, gate = self.model.forward_with_gate(ts_agg)
+            pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+            gate = torch.nan_to_num(gate, nan=0.0, posinf=1e4, neginf=-1e4)
+            loss_main = self.criterion(pred, target, gate=gate)
+        else:
+            pred = self(ts_agg)
+            pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+            loss_main = self.criterion(pred, target)
         loss_main = torch.nan_to_num(loss_main, nan=0.0, posinf=1e4, neginf=-1e4)
         neg_penalty = torch.relu(-pred).mean()
         neg_penalty = torch.nan_to_num(neg_penalty, nan=0.0, posinf=1e4, neginf=-1e4)

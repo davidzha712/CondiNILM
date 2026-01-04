@@ -68,6 +68,14 @@ class NILMFormer(nn.Module):
             padding_mode="replicate",
         )
 
+        self.GateHead = nn.Conv1d(
+            in_channels=d_model,
+            out_channels=1,
+            kernel_size=kernel_size_head,
+            padding=kernel_size_head // 2,
+            padding_mode="replicate",
+        )
+
         # ============ Initialize Weights ============#
         self.initialize_weights()
 
@@ -146,3 +154,29 @@ class NILMFormer(nn.Module):
 
         x = x * outinst_std + outinst_mean
         return x
+
+    def forward_with_gate(self, x):
+        encoding = x[:, 1:, :]
+        x_main = x[:, :1, :]
+        inst_mean = torch.mean(x_main, dim=-1, keepdim=True).detach()
+        inst_std = torch.sqrt(
+            torch.var(x_main, dim=-1, keepdim=True, unbiased=False) + 1e-6
+        ).detach()
+        x_main = (x_main - inst_mean) / inst_std
+        x_main = self.EmbedBlock(x_main)
+        encoding = self.ProjEmbedding(encoding)
+        x_cat = torch.cat([x_main, encoding], dim=1).permute(0, 2, 1)
+        stats_token = self.ProjStats1(
+            torch.cat([inst_mean, inst_std], dim=1).permute(0, 2, 1)
+        )
+        x_enc = torch.cat([x_cat, stats_token], dim=1)
+        x_enc = self.EncoderBlock(x_enc)
+        x_feat = x_enc[:, :-1, :]
+        x_feat = x_feat.permute(0, 2, 1)
+        power = self.DownstreamTaskHead(x_feat)
+        gate = self.GateHead(x_feat)
+        stats_out = self.ProjStats2(stats_token)
+        outinst_mean = stats_out[:, :, 0].unsqueeze(-1)
+        outinst_std = stats_out[:, :, 1].unsqueeze(-1)
+        power = power * outinst_std + outinst_mean
+        return power, gate
