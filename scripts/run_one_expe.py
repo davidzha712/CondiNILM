@@ -143,79 +143,105 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     lambda_grad = 0.2 + (0.8 - 0.2) * (ratio - 1.0) / 9.0
     
     # ============== 根据设备类型设置参数 ==============
+    # 关键改进：
+    # 1. 降低OFF惩罚权重（lambda_off_hard），防止模型学会全输出0
+    # 2. 添加ON召回惩罚（lambda_on_recall），确保ON时有输出
+    # 3. 设置合理的off_margin，允许小噪声
+    
     if device_type == "sparse_high_power":
         # 稀疏高功率设备（如Kettle, Microwave）
-        # 特点：ON事件稀少但功率很高，需要强调ON事件的准确捕获
-        alpha_on = 8.0
-        alpha_off = 0.3
-        lambda_zero = 0.8
-        lambda_sparse = 0.05
-        lambda_off_hard = 1.5
-        lambda_gate_cls = 0.8
+        # 特点：ON事件稀少但功率很高，需要强调ON事件检测
+        alpha_on = 6.0
+        alpha_off = 0.5
+        lambda_zero = 0.1          # 降低
+        lambda_sparse = 0.02
+        lambda_off_hard = 0.05     # 大幅降低！
+        lambda_on_recall = 0.5     # 高ON召回
+        on_recall_margin = 0.6     # ON时至少输出60%
+        lambda_gate_cls = 0.1
         lambda_energy = 0.05
+        off_margin = 0.02          # 允许小噪声
         
     elif device_type == "frequent_switching":
         # 频繁开关设备（如Fridge）
-        # 特点：ON/OFF各约50%，频繁切换，容易学成时间平均值
-        alpha_on = 1.5
-        alpha_off = 1.2
-        lambda_zero = 0.5
-        lambda_sparse = 0.02
-        lambda_off_hard = 1.2
-        lambda_gate_cls = 0.5
-        lambda_energy = 0.25
+        # 特点：ON/OFF各约50%，频繁切换
+        alpha_on = 2.0
+        alpha_off = 1.5
+        lambda_zero = 0.05         # 降低
+        lambda_sparse = 0.01
+        lambda_off_hard = 0.05     # 大幅降低！
+        lambda_on_recall = 0.4     # 中等ON召回
+        on_recall_margin = 0.5     # ON时至少输出50%
+        lambda_gate_cls = 0.1
+        lambda_energy = 0.2
+        off_margin = 0.02
         
     elif device_type == "long_cycle":
         # 长周期运行设备（如WashingMachine, Dishwasher）
         # 特点：运行周期长，功率变化大
         alpha_on = 3.0
         alpha_off = 1.0
-        lambda_zero = 0.3
-        lambda_sparse = 0.03
-        lambda_off_hard = 0.5
-        lambda_gate_cls = 0.3
+        lambda_zero = 0.08
+        lambda_sparse = 0.02
+        lambda_off_hard = 0.08
+        lambda_on_recall = 0.3
+        on_recall_margin = 0.4
+        lambda_gate_cls = 0.1
         lambda_energy = 0.15
+        off_margin = 0.02
         
     elif device_type == "always_on":
         # 常开设备
         alpha_on = 1.0
-        alpha_off = 3.0
-        lambda_zero = 0.1
-        lambda_sparse = 0.01
-        lambda_off_hard = 0.2
-        lambda_gate_cls = 0.1
-        lambda_energy = 0.3
+        alpha_off = 2.0
+        lambda_zero = 0.02
+        lambda_sparse = 0.005
+        lambda_off_hard = 0.02
+        lambda_on_recall = 0.2
+        on_recall_margin = 0.3
+        lambda_gate_cls = 0.05
+        lambda_energy = 0.25
+        off_margin = 0.03
         
     elif device_type == "sparse_medium_power":
         # 稀疏中等功率
-        alpha_on = 5.0
+        alpha_on = 4.0
         alpha_off = 0.8
-        lambda_zero = 0.6
-        lambda_sparse = 0.04
-        lambda_off_hard = 1.0
-        lambda_gate_cls = 0.5
+        lambda_zero = 0.1
+        lambda_sparse = 0.02
+        lambda_off_hard = 0.05
+        lambda_on_recall = 0.4
+        on_recall_margin = 0.5
+        lambda_gate_cls = 0.1
         lambda_energy = 0.08
+        off_margin = 0.02
         
     else:
-        # 默认参数（基于duty_cycle的原始逻辑）
+        # 默认参数
+        lambda_on_recall = 0.3
+        on_recall_margin = 0.5
+        off_margin = 0.02
+        lambda_gate_cls = 0.1
         if duty_cycle < 0.01:
-            alpha_on, alpha_off = 6.0, 0.5
-            lambda_zero, lambda_sparse = 1.0, 0.10
-            lambda_energy = 0.01
+            alpha_on, alpha_off = 5.0, 0.5
+            lambda_zero, lambda_sparse = 0.1, 0.03
+            lambda_off_hard = 0.05
+            lambda_energy = 0.02
         elif duty_cycle < 0.05:
-            alpha_on, alpha_off = 4.5, 0.8
-            lambda_zero, lambda_sparse = 0.8, 0.08
-            lambda_energy = 0.03
+            alpha_on, alpha_off = 4.0, 0.8
+            lambda_zero, lambda_sparse = 0.08, 0.02
+            lambda_off_hard = 0.05
+            lambda_energy = 0.05
         elif duty_cycle < 0.15:
             alpha_on, alpha_off = 3.0, 1.0
-            lambda_zero, lambda_sparse = 0.5, 0.05
+            lambda_zero, lambda_sparse = 0.05, 0.02
+            lambda_off_hard = 0.05
             lambda_energy = 0.08
         else:
-            alpha_on, alpha_off = 2.0, 1.0
-            lambda_zero, lambda_sparse = 0.2, 0.02
-            lambda_energy = 0.20
-        lambda_off_hard = 0.5
-        lambda_gate_cls = 0.3
+            alpha_on, alpha_off = 2.0, 1.2
+            lambda_zero, lambda_sparse = 0.03, 0.01
+            lambda_off_hard = 0.05
+            lambda_energy = 0.15
     
     # ============== soft_temp 和 edge_eps ==============
     soft_temp_raw = max(0.25 * thr, 2.0 * noise_level, 1.0)
@@ -247,7 +273,13 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     expes_config["loss_energy_floor_raw"] = float(energy_floor_raw)
     expes_config["loss_lambda_zero"] = float(lambda_zero)
     expes_config["loss_lambda_sparse"] = float(lambda_sparse)
+    # OFF假阳性惩罚（温和）
     expes_config["loss_lambda_off_hard"] = float(lambda_off_hard)
+    expes_config["loss_off_margin"] = float(off_margin)
+    # ON漏检惩罚（防止全0输出）
+    expes_config["loss_lambda_on_recall"] = float(lambda_on_recall)
+    expes_config["loss_on_recall_margin"] = float(on_recall_margin)
+    # 门控分类
     expes_config["loss_lambda_gate_cls"] = float(lambda_gate_cls)
 
 

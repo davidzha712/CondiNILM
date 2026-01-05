@@ -953,10 +953,15 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                     center_ratio=center_ratio,
                 )
             else:
-                # 获取新增的OFF状态强化参数
-                lambda_off_hard = float(getattr(expes_config, "loss_lambda_off_hard", 0.5))
-                lambda_gate_cls = float(getattr(expes_config, "loss_lambda_gate_cls", 0.2))
-                off_margin = float(getattr(expes_config, "loss_off_margin", 0.0))
+                # OFF假阳性惩罚参数（温和设置）
+                lambda_off_hard = float(getattr(expes_config, "loss_lambda_off_hard", 0.1))
+                off_margin = float(getattr(expes_config, "loss_off_margin", 0.02))
+                # ON漏检惩罚参数（防止全0输出）
+                lambda_on_recall = float(getattr(expes_config, "loss_lambda_on_recall", 0.3))
+                on_recall_margin = float(getattr(expes_config, "loss_on_recall_margin", 0.5))
+                # 门控分类参数
+                lambda_gate_cls = float(getattr(expes_config, "loss_lambda_gate_cls", 0.1))
+                gate_focal_gamma = float(getattr(expes_config, "loss_gate_focal_gamma", 2.0))
                 criterion = GAEAECLoss(
                     threshold=threshold_loss,
                     alpha_on=alpha_on,
@@ -970,8 +975,11 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                     lambda_zero=lambda_zero,
                     center_ratio=center_ratio,
                     lambda_off_hard=lambda_off_hard,
-                    lambda_gate_cls=lambda_gate_cls,
                     off_margin=off_margin,
+                    lambda_on_recall=lambda_on_recall,
+                    on_recall_margin=on_recall_margin,
+                    lambda_gate_cls=lambda_gate_cls,
+                    gate_focal_gamma=gate_focal_gamma,
                 )
         elif loss_type == "smoothl1":
             criterion = nn.SmoothL1Loss()

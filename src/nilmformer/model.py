@@ -156,6 +156,10 @@ class NILMFormer(nn.Module):
         return x
 
     def forward_with_gate(self, x):
+        """
+        带门控的前向传播（用于训练）。
+        返回原始power和gate logits，让损失函数决定如何使用。
+        """
         encoding = x[:, 1:, :]
         x_main = x[:, :1, :]
         inst_mean = torch.mean(x_main, dim=-1, keepdim=True).detach()
@@ -180,3 +184,44 @@ class NILMFormer(nn.Module):
         outinst_std = stats_out[:, :, 1].unsqueeze(-1)
         power = power * outinst_std + outinst_mean
         return power, gate
+
+    def forward_gated(self, x, gate_mode="soft", gate_threshold=0.5, soft_scale=1.0):
+        """
+        带门控的推理前向传播。
+        
+        推荐使用soft模式，避免硬门控导致的输出完全为0。
+        
+        Args:
+            x: 输入序列 (B, 1+e, L)
+            gate_mode: 门控模式
+                - "none": 不使用门控，直接返回power（推荐用于调试）
+                - "soft": 软门控，power * sigmoid(gate * soft_scale)
+                - "soft_relu": 软门控 + ReLU，确保非负
+                - "hard": 硬门控，低于阈值的位置输出0（不推荐）
+            gate_threshold: 硬门控阈值（仅hard模式使用）
+            soft_scale: 软门控的缩放因子（越大越接近硬门控）
+        
+        Returns:
+            gated_power: 门控后的功率预测 (B, 1, L)
+        """
+        power, gate = self.forward_with_gate(x)
+        
+        if gate_mode == "none":
+            # 不使用门控，直接返回（用于调试）
+            return torch.relu(power)
+        
+        gate_prob = torch.sigmoid(gate * soft_scale)
+        
+        if gate_mode == "hard":
+            # 硬门控：二值化（不推荐，容易导致全0）
+            gate_mask = (gate_prob > gate_threshold).float()
+            return torch.relu(power) * gate_mask
+        
+        elif gate_mode == "soft_relu":
+            # 软门控 + ReLU
+            return torch.relu(power) * gate_prob
+        
+        else:  # "soft"
+            # 软门控（推荐）
+            # 使用软门控，让模型自然学习
+            return power * gate_prob

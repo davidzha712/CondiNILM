@@ -49,7 +49,7 @@ postprocess_min_on_steps: 3
 
 off_high_agg_penalty_weight: 0.3
 
-# ============== OFF状态强化参数（自动根据设备类型调整） ==============
+# ============== 损失函数参数（自动根据设备类型调整） ==============
 # 这些是默认值，会被 _configure_nilm_loss_hyperparams 根据设备类型自动覆盖
 #
 # 支持的设备类型：
@@ -58,18 +58,24 @@ off_high_agg_penalty_weight: 0.3
 #   - long_cycle:           长周期运行设备（如WashingMachine, Dishwasher）
 #   - always_on:            常开设备
 #   - sparse_medium_power:  稀疏中等功率设备
-#
-# lambda_off_hard: OFF状态硬约束权重，强制OFF时输出接近0
-#   - sparse_high_power: 1.5（高）
-#   - frequent_switching: 1.2（中高）
-#   - long_cycle: 0.5（中）
-loss_lambda_off_hard: 0.5
 
-# lambda_gate_cls: 门控分类损失权重（Focal Loss），显式学习ON/OFF状态
-#   - sparse_high_power: 0.8（高，强调ON事件检测）
-#   - frequent_switching: 0.5（中，强化状态切换）
-#   - long_cycle: 0.3（中低）
-loss_lambda_gate_cls: 0.3
+# ===== OFF假阳性惩罚（温和设置，防止模型学会全输出0） =====
+# lambda_off_hard: OFF状态硬约束权重（降低！）
+loss_lambda_off_hard: 0.1
 
-# off_margin: OFF状态的功率容忍边界（归一化后），默认0表示严格为0
-loss_off_margin: 0.0
+# off_margin: OFF状态的功率容忍边界（归一化后），允许小噪声
+loss_off_margin: 0.02
+
+# ===== ON漏检惩罚（关键！防止全0输出） =====
+# lambda_on_recall: ON漏检惩罚权重，惩罚ON时输出太低
+loss_lambda_on_recall: 0.3
+
+# on_recall_margin: ON时输出至少达到目标的多少比例
+loss_on_recall_margin: 0.5
+
+# ===== 门控分类（温和设置） =====
+# lambda_gate_cls: 门控分类损失权重（降低！）
+loss_lambda_gate_cls: 0.1
+
+# gate_focal_gamma: Focal Loss gamma参数
+loss_gate_focal_gamma: 2.0
