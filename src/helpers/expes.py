@@ -953,6 +953,10 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                     center_ratio=center_ratio,
                 )
             else:
+                # 获取新增的OFF状态强化参数
+                lambda_off_hard = float(getattr(expes_config, "loss_lambda_off_hard", 0.5))
+                lambda_gate_cls = float(getattr(expes_config, "loss_lambda_gate_cls", 0.2))
+                off_margin = float(getattr(expes_config, "loss_off_margin", 0.0))
                 criterion = GAEAECLoss(
                     threshold=threshold_loss,
                     alpha_on=alpha_on,
@@ -965,6 +969,9 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                     lambda_sparse=lambda_sparse,
                     lambda_zero=lambda_zero,
                     center_ratio=center_ratio,
+                    lambda_off_hard=lambda_off_hard,
+                    lambda_gate_cls=lambda_gate_cls,
+                    off_margin=off_margin,
                 )
         elif loss_type == "smoothl1":
             criterion = nn.SmoothL1Loss()

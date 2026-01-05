@@ -48,3 +48,28 @@ state_zero_ratio: 0.9
 postprocess_min_on_steps: 3
 
 off_high_agg_penalty_weight: 0.3
+
+# ============== OFF状态强化参数（自动根据设备类型调整） ==============
+# 这些是默认值，会被 _configure_nilm_loss_hyperparams 根据设备类型自动覆盖
+#
+# 支持的设备类型：
+#   - sparse_high_power:    稀疏高功率设备（如Kettle, Microwave）
+#   - frequent_switching:   频繁开关设备（如Fridge）
+#   - long_cycle:           长周期运行设备（如WashingMachine, Dishwasher）
+#   - always_on:            常开设备
+#   - sparse_medium_power:  稀疏中等功率设备
+#
+# lambda_off_hard: OFF状态硬约束权重，强制OFF时输出接近0
+#   - sparse_high_power: 1.5（高）
+#   - frequent_switching: 1.2（中高）
+#   - long_cycle: 0.5（中）
+loss_lambda_off_hard: 0.5
+
+# lambda_gate_cls: 门控分类损失权重（Focal Loss），显式学习ON/OFF状态
+#   - sparse_high_power: 0.8（高，强调ON事件检测）
+#   - frequent_switching: 0.5（中，强化状态切换）
+#   - long_cycle: 0.3（中低）
+loss_lambda_gate_cls: 0.3
+
+# off_margin: OFF状态的功率容忍边界（归一化后），默认0表示严格为0
+loss_off_margin: 0.0

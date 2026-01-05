@@ -99,6 +99,14 @@ class EAECLoss(nn.Module):
 
 
 class GAEAECLoss(nn.Module):
+    """
+    Gate-Aware Energy-Aware Error Correction Loss.
+    
+    针对NILM问题优化，特别处理：
+    1. ON/OFF状态严重不平衡问题
+    2. OFF状态时模型输出非零值的问题（条件均值回归）
+    3. 显式门控学习，强化设备状态识别
+    """
     def __init__(
         self,
         threshold=10.0,
@@ -112,6 +120,10 @@ class GAEAECLoss(nn.Module):
         lambda_sparse=0.0,
         lambda_zero=0.0,
         center_ratio=1.0,
+        # 新增参数：强化OFF状态学习
+        lambda_off_hard=0.5,  # OFF状态硬约束权重
+        lambda_gate_cls=0.2,  # 门控分类损失权重
+        off_margin=0.0,       # OFF状态的容忍边界（归一化后）
     ):
         super().__init__()
         self.threshold = threshold
@@ -121,6 +133,9 @@ class GAEAECLoss(nn.Module):
         self.soft_temp = soft_temp
         self.energy_floor = energy_floor
         self.lambda_zero = lambda_zero
+        self.lambda_off_hard = lambda_off_hard
+        self.lambda_gate_cls = lambda_gate_cls
+        self.off_margin = off_margin
         self.center_ratio = float(center_ratio)
         self.base_loss = nn.SmoothL1Loss(reduction="none")
 
@@ -137,9 +152,12 @@ class GAEAECLoss(nn.Module):
             target = target[..., start:end]
             if gate is not None:
                 gate = gate[..., start:end]
+        
         loss_point = self.base_loss(pred, target)
         eps = 1e-6
         thr = float(self.threshold)
+        
+        # 计算ON/OFF概率
         if gate is not None:
             gate = gate.float()
             p_on = torch.sigmoid(gate)
@@ -147,9 +165,17 @@ class GAEAECLoss(nn.Module):
             temp = max(self.soft_temp, eps)
             p_on = torch.sigmoid((target - thr) / temp)
         p_off = 1.0 - p_on
+        
+        # 硬OFF掩码（基于真实目标）
+        hard_off_mask = (target <= thr).float()
+        hard_on_mask = (target > thr).float()
+        
+        # ==================== 主损失：加权回归损失 ====================
         loss_on = (loss_point * p_on).sum() / (p_on.sum() + eps)
         loss_off = (loss_point * p_off).sum() / (p_off.sum() + eps)
         loss_main = self.alpha_on * loss_on + self.alpha_off * loss_off
+        
+        # ==================== 能量损失 ====================
         energy_pred_on = (pred * p_on).sum(dim=-1)
         energy_target_on = (target * p_on).sum(dim=-1)
         floor = max(float(self.energy_floor), 1e-6)
@@ -164,12 +190,56 @@ class GAEAECLoss(nn.Module):
             )
         else:
             loss_energy = pred.new_tensor(0.0)
-        off_mask = (target <= thr).float()
-        if off_mask.sum() > 0:
-            zero_penalty = (pred.abs() * off_mask).sum() / (off_mask.sum() + eps)
+        
+        # ==================== 软OFF惩罚（原有） ====================
+        if hard_off_mask.sum() > 0:
+            zero_penalty = (pred.abs() * hard_off_mask).sum() / (hard_off_mask.sum() + eps)
         else:
             zero_penalty = pred.new_tensor(0.0)
-        return loss_main + self.lambda_energy * loss_energy + self.lambda_zero * zero_penalty
+        
+        # ==================== 硬OFF惩罚（新增：强制OFF时输出接近0） ====================
+        # 使用更强的惩罚：对OFF状态下超过margin的输出进行平方惩罚
+        if hard_off_mask.sum() > 0 and self.lambda_off_hard > 0:
+            margin = max(float(self.off_margin), 0.0)
+            pred_excess = torch.relu(pred.abs() - margin)
+            # 使用平方惩罚，对较大偏差惩罚更重
+            off_hard_penalty = ((pred_excess ** 2) * hard_off_mask).sum() / (hard_off_mask.sum() + eps)
+        else:
+            off_hard_penalty = pred.new_tensor(0.0)
+        
+        # ==================== 门控分类损失（新增：显式学习ON/OFF状态） ====================
+        if gate is not None and self.lambda_gate_cls > 0:
+            # 使用Focal Loss思想处理不平衡
+            gate_target = hard_on_mask  # 1=ON, 0=OFF
+            gate_prob = torch.sigmoid(gate)
+            gate_prob = torch.clamp(gate_prob, eps, 1.0 - eps)
+            
+            # Focal Loss: -alpha * (1-pt)^gamma * log(pt)
+            pt = gate_prob * gate_target + (1.0 - gate_prob) * (1.0 - gate_target)
+            
+            # 计算ON/OFF比例，自动调整alpha
+            on_ratio = hard_on_mask.mean()
+            # OFF样本更多时，给ON更高权重
+            alpha_pos = torch.clamp(1.0 / (on_ratio + eps), 1.0, 10.0)
+            alpha_neg = 1.0
+            alpha = alpha_pos * gate_target + alpha_neg * (1.0 - gate_target)
+            
+            gamma = 2.0  # Focal Loss gamma参数
+            gate_cls_loss = -alpha * ((1.0 - pt) ** gamma) * torch.log(pt)
+            gate_cls_loss = gate_cls_loss.mean()
+        else:
+            gate_cls_loss = pred.new_tensor(0.0)
+        
+        # ==================== 组合总损失 ====================
+        total_loss = (
+            loss_main 
+            + self.lambda_energy * loss_energy 
+            + self.lambda_zero * zero_penalty
+            + self.lambda_off_hard * off_hard_penalty
+            + self.lambda_gate_cls * gate_cls_loss
+        )
+        
+        return total_loss
 
 
 class SeqToSeqLightningModule(pl.LightningModule):
