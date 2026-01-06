@@ -8,6 +8,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.nilmformer.layers.transformer import EncoderLayer
 from src.nilmformer.layers.embedding import DilatedBlock
@@ -76,8 +77,21 @@ class NILMFormer(nn.Module):
             padding_mode="replicate",
         )
 
+        self.output_stats_alpha = 0.0
+        self.output_stats_mean_max = 0.0
+        self.output_stats_std_max = 0.0
+        self.inst_norm_min_std = 1e-2
+
         # ============ Initialize Weights ============#
         self.initialize_weights()
+
+    def set_output_stats(self, alpha=None, mean_max=None, std_max=None):
+        if alpha is not None:
+            self.output_stats_alpha = float(alpha)
+        if mean_max is not None:
+            self.output_stats_mean_max = float(mean_max)
+        if std_max is not None:
+            self.output_stats_std_max = float(std_max)
 
     def initialize_weights(self):
         """Initialize nn.Linear and nn.LayerNorm weights."""
@@ -119,6 +133,7 @@ class NILMFormer(nn.Module):
         inst_std = torch.sqrt(
             torch.var(x, dim=-1, keepdim=True, unbiased=False) + 1e-6
         ).detach()
+        inst_std = torch.clamp(inst_std, min=float(getattr(self, "inst_norm_min_std", 1e-2)))
 
         x = (x - inst_mean) / inst_std  # shape still (B, 1, L)
 
@@ -139,21 +154,28 @@ class NILMFormer(nn.Module):
         x = torch.cat([x, stats_token], dim=1)  # (B, L + 1, d_model)
 
         # === Transformer Encoder === #
-        x = self.EncoderBlock(x)  # (B, L + 1, d_model)
-        x = x[:, :-1, :]  # remove stats token => (B, L, d_model)
+        x_full = self.EncoderBlock(x)  # (B, L + 1, d_model)
+        stats_feat = x_full[:, -1:, :]
+        x = x_full[:, :-1, :]  # (B, L, d_model)
 
         # === Conv Head === #
         x = x.permute(0, 2, 1)  # (B, d_model, L)
-        x = self.DownstreamTaskHead(x)  # (B, c_out, L)
+        power_raw = self.DownstreamTaskHead(x)  # (B, c_out, L)
+        power = F.softplus(power_raw)
 
-        # === Reverse Instance Normalization === #
-        # stats_out => shape (B, 1, 2)
-        stats_out = self.ProjStats2(stats_token)  # stats_token was (B, 1, d_model)
-        outinst_mean = stats_out[:, :, 0].unsqueeze(-1)  # (B, 1, 1)
-        outinst_std = stats_out[:, :, 1].unsqueeze(-1)  # (B, 1, 1)
+        alpha = float(getattr(self, "output_stats_alpha", 0.0))
+        mean_max = float(getattr(self, "output_stats_mean_max", 0.0))
+        std_max = float(getattr(self, "output_stats_std_max", 0.0))
+        if alpha > 0.0 and (mean_max > 0.0 or std_max > 0.0):
+            stats_out = self.ProjStats2(stats_feat).float()
+            raw_mean = stats_out[..., 0:1]
+            raw_std = stats_out[..., 1:2]
+            mean = (alpha * mean_max) * torch.sigmoid(raw_mean)
+            std = 1.0 + (alpha * std_max) * torch.sigmoid(raw_std)
+            std = torch.clamp(std, min=1e-3)
+            power = power * std + mean
 
-        x = x * outinst_std + outinst_mean
-        return x
+        return power
 
     def forward_with_gate(self, x):
         """
@@ -166,6 +188,7 @@ class NILMFormer(nn.Module):
         inst_std = torch.sqrt(
             torch.var(x_main, dim=-1, keepdim=True, unbiased=False) + 1e-6
         ).detach()
+        inst_std = torch.clamp(inst_std, min=float(getattr(self, "inst_norm_min_std", 1e-2)))
         x_main = (x_main - inst_mean) / inst_std
         x_main = self.EmbedBlock(x_main)
         encoding = self.ProjEmbedding(encoding)
@@ -175,14 +198,22 @@ class NILMFormer(nn.Module):
         )
         x_enc = torch.cat([x_cat, stats_token], dim=1)
         x_enc = self.EncoderBlock(x_enc)
-        x_feat = x_enc[:, :-1, :]
-        x_feat = x_feat.permute(0, 2, 1)
-        power = self.DownstreamTaskHead(x_feat)
+        stats_feat = x_enc[:, -1:, :]
+        x_feat = x_enc[:, :-1, :].permute(0, 2, 1)
+        power_raw = self.DownstreamTaskHead(x_feat)
         gate = self.GateHead(x_feat)
-        stats_out = self.ProjStats2(stats_token)
-        outinst_mean = stats_out[:, :, 0].unsqueeze(-1)
-        outinst_std = stats_out[:, :, 1].unsqueeze(-1)
-        power = power * outinst_std + outinst_mean
+        alpha = float(getattr(self, "output_stats_alpha", 0.0))
+        mean_max = float(getattr(self, "output_stats_mean_max", 0.0))
+        std_max = float(getattr(self, "output_stats_std_max", 0.0))
+        power = F.softplus(power_raw)
+        if alpha > 0.0 and (mean_max > 0.0 or std_max > 0.0):
+            stats_out = self.ProjStats2(stats_feat).float()
+            raw_mean = stats_out[..., 0:1]
+            raw_std = stats_out[..., 1:2]
+            mean = (alpha * mean_max) * torch.sigmoid(raw_mean)
+            std = 1.0 + (alpha * std_max) * torch.sigmoid(raw_std)
+            std = torch.clamp(std, min=1e-3)
+            power = power * std + mean
         return power, gate
 
     def forward_gated(self, x, gate_mode="soft", gate_threshold=0.5, soft_scale=1.0):
@@ -208,18 +239,18 @@ class NILMFormer(nn.Module):
         
         if gate_mode == "none":
             # 不使用门控，直接返回（用于调试）
-            return torch.relu(power)
+            return power
         
         gate_prob = torch.sigmoid(gate * soft_scale)
         
         if gate_mode == "hard":
             # 硬门控：二值化（不推荐，容易导致全0）
             gate_mask = (gate_prob > gate_threshold).float()
-            return torch.relu(power) * gate_mask
+            return power * gate_mask
         
         elif gate_mode == "soft_relu":
             # 软门控 + ReLU
-            return torch.relu(power) * gate_prob
+            return power * gate_prob
         
         else:  # "soft"
             # 软门控（推荐）

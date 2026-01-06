@@ -15,7 +15,7 @@ appliance_scaling_type:  MaxScaling
 
 batch_size:  64
 epochs:  25
-p_es:  5
+p_es:  null
 p_rlr:  3
 n_warmup_epochs:  0
 
@@ -25,7 +25,7 @@ accumulate_grad_batches: 1
 num_workers: 10
 
 # EAEC Related Parameters
-p_es_eaec:  7
+p_es_eaec:  null
 p_rlr_eaec:  5
 n_warmup_epochs_eaec:  3
 warmup_type_eaec:  linear

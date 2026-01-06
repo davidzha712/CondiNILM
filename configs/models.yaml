@@ -179,6 +179,5 @@ NILMFormer:
     wd: 0
     training_in_model: false
   model_training_param_eaec:
-    lr: 1e-5
+    lr: 5e-5
     wd: 0
-    training_in_model: false

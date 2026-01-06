@@ -89,6 +89,18 @@ def main():
         help="Forwarded to scripts.run_one_expe to skip final heavy eval.",
     )
     parser.add_argument(
+        "--epochs",
+        type=int,
+        default=25,
+        help="Forwarded to scripts.run_one_expe to override max epochs.",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=None,
+        help="Forwarded to scripts.run_one_expe to override batch size.",
+    )
+    parser.add_argument(
         "--loss_type",
         type=str,
         default=None,
@@ -96,6 +108,11 @@ def main():
             "Forwarded to scripts.run_one_expe. Choices: "
             "'eaec', 'smoothl1', 'mse', 'mae'."
         ),
+    )
+    parser.add_argument(
+        "--stop_on_error",
+        action="store_true",
+        help="Stop batch at first failed subprocess (default: continue).",
     )
     args = parser.parse_args()
 
@@ -113,6 +130,7 @@ def main():
     )
     logging.info("Target appliances: %s", ", ".join(appliances))
 
+    results = []
     for appliance in appliances:
         logging.info(
             "Start training appliance %s for dataset %s.", appliance, dataset_key
@@ -131,7 +149,11 @@ def main():
             appliance,
             "--name_model",
             args.name_model,
+            "--epochs",
+            str(int(args.epochs)),
         ]
+        if args.batch_size is not None:
+            cmd.extend(["--batch_size", str(int(args.batch_size))])
         if args.resume:
             cmd.append("--resume")
         if args.no_final_eval:
@@ -140,13 +162,24 @@ def main():
             cmd.extend(["--loss_type", args.loss_type])
         logging.info("Launch subprocess: %s", " ".join(cmd))
         result = subprocess.run(cmd, check=False)
+        results.append((appliance, int(result.returncode)))
         if result.returncode != 0:
             logging.error(
-                "Subprocess for appliance %s exited with code %s. Stop batch.",
+                "Subprocess for appliance %s exited with code %s.",
                 appliance,
                 result.returncode,
             )
-            break
+            if args.stop_on_error:
+                logging.error("Stop batch due to --stop_on_error.")
+                break
+
+    failed = [(a, rc) for a, rc in results if rc != 0]
+    if failed:
+        logging.error("Batch summary: %s/%s failed.", len(failed), len(results))
+        for appliance, rc in failed:
+            logging.error("  - %s: exit_code=%s", appliance, rc)
+        sys.exit(1)
+    logging.info("Batch summary: all %s appliances completed successfully.", len(results))
 
 
 if __name__ == "__main__":

@@ -30,6 +30,12 @@ from src.helpers.dataset import NILMDataset, TSDatasetScaling
 from src.helpers.metrics import NILMmetrics, eval_win_energy_aggregation
 
 
+def _append_jsonl(path, record):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 # ==== SotA NILM baselines ==== #
 # Recurrent-based
 from src.baselines.nilm.bilstm import BiLSTM
@@ -570,14 +576,50 @@ class ValidationNILMMetricCallback(pl.Callback):
         self.metrics = NILMmetrics()
 
     def on_validation_epoch_end(self, trainer, pl_module):
+        if getattr(trainer, "sanity_checking", False):
+            return
         device = pl_module.device
-        threshold_small_values = self.expes_config.threshold
+        threshold_small_values = float(self.expes_config.threshold)
+        threshold_postprocess = float(
+            getattr(self.expes_config, "postprocess_threshold", threshold_small_values)
+        )
         min_on_steps = int(getattr(self.expes_config, "postprocess_min_on_steps", 0))
+        off_run_min_len = int(
+            getattr(self.expes_config, "state_zero_kernel", max(min_on_steps, 0))
+        )
         y = np.array([])
         y_hat = np.array([])
         y_win = np.array([])
         y_hat_win = np.array([])
         y_state = np.array([])
+        stats = {
+            "pred_raw_sum": 0.0,
+            "pred_raw_sumsq": 0.0,
+            "pred_raw_max": 0.0,
+            "pred_raw_n": 0,
+            "pred_raw_zero_n": 0,
+            "pred_post_sum": 0.0,
+            "pred_post_sumsq": 0.0,
+            "pred_post_max": 0.0,
+            "pred_post_n": 0,
+            "pred_post_zero_n": 0,
+            "target_sum": 0.0,
+            "target_sumsq": 0.0,
+            "target_max": 0.0,
+            "target_n": 0,
+            "gate_prob_sum": 0.0,
+            "gate_prob_sumsq": 0.0,
+            "gate_prob_n": 0,
+        }
+        off_stats = {
+            "off_pred_sum": 0.0,
+            "off_pred_max": 0.0,
+            "off_pred_nonzero_rate_sum": 0.0,
+            "off_pred_nonzero_rate_n": 0,
+            "off_long_run_pred_sum": 0.0,
+            "off_long_run_pred_max": 0.0,
+            "off_long_run_total_len": 0,
+        }
         with torch.no_grad():
             for ts_agg, appl, state in self.valid_loader:
                 pl_module.eval()
@@ -586,12 +628,102 @@ class ValidationNILMMetricCallback(pl.Callback):
                 pred = pl_module(ts_agg_t)
                 pred = torch.clamp(pred, min=0.0)
                 target_inv = self.scaler.inverse_transform_appliance(target)
-                pred_inv = self.scaler.inverse_transform_appliance(pred)
-                pred_inv[pred_inv < threshold_small_values] = 0
+                pred_inv_raw = self.scaler.inverse_transform_appliance(pred)
+                target_inv = torch.nan_to_num(
+                    target_inv, nan=0.0, posinf=0.0, neginf=0.0
+                )
+                pred_inv_raw = torch.nan_to_num(
+                    pred_inv_raw, nan=0.0, posinf=0.0, neginf=0.0
+                )
+                pred_inv = pred_inv_raw.clone()
+                pred_inv[pred_inv < threshold_postprocess] = 0
                 if min_on_steps > 1:
                     pred_inv = suppress_short_activations(
-                        pred_inv, threshold_small_values, min_on_steps
+                        pred_inv, threshold_postprocess, min_on_steps
                     )
+                pred_inv = torch.nan_to_num(pred_inv, nan=0.0, posinf=0.0, neginf=0.0)
+                pred_raw_np = torch.flatten(pred_inv_raw).detach().cpu().numpy()
+                pred_post_np = torch.flatten(pred_inv).detach().cpu().numpy()
+                target_np = torch.flatten(target_inv).detach().cpu().numpy()
+                pred_raw_np = np.nan_to_num(
+                    pred_raw_np.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0
+                )
+                pred_post_np = np.nan_to_num(
+                    pred_post_np.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0
+                )
+                target_np = np.nan_to_num(
+                    target_np.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0
+                )
+                stats["pred_raw_sum"] += float(pred_raw_np.sum())
+                stats["pred_raw_sumsq"] += float((pred_raw_np**2).sum())
+                pred_raw_max = float(pred_raw_np.max()) if pred_raw_np.size else 0.0
+                stats["pred_raw_max"] = max(stats["pred_raw_max"], pred_raw_max)
+                stats["pred_raw_n"] += int(pred_raw_np.size)
+                stats["pred_raw_zero_n"] += int((pred_raw_np <= 0.0).sum())
+                stats["pred_post_sum"] += float(pred_post_np.sum())
+                stats["pred_post_sumsq"] += float((pred_post_np**2).sum())
+                pred_post_max = float(pred_post_np.max()) if pred_post_np.size else 0.0
+                stats["pred_post_max"] = max(stats["pred_post_max"], pred_post_max)
+                stats["pred_post_n"] += int(pred_post_np.size)
+                stats["pred_post_zero_n"] += int((pred_post_np <= 0.0).sum())
+                stats["target_sum"] += float(target_np.sum())
+                stats["target_sumsq"] += float((target_np**2).sum())
+                target_max = float(target_np.max()) if target_np.size else 0.0
+                stats["target_max"] = max(stats["target_max"], target_max)
+                stats["target_n"] += int(target_np.size)
+
+                target_3d = target_inv.detach().cpu().numpy()
+                pred_post_3d = pred_inv.detach().cpu().numpy()
+                target_3d = np.nan_to_num(
+                    target_3d.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0
+                )
+                pred_post_3d = np.nan_to_num(
+                    pred_post_3d.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0
+                )
+                off_s = _off_run_stats(
+                    target_3d, pred_post_3d, threshold_small_values, off_run_min_len
+                )
+                off_stats["off_pred_sum"] += float(off_s["off_pred_sum"])
+                off_stats["off_pred_max"] = max(
+                    float(off_stats["off_pred_max"]), float(off_s["off_pred_max"])
+                )
+                off_stats["off_pred_nonzero_rate_sum"] += float(
+                    off_s["off_pred_nonzero_rate"]
+                )
+                off_stats["off_pred_nonzero_rate_n"] += 1
+                off_stats["off_long_run_pred_sum"] += float(
+                    off_s["off_long_run_pred_sum"]
+                )
+                off_stats["off_long_run_pred_max"] = max(
+                    float(off_stats["off_long_run_pred_max"]),
+                    float(off_s["off_long_run_pred_max"]),
+                )
+                off_stats["off_long_run_total_len"] += int(
+                    off_s["off_long_run_total_len"]
+                )
+
+                if hasattr(pl_module, "model") and hasattr(pl_module.model, "forward_with_gate"):
+                    try:
+                        _, gate_logits = pl_module.model.forward_with_gate(ts_agg_t)
+                        soft_scale = float(getattr(pl_module, "gate_soft_scale", 1.0))
+                        gate_logits = torch.nan_to_num(
+                            gate_logits.float(), nan=0.0, posinf=0.0, neginf=0.0
+                        )
+                        gate_prob = torch.sigmoid(
+                            torch.clamp(gate_logits * soft_scale, min=-50.0, max=50.0)
+                        )
+                        gate_prob_np = torch.flatten(gate_prob).detach().cpu().numpy()
+                        gate_prob_np = np.nan_to_num(
+                            gate_prob_np.astype(np.float64),
+                            nan=0.0,
+                            posinf=0.0,
+                            neginf=0.0,
+                        )
+                        stats["gate_prob_sum"] += float(gate_prob_np.sum())
+                        stats["gate_prob_sumsq"] += float((gate_prob_np**2).sum())
+                        stats["gate_prob_n"] += int(gate_prob_np.size)
+                    except Exception:
+                        pass
                 target_win = target_inv.sum(dim=-1)
                 pred_win = pred_inv.sum(dim=-1)
                 target_flat = torch.flatten(target_inv).detach().cpu().numpy()
@@ -629,7 +761,7 @@ class ValidationNILMMetricCallback(pl.Callback):
         if not y.size:
             return
         y_hat_state = (
-            (y_hat > threshold_small_values).astype(int)
+            (y_hat > threshold_postprocess).astype(int)
             if y_state.size
             else None
         )
@@ -640,6 +772,79 @@ class ValidationNILMMetricCallback(pl.Callback):
             y_hat_state=y_hat_state,
         )
         metrics_win = self.metrics(y=y_win, y_hat=y_hat_win)
+
+        target_sum = float(stats["target_sum"])
+        pred_post_sum = float(stats["pred_post_sum"])
+        if not np.isfinite(target_sum):
+            target_sum = 0.0
+        if not np.isfinite(pred_post_sum):
+            pred_post_sum = 0.0
+        pred_post_zero_rate = float(stats["pred_post_zero_n"]) / float(
+            max(stats["pred_post_n"], 1)
+        )
+        energy_ratio = pred_post_sum / float(max(target_sum, 1e-6))
+        collapse_flag = bool(pred_post_zero_rate >= 0.995 or energy_ratio <= 0.02)
+        gate_prob_mean = None
+        if stats["gate_prob_n"] > 0:
+            gate_prob_sum = float(stats["gate_prob_sum"])
+            gate_prob_n = float(stats["gate_prob_n"])
+            if np.isfinite(gate_prob_sum) and gate_prob_n > 0:
+                gate_prob_mean = gate_prob_sum / gate_prob_n
+        off_pred_sum = float(off_stats["off_pred_sum"])
+        off_long_run_pred_sum = float(off_stats["off_long_run_pred_sum"])
+        if not np.isfinite(off_pred_sum):
+            off_pred_sum = 0.0
+        if not np.isfinite(off_long_run_pred_sum):
+            off_long_run_pred_sum = 0.0
+        off_energy_ratio = off_pred_sum / float(max(target_sum, 1e-6))
+        off_long_run_energy_ratio = off_long_run_pred_sum / float(max(target_sum, 1e-6))
+        off_pred_nonzero_rate = None
+        if off_stats["off_pred_nonzero_rate_n"] > 0:
+            off_pred_nonzero_rate = float(off_stats["off_pred_nonzero_rate_sum"]) / float(
+                off_stats["off_pred_nonzero_rate_n"]
+            )
+
+        result_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(self.expes_config.result_path))
+        )
+        group_dir = os.path.join(
+            result_root,
+            "{}_{}".format(self.expes_config.dataset, self.expes_config.sampling_rate),
+            str(self.expes_config.window_size),
+        )
+        appliance_name = getattr(self.expes_config, "appliance", None)
+        if appliance_name is not None:
+            group_dir = os.path.join(group_dir, str(appliance_name))
+        os.makedirs(group_dir, exist_ok=True)
+        record = {
+            "epoch": int(trainer.current_epoch),
+            "model": str(self.expes_config.name_model),
+            "dataset": str(self.expes_config.dataset),
+            "appliance": str(appliance_name) if appliance_name is not None else None,
+            "sampling_rate": str(self.expes_config.sampling_rate),
+            "window_size": int(self.expes_config.window_size),
+            "threshold": float(threshold_small_values),
+            "threshold_postprocess": float(threshold_postprocess),
+            "min_on_steps": int(min_on_steps),
+            "metrics_timestamp": metrics_timestamp,
+            "metrics_win": metrics_win,
+            "pred_raw_max": float(stats["pred_raw_max"]),
+            "pred_post_max": float(stats["pred_post_max"]),
+            "pred_post_zero_rate": pred_post_zero_rate,
+            "target_max": float(stats["target_max"]),
+            "energy_ratio": energy_ratio,
+            "off_energy_ratio": off_energy_ratio,
+            "off_pred_max": float(off_stats["off_pred_max"]),
+            "off_pred_nonzero_rate": off_pred_nonzero_rate,
+            "off_run_min_len": int(off_run_min_len),
+            "off_long_run_energy_ratio": off_long_run_energy_ratio,
+            "off_long_run_pred_max": float(off_stats["off_long_run_pred_max"]),
+            "off_long_run_total_len": int(off_stats["off_long_run_total_len"]),
+            "gate_prob_mean": gate_prob_mean,
+            "collapse_flag": collapse_flag,
+        }
+        _append_jsonl(os.path.join(group_dir, "val_report.jsonl"), record)
+        logging.info("VAL_REPORT_JSON: %s", json.dumps(record, ensure_ascii=False))
         writer = None
         if trainer.logger is not None and hasattr(trainer.logger, "experiment"):
             writer = trainer.logger.experiment
@@ -673,6 +878,50 @@ def suppress_short_activations(pred_inv, threshold_small_values, min_on_steps):
                 if seg.size < min_on_steps:
                     series[seg] = 0.0
     return torch.from_numpy(pred_np).to(pred_inv.device)
+
+
+def _off_run_stats(target_np, pred_np, thr, min_len):
+    off_mask = target_np <= float(thr)
+    pred_off = pred_np[off_mask]
+    out = {
+        "off_pred_sum": float(pred_off.sum()) if pred_off.size else 0.0,
+        "off_pred_max": float(pred_off.max()) if pred_off.size else 0.0,
+        "off_pred_nonzero_rate": float((pred_off > 0.0).mean()) if pred_off.size else 0.0,
+        "off_long_run_pred_sum": 0.0,
+        "off_long_run_pred_max": 0.0,
+        "off_long_run_total_len": 0,
+    }
+    min_len = int(min_len)
+    if min_len <= 1:
+        return out
+    if target_np.ndim != 3 or pred_np.ndim != 3:
+        return out
+    b, c, l = target_np.shape
+    long_sum = 0.0
+    long_max = 0.0
+    long_len = 0
+    for i in range(b):
+        for j in range(c):
+            off_row = off_mask[i, j]
+            if not off_row.any():
+                continue
+            idx = np.nonzero(off_row)[0]
+            if idx.size == 0:
+                continue
+            splits = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
+            for seg in splits:
+                if seg.size < min_len:
+                    continue
+                vals = pred_np[i, j, seg]
+                if vals.size == 0:
+                    continue
+                long_sum += float(vals.sum())
+                long_max = max(long_max, float(vals.max()))
+                long_len += int(seg.size)
+    out["off_long_run_pred_sum"] = float(long_sum)
+    out["off_long_run_pred_max"] = float(long_max)
+    out["off_long_run_total_len"] = int(long_len)
+    return out
 
 
 def evaluate_nilm_split(
@@ -807,7 +1056,8 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             freq=expes_config.sampling_rate,
         )
 
-    loss_type = str(getattr(expes_config, "loss_type", "eaec"))
+    default_loss_type = "ga_eaec" if expes_config.name_model == "NILMFormer" else "eaec"
+    loss_type = str(getattr(expes_config, "loss_type", default_loss_type))
     if loss_type in ["eaec", "ga_eaec"] and expes_config.name_model == "NILMFormer":
         p_es_eaec = getattr(expes_config, "p_es_eaec", None)
         if p_es_eaec is not None:
@@ -845,14 +1095,70 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         if gate_focal_gamma_eaec is not None:
             expes_config.gate_focal_gamma = gate_focal_gamma_eaec
 
+    train_sampler = None
+    try:
+        balance_window_sampling = bool(
+            getattr(expes_config, "balance_window_sampling", True)
+        )
+    except Exception:
+        balance_window_sampling = False
+    if (
+        balance_window_sampling
+        and str(getattr(expes_config, "name_model", "")).lower() == "nilmformer"
+        and loss_type in ["eaec", "ga_eaec"]
+    ):
+        try:
+            train_states = tuple_data[0][:, 1, 1, :]
+            on_window_mask = (train_states.sum(axis=-1) > 0).astype(np.float32)
+            on_window_frac = float(on_window_mask.mean()) if on_window_mask.size else 0.0
+            sparse_threshold = float(
+                getattr(expes_config, "balance_window_on_frac_threshold", 0.25)
+            )
+            if 0.0 < on_window_frac < sparse_threshold:
+                target_on_frac = float(
+                    getattr(expes_config, "balance_window_target_on_frac", 0.5)
+                )
+                target_on_frac = min(max(target_on_frac, 0.05), 0.95)
+                w_on = target_on_frac / float(max(on_window_frac, 1e-6))
+                w_off = (1.0 - target_on_frac) / float(max(1.0 - on_window_frac, 1e-6))
+                max_ratio = float(getattr(expes_config, "balance_window_max_ratio", 100.0))
+                max_ratio = max(max_ratio, 1.0)
+                ratio = float(w_on) / float(max(w_off, 1e-12))
+                if ratio > max_ratio:
+                    w_on = w_off * max_ratio
+                weights_np = np.where(on_window_mask > 0.5, w_on, w_off).astype(
+                    np.float32
+                )
+                weights = torch.from_numpy(weights_np)
+                train_sampler = torch.utils.data.WeightedRandomSampler(
+                    weights=weights,
+                    num_samples=int(weights.numel()),
+                    replacement=True,
+                )
+                logging.info(
+                    "Enable balanced window sampling: on_window_frac=%.4f target_on_frac=%.2f",
+                    on_window_frac,
+                    target_on_frac,
+                )
+            else:
+                logging.info(
+                    "Skip balanced window sampling: on_window_frac=%.4f",
+                    on_window_frac,
+                )
+        except Exception as e:
+            logging.warning("Could not build balanced sampler: %s", e)
+
     num_workers = getattr(expes_config, "num_workers", 0)
+    if os.name == "nt" and num_workers:
+        num_workers = 0
     persistent_workers = num_workers > 0
     pin_memory = expes_config.device == "cuda"
     batch_size = expes_config.batch_size
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=train_sampler is None,
+        sampler=train_sampler,
         num_workers=num_workers,
         persistent_workers=persistent_workers,
         pin_memory=pin_memory,
@@ -913,17 +1219,57 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             warmup_type=getattr(expes_config, "warmup_type", "linear"),
         )
     else:
-        loss_type = str(getattr(expes_config, "loss_type", "eaec"))
-        threshold_loss = float(
+        default_loss_type = "ga_eaec" if expes_config.name_model == "NILMFormer" else "eaec"
+        loss_type = str(getattr(expes_config, "loss_type", default_loss_type))
+        threshold_loss_raw = float(
             getattr(expes_config, "loss_threshold", expes_config.threshold)
         )
+        threshold_loss = threshold_loss_raw
+        loss_scale_denom = None
+        if threshold_loss_raw > 1.5 and scaler is not None and getattr(scaler, "is_fitted", False):
+            try:
+                scaling_type = getattr(scaler, "appliance_scaling_type", None)
+                n_app = int(getattr(scaler, "n_appliance", 0))
+                if scaling_type is not None and n_app > 0:
+                    if scaling_type == "SameAsPower":
+                        offset = float(getattr(scaler, "power_stat1", 0.0))
+                        denom = float(getattr(scaler, "power_stat2", 1.0))
+                        if getattr(scaler, "power_scaling_type", None) == "MinMax":
+                            denom = float(getattr(scaler, "power_stat2", 1.0)) - float(
+                                getattr(scaler, "power_stat1", 0.0)
+                            )
+                    else:
+                        offset = float(getattr(scaler, "appliance_stat1", [0.0])[0])
+                        denom = float(getattr(scaler, "appliance_stat2", [1.0])[0])
+                        if scaling_type == "MinMax":
+                            denom = float(getattr(scaler, "appliance_stat2", [1.0])[0]) - float(
+                                getattr(scaler, "appliance_stat1", [0.0])[0]
+                            )
+                    if denom == 0.0:
+                        denom = 1.0
+                    threshold_loss = max(0.0, (threshold_loss_raw - offset) / denom)
+                    loss_scale_denom = float(denom)
+            except Exception:
+                threshold_loss = threshold_loss_raw
+        try:
+            cutoff = float(getattr(expes_config, "cutoff", 0.0) or 0.0)
+            if cutoff > 0.0 and threshold_loss_raw > 1.5:
+                threshold_loss = threshold_loss_raw / cutoff
+        except Exception:
+            threshold_loss = threshold_loss_raw
         if loss_type in ["eaec", "ga_eaec"]:
             alpha_on = float(getattr(expes_config, "loss_alpha_on", 3.0))
             alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
             lambda_grad = float(getattr(expes_config, "loss_lambda_grad", 0.5))
             lambda_energy = float(getattr(expes_config, "loss_lambda_energy", 0.5))
-            soft_temp = float(getattr(expes_config, "loss_soft_temp", 10.0))
-            edge_eps = float(getattr(expes_config, "loss_edge_eps", 5.0))
+            soft_temp_raw = float(getattr(expes_config, "loss_soft_temp", 10.0))
+            edge_eps_raw = float(getattr(expes_config, "loss_edge_eps", 5.0))
+            if loss_scale_denom is not None:
+                soft_temp = soft_temp_raw / loss_scale_denom if soft_temp_raw > 1.5 else soft_temp_raw
+                edge_eps = edge_eps_raw / loss_scale_denom if edge_eps_raw > 1.5 else edge_eps_raw
+            else:
+                soft_temp = soft_temp_raw
+                edge_eps = edge_eps_raw
             lambda_sparse = float(getattr(expes_config, "loss_lambda_sparse", 0.0))
             lambda_zero = float(getattr(expes_config, "loss_lambda_zero", 0.0))
             center_ratio = float(getattr(expes_config, "loss_center_ratio", 1.0))
@@ -936,6 +1282,8 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                 energy_floor = float(expes_config.loss_energy_floor_raw) / float(
                     expes_config.cutoff
                 )
+                if loss_scale_denom is not None and float(expes_config.loss_energy_floor_raw) > 1.5:
+                    energy_floor = float(expes_config.loss_energy_floor_raw) / loss_scale_denom
             else:
                 energy_floor = energy_floor_default
             if loss_type == "eaec":
@@ -1005,6 +1353,16 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             patience_rlr=expes_config.p_rlr,
             n_warmup_epochs=expes_config.n_warmup_epochs,
             warmup_type=getattr(expes_config, "warmup_type", "linear"),
+            output_stats_warmup_epochs=int(
+                getattr(expes_config, "output_stats_warmup_epochs", 0)
+            ),
+            output_stats_ramp_epochs=int(
+                getattr(expes_config, "output_stats_ramp_epochs", 0)
+            ),
+            output_stats_mean_max=float(
+                getattr(expes_config, "output_stats_mean_max", 0.0)
+            ),
+            output_stats_std_max=float(getattr(expes_config, "output_stats_std_max", 0.0)),
             neg_penalty_weight=float(getattr(expes_config, "neg_penalty_weight", 0.1)),
             rlr_factor=float(getattr(expes_config, "rlr_factor", 0.1)),
             rlr_min_lr=float(getattr(expes_config, "rlr_min_lr", 0.0)),
@@ -1018,6 +1376,9 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                 getattr(expes_config, "gate_window_weight", 0.0)
             ),
             gate_focal_gamma=float(getattr(expes_config, "gate_focal_gamma", 2.0)),
+            gate_soft_scale=float(getattr(expes_config, "gate_soft_scale", 1.0)),
+            gate_floor=float(getattr(expes_config, "gate_floor", 0.1)),
+            gate_duty_weight=float(getattr(expes_config, "gate_duty_weight", 0.0)),
         )
     accelerator = "cpu"
     devices = 1
@@ -1061,14 +1422,22 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     resume_flag = bool(getattr(expes_config, "resume", False))
     ckpt_path_resume = None
     if resume_flag:
-        ckpt_last = os.path.join(ckpt_root, ckpt_name + "_last.ckpt")
-        if os.path.isfile(ckpt_last):
+        ckpt_last_candidates = [
+            os.path.join(ckpt_root, "last.ckpt"),
+            os.path.join(ckpt_root, ckpt_name + "_last.ckpt"),
+        ]
+        ckpt_last = None
+        for cand in ckpt_last_candidates:
+            if os.path.isfile(cand):
+                ckpt_last = cand
+                break
+        if ckpt_last is not None:
             ckpt_path_resume = ckpt_last
             logging.info("Resume training from last checkpoint: %s", ckpt_last)
         else:
             logging.info(
                 "Resume flag is set but no last checkpoint found at %s, train from scratch.",
-                ckpt_last,
+                ckpt_last_candidates[0],
             )
     loss_type = str(getattr(expes_config, "loss_type", "eaec"))
     gradient_clip_val = 0.0
@@ -1239,6 +1608,8 @@ def tser_model_training(inst_model, tuple_data, expes_config):
     test_dataset = TSDatasetScaling(tuple_data[2][0], tuple_data[2][1])
 
     num_workers = getattr(expes_config, "num_workers", 0)
+    if os.name == "nt" and num_workers:
+        num_workers = 0
     persistent_workers = num_workers > 0
     pin_memory = expes_config.device == "cuda"
     train_loader = torch.utils.data.DataLoader(
@@ -1325,14 +1696,22 @@ def tser_model_training(inst_model, tuple_data, expes_config):
     resume_flag = bool(getattr(expes_config, "resume", False))
     ckpt_path_resume = None
     if resume_flag:
-        ckpt_last = os.path.join(ckpt_root, ckpt_name + "_last.ckpt")
-        if os.path.isfile(ckpt_last):
+        ckpt_last_candidates = [
+            os.path.join(ckpt_root, "last.ckpt"),
+            os.path.join(ckpt_root, ckpt_name + "_last.ckpt"),
+        ]
+        ckpt_last = None
+        for cand in ckpt_last_candidates:
+            if os.path.isfile(cand):
+                ckpt_last = cand
+                break
+        if ckpt_last is not None:
             ckpt_path_resume = ckpt_last
             logging.info("Resume TSER training from last checkpoint: %s", ckpt_last)
         else:
             logging.info(
                 "Resume flag is set for TSER but no last checkpoint found at %s, train from scratch.",
-                ckpt_last,
+                ckpt_last_candidates[0],
             )
     trainer = pl.Trainer(
         max_epochs=expes_config.epochs,

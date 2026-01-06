@@ -27,6 +27,7 @@ class NILMFormerConfig:
     pffn_ratio: int = 4
     n_head: int = 8
     norm_eps: float = 1e-5
+    mask_diagonal: bool = True
 
     def __post_init__(self):
         self.c_in = int(self.c_in)
@@ -45,3 +46,4 @@ class NILMFormerConfig:
         self.pffn_ratio = int(self.pffn_ratio)
         self.n_head = int(self.n_head)
         self.norm_eps = float(self.norm_eps)
+        self.mask_diagonal = bool(self.mask_diagonal)

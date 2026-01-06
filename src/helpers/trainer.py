@@ -79,7 +79,7 @@ class EAECLoss(nn.Module):
         weight = energy_target.abs() / denom
         loss_energy_sample = ((energy_pred - energy_target).abs() / denom) * weight
         on_coverage = p_on.sum(dim=-1)
-        min_on_steps = 0.1 * float(pred.size(-1))
+        min_on_steps = max(1.0, 0.02 * float(pred.size(-1)))
         energy_mask = (on_coverage > min_on_steps).float()
         if energy_mask.sum() > 0:
             loss_energy = (loss_energy_sample * energy_mask).sum() / (
@@ -137,9 +137,12 @@ class GAEAECLoss(nn.Module):
         self.threshold = threshold
         self.alpha_on = alpha_on
         self.alpha_off = alpha_off
+        self.lambda_grad = float(lambda_grad)
         self.lambda_energy = lambda_energy
         self.soft_temp = soft_temp
+        self.edge_eps = float(edge_eps)
         self.energy_floor = energy_floor
+        self.lambda_sparse = float(lambda_sparse)
         self.lambda_zero = lambda_zero
         self.lambda_off_hard = lambda_off_hard
         self.off_margin = off_margin
@@ -183,6 +186,17 @@ class GAEAECLoss(nn.Module):
         loss_off = (loss_point * p_off_target).sum() / (p_off_target.sum() + eps)
         loss_main = self.alpha_on * loss_on + self.alpha_off * loss_off
         
+        if pred.size(-1) > 1 and self.lambda_grad > 0:
+            d_pred = pred[..., 1:] - pred[..., :-1]
+            d_target = target[..., 1:] - target[..., :-1]
+            grad_point = self.base_loss(d_pred, d_target)
+            p_on_mid = torch.maximum(p_on_target[..., 1:], p_on_target[..., :-1])
+            edge_mask = (d_target.abs() > float(self.edge_eps)).float()
+            w = torch.maximum(p_on_mid, edge_mask)
+            loss_grad = (grad_point * w).sum() / (w.sum() + eps)
+        else:
+            loss_grad = pred.new_tensor(0.0)
+
         # ==================== 能量损失 ====================
         energy_pred_on = (pred * p_on_target).sum(dim=-1)
         energy_target_on = (target * p_on_target).sum(dim=-1)
@@ -190,13 +204,18 @@ class GAEAECLoss(nn.Module):
         denom = energy_target_on.abs() + floor
         loss_energy_sample = (energy_pred_on - energy_target_on).abs() / denom
         on_coverage = p_on_target.sum(dim=-1)
-        min_on_steps = 0.1 * float(pred.size(-1))
+        min_on_steps = max(1.0, 0.02 * float(pred.size(-1)))
         energy_mask = (on_coverage > min_on_steps).float()
         if energy_mask.sum() > 0:
             loss_energy = (loss_energy_sample * energy_mask).sum() / (energy_mask.sum() + eps)
         else:
             loss_energy = pred.new_tensor(0.0)
         
+        if self.lambda_sparse > 0 and p_on_target.sum() > 0:
+            sparse_penalty = (pred.abs() * p_on_target).sum() / (p_on_target.sum() + eps)
+        else:
+            sparse_penalty = pred.new_tensor(0.0)
+
         # ==================== OFF假阳性惩罚（温和版本） ====================
         # 只惩罚OFF时超过margin的输出，使用线性惩罚而非平方
         if hard_off_mask.sum() > 0 and self.lambda_off_hard > 0:
@@ -259,7 +278,9 @@ class GAEAECLoss(nn.Module):
         # ==================== 组合总损失 ====================
         total_loss = (
             loss_main 
+            + self.lambda_grad * loss_grad
             + self.lambda_energy * loss_energy 
+            + self.lambda_sparse * sparse_penalty
             + self.lambda_zero * zero_penalty
             + self.lambda_off_hard * off_fp_penalty      # OFF假阳性惩罚
             + self.lambda_on_recall * on_fn_penalty      # ON漏检惩罚（新增！）
@@ -279,6 +300,10 @@ class SeqToSeqLightningModule(pl.LightningModule):
         patience_rlr=None,
         n_warmup_epochs=0,
         warmup_type="linear",
+        output_stats_warmup_epochs=0,
+        output_stats_ramp_epochs=0,
+        output_stats_mean_max=0.0,
+        output_stats_std_max=0.0,
         neg_penalty_weight=0.1,
         rlr_factor=0.1,
         rlr_min_lr=0.0,
@@ -290,6 +315,9 @@ class SeqToSeqLightningModule(pl.LightningModule):
         gate_cls_weight=0.0,
         gate_window_weight=0.0,
         gate_focal_gamma=2.0,
+        gate_soft_scale=1.0,
+        gate_floor=0.1,
+        gate_duty_weight=0.0,
     ):
         super().__init__()
         self.model = model
@@ -302,6 +330,10 @@ class SeqToSeqLightningModule(pl.LightningModule):
         self.patience_rlr = patience_rlr
         self.n_warmup_epochs = n_warmup_epochs
         self.warmup_type = warmup_type
+        self.output_stats_warmup_epochs = int(output_stats_warmup_epochs)
+        self.output_stats_ramp_epochs = int(output_stats_ramp_epochs)
+        self.output_stats_mean_max = float(output_stats_mean_max)
+        self.output_stats_std_max = float(output_stats_std_max)
         self.neg_penalty_weight = float(neg_penalty_weight)
         self.rlr_factor = float(rlr_factor)
         self.rlr_min_lr = float(rlr_min_lr)
@@ -313,13 +345,42 @@ class SeqToSeqLightningModule(pl.LightningModule):
         self.gate_cls_weight = float(gate_cls_weight)
         self.gate_window_weight = float(gate_window_weight)
         self.gate_focal_gamma = float(gate_focal_gamma)
+        self.gate_soft_scale = float(gate_soft_scale)
+        self.gate_floor = float(gate_floor)
+        self.gate_duty_weight = float(gate_duty_weight)
         self.best_val_loss = float("inf")
         self.best_epoch = -1
         self.best_model_state_dict = None
         self.loss_train_history = []
         self.loss_valid_history = []
 
+    def _compute_output_stats_alpha(self, epoch_idx: int) -> float:
+        if self.output_stats_mean_max <= 0.0 and self.output_stats_std_max <= 0.0:
+            return 0.0
+        warm = max(int(self.output_stats_warmup_epochs), 0)
+        ramp = max(int(self.output_stats_ramp_epochs), 0)
+        if epoch_idx < warm:
+            return 0.0
+        if ramp <= 0:
+            return 1.0
+        t = epoch_idx - warm
+        return min(1.0, float(t + 1) / float(ramp))
+
+    def _sync_output_stats_to_model(self, epoch_idx: int):
+        if not hasattr(self.model, "set_output_stats"):
+            return
+        alpha = self._compute_output_stats_alpha(epoch_idx)
+        self.model.set_output_stats(
+            alpha=alpha,
+            mean_max=self.output_stats_mean_max,
+            std_max=self.output_stats_std_max,
+        )
+
     def forward(self, ts_agg):
+        if isinstance(self.criterion, GAEAECLoss) and hasattr(self.model, "forward_with_gate"):
+            power, gate = self.model.forward_with_gate(ts_agg)
+            pred, _gate_prob = self._apply_soft_gate(power, gate)
+            return pred
         return self.model(ts_agg)
 
     def _gate_focal_bce(self, logits, targets):
@@ -331,12 +392,18 @@ class SeqToSeqLightningModule(pl.LightningModule):
         eps = 1e-6
         probs = torch.clamp(probs, eps, 1.0 - eps)
         pt = probs * targets + (1.0 - probs) * (1.0 - targets)
-        alpha_pos = 1.5
+        alpha_pos = 5.0
         alpha_neg = 1.0
         alpha = alpha_pos * targets + alpha_neg * (1.0 - targets)
         gamma = max(self.gate_focal_gamma, 0.0)
         loss = -alpha * ((1.0 - pt) ** gamma) * torch.log(pt)
         return loss.mean()
+
+    def _apply_soft_gate(self, power, gate_logits):
+        gate_floor = min(max(self.gate_floor, 0.0), 1.0)
+        soft_scale = max(self.gate_soft_scale, 0.0)
+        gate_prob = torch.sigmoid(gate_logits.float() * soft_scale)
+        return power * (gate_floor + (1.0 - gate_floor) * gate_prob), gate_prob
 
     def _gate_window_bce(self, logits, state):
         if self.gate_window_weight <= 0.0:
@@ -389,6 +456,10 @@ class SeqToSeqLightningModule(pl.LightningModule):
                 for s, e in zip(starts.tolist(), ends.tolist()):
                     if e - s >= min_len:
                         long_zero_mask[b, c, s:e] = 1.0
+        ratio_thr = float(getattr(self, "zero_run_ratio", 0.0))
+        if ratio_thr > 0.0:
+            mostly_off = (zero_mask.mean(dim=-1, keepdim=True) >= ratio_thr).float()
+            long_zero_mask = long_zero_mask * mostly_off
         if long_zero_mask.sum() <= 0:
             return pred.new_tensor(0.0)
         p_abs = pred.float().abs()
@@ -421,6 +492,10 @@ class SeqToSeqLightningModule(pl.LightningModule):
         if off_mask.ndim == 3 and high_mask.ndim == 2:
             high_mask = high_mask.unsqueeze(1)
         joint_mask = off_mask * high_mask
+        ratio_thr = float(getattr(self, "zero_run_ratio", 0.0))
+        if ratio_thr > 0.0 and off_mask.ndim == 3:
+            mostly_off = (off_mask.mean(dim=-1, keepdim=True) >= ratio_thr).float()
+            joint_mask = joint_mask * mostly_off
         if joint_mask.sum() <= 0:
             return pred.new_tensor(0.0)
         p_abs = pred.float().abs()
@@ -438,18 +513,27 @@ class SeqToSeqLightningModule(pl.LightningModule):
         if isinstance(self.criterion, GAEAECLoss) and hasattr(
             self.model, "forward_with_gate"
         ):
-            pred, gate = self.model.forward_with_gate(ts_agg)
-            pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+            power, gate = self.model.forward_with_gate(ts_agg)
+            power = torch.nan_to_num(power, nan=0.0, posinf=1e4, neginf=-1e4)
             gate = torch.nan_to_num(gate, nan=0.0, posinf=1e4, neginf=-1e4)
+            pred, gate_prob = self._apply_soft_gate(power, gate)
+            pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
             loss_main = self.criterion(pred, target, gate=gate)
             gate_cls_loss = self._gate_focal_bce(gate, state)
             gate_window_loss = self._gate_window_bce(gate, state)
+            if self.gate_duty_weight > 0.0:
+                target_duty = torch.clamp(state.float().mean(), 0.0, 1.0)
+                pred_duty = torch.clamp(gate_prob.mean(), 0.0, 1.0)
+                gate_duty_loss = F.mse_loss(pred_duty, target_duty)
+            else:
+                gate_duty_loss = pred.new_tensor(0.0)
         else:
             pred = self(ts_agg)
             pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
             loss_main = self.criterion(pred, target)
             gate_cls_loss = pred.new_tensor(0.0)
             gate_window_loss = pred.new_tensor(0.0)
+            gate_duty_loss = pred.new_tensor(0.0)
         loss_main = torch.nan_to_num(loss_main, nan=0.0, posinf=1e4, neginf=-1e4)
         neg_penalty = torch.relu(-pred).mean()
         neg_penalty = torch.nan_to_num(neg_penalty, nan=0.0, posinf=1e4, neginf=-1e4)
@@ -468,6 +552,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
             + self.neg_penalty_weight * neg_penalty
             + self.gate_cls_weight * gate_cls_loss
             + self.gate_window_weight * gate_window_loss
+            + self.gate_duty_weight * gate_duty_loss
         )
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
@@ -480,9 +565,11 @@ class SeqToSeqLightningModule(pl.LightningModule):
         if isinstance(self.criterion, GAEAECLoss) and hasattr(
             self.model, "forward_with_gate"
         ):
-            pred, gate = self.model.forward_with_gate(ts_agg)
-            pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+            power, gate = self.model.forward_with_gate(ts_agg)
+            power = torch.nan_to_num(power, nan=0.0, posinf=1e4, neginf=-1e4)
             gate = torch.nan_to_num(gate, nan=0.0, posinf=1e4, neginf=-1e4)
+            pred, _gate_prob = self._apply_soft_gate(power, gate)
+            pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
             loss_main = self.criterion(pred, target, gate=gate)
         else:
             pred = self(ts_agg)
@@ -557,6 +644,15 @@ class SeqToSeqLightningModule(pl.LightningModule):
             return optimizer
 
         return [optimizer], schedulers
+
+    def on_fit_start(self):
+        self._sync_output_stats_to_model(int(self.current_epoch))
+
+    def on_train_epoch_start(self):
+        self._sync_output_stats_to_model(int(self.current_epoch))
+
+    def on_validation_epoch_start(self):
+        self._sync_output_stats_to_model(int(self.current_epoch))
 
     def on_train_epoch_end(self):
         metrics = self.trainer.callback_metrics

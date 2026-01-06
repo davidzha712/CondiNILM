@@ -22,10 +22,12 @@ class DiagonnalyMaskedSelfAttention(nn.Module):
         head_dim: int,
         dropout: float,
         use_efficient_attention: bool = False,
+        mask_diagonal: bool = True,
     ):
         super().__init__()
 
         self.use_efficient_attention: bool = use_efficient_attention
+        self.mask_diagonal: bool = bool(mask_diagonal)
 
         self.n_heads: int = n_heads
         self.head_dim: int = head_dim
@@ -57,18 +59,18 @@ class DiagonnalyMaskedSelfAttention(nn.Module):
 
         scores = torch.einsum("bhle,bhse->bhls", xq, xk)
         scores = scores * self.scale
+        scores = torch.nan_to_num(scores, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        diag_mask = torch.eye(
-            seqlen, dtype=torch.bool, device=xq.device
-        ).unsqueeze(0).unsqueeze(0)
-        scores = scores.masked_fill(diag_mask, float("-inf"))
+        diag_mask = None
+        if self.mask_diagonal:
+            diag_mask = torch.eye(seqlen, dtype=torch.bool, device=xq.device).unsqueeze(
+                0
+            ).unsqueeze(0)
+            scores = scores.masked_fill(diag_mask, -1e4)
 
-        max_scores = scores.max(dim=-1, keepdim=True).values
-        scores = scores - max_scores
-        scores = torch.exp(scores)
-        scores = scores.masked_fill(diag_mask, 0.0)
-        denom = scores.sum(dim=-1, keepdim=True)
-        attn = scores / (denom + 1e-9)
+        attn = torch.softmax(scores, dim=-1)
+        if diag_mask is not None:
+            attn = attn.masked_fill(diag_mask, 0.0)
         attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
         attn = self.attn_dropout(attn)
 
@@ -111,6 +113,7 @@ class EncoderLayer(nn.Module):
             head_dim=NFconfig.d_model // NFconfig.n_head,
             dropout=NFconfig.dp_rate,
             use_efficient_attention=NFconfig.use_efficient_attention,
+            mask_diagonal=bool(getattr(NFconfig, "mask_diagonal", True)),
         )
 
         self.norm1 = nn.LayerNorm(NFconfig.d_model, eps=NFconfig.norm_eps)

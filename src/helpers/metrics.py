@@ -81,6 +81,7 @@ class NILMmetrics:
 
     def __call__(self, y=None, y_hat=None, y_state=None, y_hat_state=None):
         metrics = {}
+        eps = 1e-12
 
         # ======= Basic regression Metrics ======= #
         if y is not None:
@@ -102,21 +103,29 @@ class NILMmetrics:
             # =======  NILM Metrics ======= #
 
             # Total Energy Correctly Assigned (TECA)
+            abs_y_sum = float(np.sum(np.abs(y)))
+            abs_y_sum = max(abs_y_sum, eps)
             metrics["TECA"] = round(
-                1 - ((np.sum(np.abs(y_hat - y))) / (2 * np.sum(np.abs(y)))),
+                1 - ((np.sum(np.abs(y_hat - y))) / (2 * abs_y_sum)),
                 self.round_to,
             )
             # Normalized Disaggregation Error (NDE)
+            y_sq_sum = float(np.sum(y**2))
+            y_sq_sum = max(y_sq_sum, eps)
             metrics["NDE"] = round(
-                (np.sum((y_hat - y) ** 2)) / np.sum(y**2), self.round_to
+                (np.sum((y_hat - y) ** 2)) / y_sq_sum, self.round_to
             )
             # Signal Aggregate Error (SAE)
+            y_sum = float(np.sum(y))
+            y_sum = max(y_sum, eps)
             metrics["SAE"] = round(
-                np.abs(np.sum(y_hat) - np.sum(y)) / np.sum(y), self.round_to
+                np.abs(np.sum(y_hat) - np.sum(y)) / y_sum, self.round_to
             )
             # Matching Rate
+            mr_denom = float(np.sum(np.maximum(y_hat, y)))
+            mr_denom = max(mr_denom, eps)
             metrics["MR"] = round(
-                np.sum(np.minimum(y_hat, y)) / np.sum(np.maximum(y_hat, y)),
+                np.sum(np.minimum(y_hat, y)) / mr_denom,
                 self.round_to,
             )
 
@@ -170,7 +179,15 @@ class REGmetrics:
         metrics["MAE"] = round(mean_absolute_error(y, y_hat), self.round_to)
         metrics["MSE"] = round(mean_squared_error(y, y_hat), self.round_to)
         metrics["RMSE"] = round(np.sqrt(mean_squared_error(y, y_hat)), self.round_to)
-        metrics["MAPE"] = round(mean_absolute_percentage_error(y, y_hat), self.round_to)
+        y_arr = np.nan_to_num(np.asarray(y, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        y_hat_arr = np.nan_to_num(
+            np.asarray(y_hat, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0
+        )
+        denom = np.maximum(np.abs(y_arr), 1e-12)
+        mape = float(np.mean(np.abs((y_arr - y_hat_arr) / denom)))
+        if not np.isfinite(mape):
+            mape = 0.0
+        metrics["MAPE"] = round(mape, self.round_to)
 
         return metrics
 
@@ -302,6 +319,7 @@ def eval_win_energy_aggregation(
             df_inst["true_ratio"] = df_inst["true_app_power"] / df_inst["total_power"]
             df_inst["pred_ratio"] = df_inst["pred_app_power"] / df_inst["total_power"]
 
+            df_inst = df_inst.replace([np.inf, -np.inf], 0)
             df_inst = df_inst.fillna(value=0)
 
             true_ratio.extend(df_inst["true_ratio"].tolist())
