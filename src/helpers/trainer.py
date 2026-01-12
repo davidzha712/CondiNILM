@@ -225,7 +225,7 @@ class GAEAECLoss(nn.Module):
             off_fp_penalty = (pred_excess * hard_off_mask).sum() / (hard_off_mask.sum() + eps)
         else:
             off_fp_penalty = pred.new_tensor(0.0)
-        
+
         # ==================== ON漏检惩罚（关键！防止全0输出） ====================
         # 惩罚ON时输出太低的情况
         if hard_on_mask.sum() > 0 and self.lambda_on_recall > 0:
@@ -312,6 +312,11 @@ class SeqToSeqLightningModule(pl.LightningModule):
         zero_run_ratio=0.8,
         loss_threshold=0.0,
         off_high_agg_penalty_weight=0.0,
+        off_state_penalty_weight=0.0,
+        off_state_margin=0.0,
+        off_state_long_penalty_weight=0.0,
+        off_state_long_kernel=0,
+        off_state_long_margin=0.0,
         gate_cls_weight=0.0,
         gate_window_weight=0.0,
         gate_focal_gamma=2.0,
@@ -342,6 +347,11 @@ class SeqToSeqLightningModule(pl.LightningModule):
         self.zero_run_ratio = float(zero_run_ratio)
         self.loss_threshold = float(loss_threshold)
         self.off_high_agg_penalty_weight = float(off_high_agg_penalty_weight)
+        self.off_state_penalty_weight = float(off_state_penalty_weight)
+        self.off_state_margin = float(off_state_margin)
+        self.off_state_long_penalty_weight = float(off_state_long_penalty_weight)
+        self.off_state_long_kernel = int(off_state_long_kernel)
+        self.off_state_long_margin = float(off_state_long_margin)
         self.gate_cls_weight = float(gate_cls_weight)
         self.gate_window_weight = float(gate_window_weight)
         self.gate_focal_gamma = float(gate_focal_gamma)
@@ -506,10 +516,99 @@ class SeqToSeqLightningModule(pl.LightningModule):
         penalty = (excess * joint_mask).sum() / (joint_mask.sum() + eps)
         return self.off_high_agg_penalty_weight * penalty
 
+    def _off_state_long_penalty(self, pred, state):
+        """
+        Compute penalty for predictions during long consecutive OFF periods.
+
+        Uses 1D convolution to detect runs of OFF states >= kernel length,
+        then penalizes predictions that exceed the margin in those regions.
+
+        Args:
+            pred: Prediction tensor, shape (B, C, L) or (B, L)
+            state: State tensor indicating ON/OFF, shape (B, C, L) or (B, L)
+
+        Returns:
+            Weighted penalty value (scalar tensor)
+        """
+        if self.off_state_long_penalty_weight <= 0.0 or self.off_state_long_kernel <= 1:
+            return pred.new_tensor(0.0)
+        if state is None:
+            return pred.new_tensor(0.0)
+        eps = 1e-6
+        k = min(int(self.off_state_long_kernel), int(pred.size(-1)))
+        if k <= 1:
+            return pred.new_tensor(0.0)
+        state = state.float()
+        off_mask = (state <= 0.5).float()
+        if off_mask.ndim == 2:
+            off_mask = off_mask.unsqueeze(1)
+        if off_mask.ndim != 3:
+            return pred.new_tensor(0.0)
+        if off_mask.size(-1) != pred.size(-1):
+            return pred.new_tensor(0.0)
+        # Ensure single channel for conv1d - take max across channels (any OFF = OFF)
+        if off_mask.size(1) > 1:
+            off_mask = off_mask.max(dim=1, keepdim=True)[0]
+        kernel = torch.ones((1, 1, k), device=pred.device, dtype=pred.dtype)
+        counts = F.conv1d(off_mask.to(dtype=pred.dtype), kernel, stride=1, padding=0)
+        full_off = (counts >= float(k) - 0.5).to(dtype=pred.dtype)
+        if full_off.sum() <= 0:
+            return pred.new_tensor(0.0)
+        long_mask = F.conv_transpose1d(full_off, kernel, stride=1, padding=0)
+        long_mask = (long_mask > 0.0).to(dtype=pred.dtype)
+        if pred.ndim == 3 and long_mask.size(1) == 1 and pred.size(1) != 1:
+            long_mask = long_mask.expand(-1, pred.size(1), -1)
+        if long_mask.sum() <= 0:
+            return pred.new_tensor(0.0)
+        margin = max(float(self.off_state_long_margin), 0.0)
+        p = pred.float()
+        excess_above = torch.relu(p - margin)
+        below_margin = torch.relu(margin - p)
+        penalty_pos = (excess_above * long_mask).sum() / (long_mask.sum() + eps)
+        penalty_neg = (below_margin * long_mask).sum() / (long_mask.sum() + eps)
+        penalty = 0.7 * penalty_pos + 0.3 * penalty_neg
+        return penalty * float(self.off_state_long_penalty_weight)
+
+    def _off_state_penalty(self, pred, state):
+        """Compute OFF state penalty - penalize predictions when state is OFF."""
+        if state is None or self.off_state_penalty_weight <= 0.0:
+            return pred.new_tensor(0.0)
+        eps = 1e-6
+        off_mask = (state <= 0.5).float()
+        if pred.ndim == 3 and off_mask.ndim == 2:
+            off_mask = off_mask.unsqueeze(1)
+        if off_mask.sum() <= 0:
+            return pred.new_tensor(0.0)
+        margin = max(float(self.off_state_margin), 0.0)
+        excess = torch.relu(pred.float() - margin)
+        penalty = (excess * off_mask).sum() / (off_mask.sum() + eps)
+        return penalty * float(self.off_state_penalty_weight)
+
+    def _compute_all_penalties(self, pred, target, state, ts_agg):
+        """Compute all auxiliary penalties and return them as a dict."""
+        penalties = {}
+        penalties["neg"] = torch.nan_to_num(
+            torch.relu(-pred).mean(), nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        penalties["zero_run"] = torch.nan_to_num(
+            self._zero_run_penalty(pred, target), nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        penalties["off_high_agg"] = torch.nan_to_num(
+            self._off_high_agg_penalty(pred, target, ts_agg), nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        penalties["off_state_long"] = torch.nan_to_num(
+            self._off_state_long_penalty(pred, state), nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        penalties["off_state"] = torch.nan_to_num(
+            self._off_state_penalty(pred, state), nan=0.0, posinf=1e4, neginf=-1e4
+        )
+        return penalties
+
     def training_step(self, batch, batch_idx):
         ts_agg, appl, state = batch
         ts_agg = torch.nan_to_num(ts_agg.float(), nan=0.0, posinf=0.0, neginf=0.0)
         target = torch.nan_to_num(appl.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        state = torch.nan_to_num(state.float(), nan=0.0, posinf=0.0, neginf=0.0)
         if isinstance(self.criterion, GAEAECLoss) and hasattr(
             self.model, "forward_with_gate"
         ):
@@ -535,21 +634,14 @@ class SeqToSeqLightningModule(pl.LightningModule):
             gate_window_loss = pred.new_tensor(0.0)
             gate_duty_loss = pred.new_tensor(0.0)
         loss_main = torch.nan_to_num(loss_main, nan=0.0, posinf=1e4, neginf=-1e4)
-        neg_penalty = torch.relu(-pred).mean()
-        neg_penalty = torch.nan_to_num(neg_penalty, nan=0.0, posinf=1e4, neginf=-1e4)
-        zero_run_penalty = self._zero_run_penalty(pred, target)
-        zero_run_penalty = torch.nan_to_num(
-            zero_run_penalty, nan=0.0, posinf=1e4, neginf=-1e4
-        )
-        off_high_agg_penalty = self._off_high_agg_penalty(pred, target, ts_agg)
-        off_high_agg_penalty = torch.nan_to_num(
-            off_high_agg_penalty, nan=0.0, posinf=1e4, neginf=-1e4
-        )
+        penalties = self._compute_all_penalties(pred, target, state, ts_agg)
         loss = (
             loss_main
-            + zero_run_penalty
-            + off_high_agg_penalty
-            + self.neg_penalty_weight * neg_penalty
+            + penalties["zero_run"]
+            + penalties["off_high_agg"]
+            + penalties["off_state_long"]
+            + penalties["off_state"]
+            + self.neg_penalty_weight * penalties["neg"]
             + self.gate_cls_weight * gate_cls_loss
             + self.gate_window_weight * gate_window_loss
             + self.gate_duty_weight * gate_duty_loss
@@ -562,6 +654,12 @@ class SeqToSeqLightningModule(pl.LightningModule):
         ts_agg, appl, _ = batch
         ts_agg = torch.nan_to_num(ts_agg.float(), nan=0.0, posinf=0.0, neginf=0.0)
         target = torch.nan_to_num(appl.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        state = None
+        try:
+            if isinstance(batch, (list, tuple)) and len(batch) >= 3:
+                state = torch.nan_to_num(batch[2].float(), nan=0.0, posinf=0.0, neginf=0.0)
+        except Exception:
+            state = None
         if isinstance(self.criterion, GAEAECLoss) and hasattr(
             self.model, "forward_with_gate"
         ):
@@ -576,21 +674,14 @@ class SeqToSeqLightningModule(pl.LightningModule):
             pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
             loss_main = self.criterion(pred, target)
         loss_main = torch.nan_to_num(loss_main, nan=0.0, posinf=1e4, neginf=-1e4)
-        neg_penalty = torch.relu(-pred).mean()
-        neg_penalty = torch.nan_to_num(neg_penalty, nan=0.0, posinf=1e4, neginf=-1e4)
-        zero_run_penalty = self._zero_run_penalty(pred, target)
-        zero_run_penalty = torch.nan_to_num(
-            zero_run_penalty, nan=0.0, posinf=1e4, neginf=-1e4
-        )
-        off_high_agg_penalty = self._off_high_agg_penalty(pred, target, ts_agg)
-        off_high_agg_penalty = torch.nan_to_num(
-            off_high_agg_penalty, nan=0.0, posinf=1e4, neginf=-1e4
-        )
+        penalties = self._compute_all_penalties(pred, target, state, ts_agg)
         loss = (
             loss_main
-            + zero_run_penalty
-            + off_high_agg_penalty
-            + self.neg_penalty_weight * neg_penalty
+            + penalties["zero_run"]
+            + penalties["off_high_agg"]
+            + penalties["off_state_long"]
+            + penalties["off_state"]
+            + self.neg_penalty_weight * penalties["neg"]
         )
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)

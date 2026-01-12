@@ -17,6 +17,7 @@ import pytorch_lightning as pl
 from tqdm import tqdm
 
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.helpers.trainer import (
     EAECLoss,
@@ -28,6 +29,7 @@ from src.helpers.trainer import (
 )
 from src.helpers.dataset import NILMDataset, TSDatasetScaling
 from src.helpers.metrics import NILMmetrics, eval_win_energy_aggregation
+from src.helpers.loss_tuning import AdaptiveLossTuner
 
 
 def _append_jsonl(path, record):
@@ -138,7 +140,9 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
             device = None
     if device is None:
         device = expes_config.device
-    if hasattr(model_trainer, "model"):
+    if hasattr(model_trainer, "criterion") and hasattr(model_trainer, "model"):
+        model = model_trainer
+    elif hasattr(model_trainer, "model"):
         model = model_trainer.model
     else:
         model = model_trainer
@@ -161,16 +165,75 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
             ts_agg_t = ts_agg.float().to(device)
             appl_t = appl.float().to(device)
             pred_t = model(ts_agg_t)
-            pred_t = torch.clamp(pred_t, min=0.0)
-            agg_np = scaler.inverse_transform_agg_power(
-                ts_agg_t[:, 0:1, :].detach().cpu().numpy()
+            threshold_small_values = float(getattr(expes_config, "threshold", 0.0))
+            threshold_postprocess = float(
+                getattr(expes_config, "postprocess_threshold", threshold_small_values)
             )
-            target_np = scaler.inverse_transform_appliance(
-                appl_t.detach().cpu().numpy()
+            min_on_steps = int(getattr(expes_config, "postprocess_min_on_steps", 0))
+            gate_logits = None
+            if hasattr(model, "model") and hasattr(model.model, "forward_with_gate"):
+                try:
+                    _power_raw, gate_logits = model.model.forward_with_gate(ts_agg_t)
+                except Exception:
+                    gate_logits = None
+            elif hasattr(model, "forward_with_gate"):
+                try:
+                    _power_raw, gate_logits = model.forward_with_gate(ts_agg_t)
+                except Exception:
+                    gate_logits = None
+
+            agg_t = scaler.inverse_transform_agg_power(ts_agg_t[:, 0:1, :])
+            target_t = scaler.inverse_transform_appliance(appl_t)
+            pred_inv_raw = scaler.inverse_transform_appliance(pred_t)
+            agg_t = torch.nan_to_num(agg_t, nan=0.0, posinf=0.0, neginf=0.0)
+            target_t = torch.nan_to_num(target_t, nan=0.0, posinf=0.0, neginf=0.0)
+            pred_inv_raw = torch.nan_to_num(
+                pred_inv_raw, nan=0.0, posinf=0.0, neginf=0.0
             )
-            pred_np = scaler.inverse_transform_appliance(
-                pred_t.detach().cpu().numpy()
-            )
+            pred_inv_raw = torch.clamp(pred_inv_raw, min=0.0)
+            pred_inv = pred_inv_raw.clone()
+            pred_inv[pred_inv < threshold_postprocess] = 0.0
+            if min_on_steps > 1:
+                pred_inv = suppress_short_activations(
+                    pred_inv, threshold_postprocess, min_on_steps
+                )
+            if gate_logits is not None and bool(
+                getattr(expes_config, "postprocess_use_gate", True)
+            ):
+                try:
+                    gate_logits = torch.nan_to_num(
+                        gate_logits.float(), nan=0.0, posinf=0.0, neginf=0.0
+                    )
+                    soft_scale = float(getattr(expes_config, "gate_soft_scale", 1.0))
+                    pscale = getattr(expes_config, "postprocess_gate_soft_scale", None)
+                    if pscale is None:
+                        pscale = max(soft_scale, 1.0) * 3.0
+                    pscale = float(pscale)
+                    if not np.isfinite(pscale) or pscale <= 0.0:
+                        pscale = 1.0
+                    gate_prob_sharp = torch.sigmoid(
+                        torch.clamp(gate_logits * pscale, min=-50.0, max=50.0)
+                    )
+                    k = int(
+                        getattr(
+                            expes_config,
+                            "postprocess_gate_kernel",
+                            getattr(expes_config, "state_zero_kernel", max(min_on_steps, 0)),
+                        )
+                    )
+                    pred_inv = suppress_long_off_with_gate(
+                        pred_inv,
+                        gate_prob_sharp,
+                        k,
+                        float(getattr(expes_config, "postprocess_gate_avg_threshold", 0.35)),
+                        float(getattr(expes_config, "postprocess_gate_max_threshold", 0.55)),
+                    )
+                except Exception:
+                    pass
+            pred_inv = torch.nan_to_num(pred_inv, nan=0.0, posinf=0.0, neginf=0.0)
+            agg_np = agg_t.detach().cpu().numpy()
+            target_np = target_t.detach().cpu().numpy()
+            pred_np = pred_inv.detach().cpu().numpy()
             batch_size = agg_np.shape[0]
             if target_concat is None:
                 n_app = target_np.shape[1]
@@ -574,6 +637,7 @@ class ValidationNILMMetricCallback(pl.Callback):
         self.scaler = scaler
         self.expes_config = expes_config
         self.metrics = NILMmetrics()
+        self.adaptive_tuner = AdaptiveLossTuner()
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if getattr(trainer, "sanity_checking", False):
@@ -593,6 +657,11 @@ class ValidationNILMMetricCallback(pl.Callback):
         y_hat_win = np.array([])
         y_state = np.array([])
         stats = {
+            "pred_scaled_sum": 0.0,
+            "pred_scaled_sumsq": 0.0,
+            "pred_scaled_max": 0.0,
+            "pred_scaled_n": 0,
+            "pred_scaled_nan_n": 0,
             "pred_raw_sum": 0.0,
             "pred_raw_sumsq": 0.0,
             "pred_raw_max": 0.0,
@@ -620,13 +689,37 @@ class ValidationNILMMetricCallback(pl.Callback):
             "off_long_run_pred_max": 0.0,
             "off_long_run_total_len": 0,
         }
+        off_stats_raw = {
+            "off_pred_sum": 0.0,
+            "off_pred_max": 0.0,
+            "off_pred_nonzero_rate_sum": 0.0,
+            "off_pred_nonzero_rate_n": 0,
+            "off_long_run_pred_sum": 0.0,
+            "off_long_run_pred_max": 0.0,
+            "off_long_run_total_len": 0,
+        }
         with torch.no_grad():
             for ts_agg, appl, state in self.valid_loader:
                 pl_module.eval()
                 ts_agg_t = ts_agg.float().to(device)
                 target = appl.float().to(device)
                 pred = pl_module(ts_agg_t)
-                pred = torch.clamp(pred, min=0.0)
+                pred_scaled = torch.nan_to_num(
+                    pred.float(), nan=0.0, posinf=0.0, neginf=0.0
+                )
+                pred_scaled_flat = torch.flatten(pred_scaled).detach().cpu().numpy()
+                pred_scaled_flat = np.nan_to_num(
+                    pred_scaled_flat.astype(np.float64),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                stats["pred_scaled_sum"] += float(pred_scaled_flat.sum())
+                stats["pred_scaled_sumsq"] += float((pred_scaled_flat**2).sum())
+                pred_scaled_max = float(pred_scaled_flat.max()) if pred_scaled_flat.size else 0.0
+                stats["pred_scaled_max"] = max(stats["pred_scaled_max"], pred_scaled_max)
+                stats["pred_scaled_n"] += int(pred_scaled_flat.size)
+                stats["pred_scaled_nan_n"] += int((~np.isfinite(pred_scaled_flat)).sum())
                 target_inv = self.scaler.inverse_transform_appliance(target)
                 pred_inv_raw = self.scaler.inverse_transform_appliance(pred)
                 target_inv = torch.nan_to_num(
@@ -635,12 +728,79 @@ class ValidationNILMMetricCallback(pl.Callback):
                 pred_inv_raw = torch.nan_to_num(
                     pred_inv_raw, nan=0.0, posinf=0.0, neginf=0.0
                 )
+                pred_inv_raw = torch.clamp(pred_inv_raw, min=0.0)
                 pred_inv = pred_inv_raw.clone()
                 pred_inv[pred_inv < threshold_postprocess] = 0
                 if min_on_steps > 1:
                     pred_inv = suppress_short_activations(
                         pred_inv, threshold_postprocess, min_on_steps
                     )
+                if hasattr(pl_module, "model") and hasattr(pl_module.model, "forward_with_gate"):
+                    try:
+                        _power_raw, gate_logits = pl_module.model.forward_with_gate(ts_agg_t)
+                        soft_scale = float(getattr(pl_module, "gate_soft_scale", 1.0))
+                        post_scale = float(
+                            getattr(
+                                self.expes_config,
+                                "postprocess_gate_soft_scale",
+                                max(float(getattr(pl_module, "gate_soft_scale", 1.0)), 1.0) * 3.0,
+                            )
+                        )
+                        if not np.isfinite(post_scale) or post_scale <= 0.0:
+                            post_scale = 1.0
+                        gate_logits = torch.nan_to_num(
+                            gate_logits.float(), nan=0.0, posinf=0.0, neginf=0.0
+                        )
+                        gate_prob_stats = torch.sigmoid(
+                            torch.clamp(gate_logits * soft_scale, min=-50.0, max=50.0)
+                        )
+                        gate_prob_np = torch.flatten(gate_prob_stats).detach().cpu().numpy()
+                        gate_prob_np = np.nan_to_num(
+                            gate_prob_np.astype(np.float64),
+                            nan=0.0,
+                            posinf=0.0,
+                            neginf=0.0,
+                        )
+                        stats["gate_prob_sum"] += float(gate_prob_np.sum())
+                        stats["gate_prob_sumsq"] += float((gate_prob_np**2).sum())
+                        stats["gate_prob_n"] += int(gate_prob_np.size)
+                        gate_prob_sharp = torch.sigmoid(
+                            torch.clamp(gate_logits * post_scale, min=-50.0, max=50.0)
+                        )
+                        use_gate_pp = bool(
+                            getattr(self.expes_config, "postprocess_use_gate", True)
+                        )
+                        if use_gate_pp:
+                            k = int(
+                                getattr(
+                                    self.expes_config,
+                                    "postprocess_gate_kernel",
+                                    off_run_min_len,
+                                )
+                            )
+                            gate_avg_thr = float(
+                                getattr(
+                                    self.expes_config,
+                                    "postprocess_gate_avg_threshold",
+                                    0.35,
+                                )
+                            )
+                            gate_max_thr = float(
+                                getattr(
+                                    self.expes_config,
+                                    "postprocess_gate_max_threshold",
+                                    0.55,
+                                )
+                            )
+                            pred_inv = suppress_long_off_with_gate(
+                                pred_inv,
+                                gate_prob_sharp,
+                                k,
+                                gate_avg_thr,
+                                gate_max_thr,
+                            )
+                    except Exception:
+                        pass
                 pred_inv = torch.nan_to_num(pred_inv, nan=0.0, posinf=0.0, neginf=0.0)
                 pred_raw_np = torch.flatten(pred_inv_raw).detach().cpu().numpy()
                 pred_post_np = torch.flatten(pred_inv).detach().cpu().numpy()
@@ -674,14 +834,22 @@ class ValidationNILMMetricCallback(pl.Callback):
 
                 target_3d = target_inv.detach().cpu().numpy()
                 pred_post_3d = pred_inv.detach().cpu().numpy()
+                pred_raw_3d = pred_inv_raw.detach().cpu().numpy()
                 target_3d = np.nan_to_num(
                     target_3d.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0
                 )
                 pred_post_3d = np.nan_to_num(
                     pred_post_3d.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0
                 )
+                pred_raw_3d = np.nan_to_num(
+                    pred_raw_3d.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0
+                )
                 off_s = _off_run_stats(
-                    target_3d, pred_post_3d, threshold_small_values, off_run_min_len
+                    target_3d,
+                    pred_post_3d,
+                    threshold_small_values,
+                    off_run_min_len,
+                    pred_thr=0.0,
                 )
                 off_stats["off_pred_sum"] += float(off_s["off_pred_sum"])
                 off_stats["off_pred_max"] = max(
@@ -701,29 +869,32 @@ class ValidationNILMMetricCallback(pl.Callback):
                 off_stats["off_long_run_total_len"] += int(
                     off_s["off_long_run_total_len"]
                 )
+                off_s_raw = _off_run_stats(
+                    target_3d,
+                    pred_raw_3d,
+                    threshold_small_values,
+                    off_run_min_len,
+                    pred_thr=threshold_small_values,
+                )
+                off_stats_raw["off_pred_sum"] += float(off_s_raw["off_pred_sum"])
+                off_stats_raw["off_pred_max"] = max(
+                    float(off_stats_raw["off_pred_max"]), float(off_s_raw["off_pred_max"])
+                )
+                off_stats_raw["off_pred_nonzero_rate_sum"] += float(
+                    off_s_raw["off_pred_nonzero_rate"]
+                )
+                off_stats_raw["off_pred_nonzero_rate_n"] += 1
+                off_stats_raw["off_long_run_pred_sum"] += float(
+                    off_s_raw["off_long_run_pred_sum"]
+                )
+                off_stats_raw["off_long_run_pred_max"] = max(
+                    float(off_stats_raw["off_long_run_pred_max"]),
+                    float(off_s_raw["off_long_run_pred_max"]),
+                )
+                off_stats_raw["off_long_run_total_len"] += int(
+                    off_s_raw["off_long_run_total_len"]
+                )
 
-                if hasattr(pl_module, "model") and hasattr(pl_module.model, "forward_with_gate"):
-                    try:
-                        _, gate_logits = pl_module.model.forward_with_gate(ts_agg_t)
-                        soft_scale = float(getattr(pl_module, "gate_soft_scale", 1.0))
-                        gate_logits = torch.nan_to_num(
-                            gate_logits.float(), nan=0.0, posinf=0.0, neginf=0.0
-                        )
-                        gate_prob = torch.sigmoid(
-                            torch.clamp(gate_logits * soft_scale, min=-50.0, max=50.0)
-                        )
-                        gate_prob_np = torch.flatten(gate_prob).detach().cpu().numpy()
-                        gate_prob_np = np.nan_to_num(
-                            gate_prob_np.astype(np.float64),
-                            nan=0.0,
-                            posinf=0.0,
-                            neginf=0.0,
-                        )
-                        stats["gate_prob_sum"] += float(gate_prob_np.sum())
-                        stats["gate_prob_sumsq"] += float((gate_prob_np**2).sum())
-                        stats["gate_prob_n"] += int(gate_prob_np.size)
-                    except Exception:
-                        pass
                 target_win = target_inv.sum(dim=-1)
                 pred_win = pred_inv.sum(dim=-1)
                 target_flat = torch.flatten(target_inv).detach().cpu().numpy()
@@ -784,6 +955,9 @@ class ValidationNILMMetricCallback(pl.Callback):
         )
         energy_ratio = pred_post_sum / float(max(target_sum, 1e-6))
         collapse_flag = bool(pred_post_zero_rate >= 0.995 or energy_ratio <= 0.02)
+        postprocess_zeroed_flag = bool(
+            float(stats["pred_raw_max"]) > 0.0 and float(stats["pred_post_max"]) <= 0.0
+        )
         gate_prob_mean = None
         if stats["gate_prob_n"] > 0:
             gate_prob_sum = float(stats["gate_prob_sum"])
@@ -802,6 +976,19 @@ class ValidationNILMMetricCallback(pl.Callback):
         if off_stats["off_pred_nonzero_rate_n"] > 0:
             off_pred_nonzero_rate = float(off_stats["off_pred_nonzero_rate_sum"]) / float(
                 off_stats["off_pred_nonzero_rate_n"]
+            )
+        off_pred_sum_raw = float(off_stats_raw["off_pred_sum"])
+        off_long_run_pred_sum_raw = float(off_stats_raw["off_long_run_pred_sum"])
+        if not np.isfinite(off_pred_sum_raw):
+            off_pred_sum_raw = 0.0
+        if not np.isfinite(off_long_run_pred_sum_raw):
+            off_long_run_pred_sum_raw = 0.0
+        off_energy_ratio_raw = off_pred_sum_raw / float(max(target_sum, 1e-6))
+        off_long_run_energy_ratio_raw = off_long_run_pred_sum_raw / float(max(target_sum, 1e-6))
+        off_pred_nonzero_rate_raw = None
+        if off_stats_raw["off_pred_nonzero_rate_n"] > 0:
+            off_pred_nonzero_rate_raw = float(off_stats_raw["off_pred_nonzero_rate_sum"]) / float(
+                off_stats_raw["off_pred_nonzero_rate_n"]
             )
 
         result_root = os.path.dirname(
@@ -826,25 +1013,52 @@ class ValidationNILMMetricCallback(pl.Callback):
             "threshold": float(threshold_small_values),
             "threshold_postprocess": float(threshold_postprocess),
             "min_on_steps": int(min_on_steps),
+            "loss_threshold": float(getattr(self.expes_config, "loss_threshold", threshold_small_values)),
             "metrics_timestamp": metrics_timestamp,
             "metrics_win": metrics_win,
+            "pred_scaled_max": float(stats["pred_scaled_max"]),
             "pred_raw_max": float(stats["pred_raw_max"]),
             "pred_post_max": float(stats["pred_post_max"]),
             "pred_post_zero_rate": pred_post_zero_rate,
+            "postprocess_zeroed_flag": postprocess_zeroed_flag,
             "target_max": float(stats["target_max"]),
             "energy_ratio": energy_ratio,
             "off_energy_ratio": off_energy_ratio,
+            "off_energy_ratio_raw": off_energy_ratio_raw,
             "off_pred_max": float(off_stats["off_pred_max"]),
+            "off_pred_max_raw": float(off_stats_raw["off_pred_max"]),
             "off_pred_nonzero_rate": off_pred_nonzero_rate,
+            "off_pred_nonzero_rate_raw": off_pred_nonzero_rate_raw,
             "off_run_min_len": int(off_run_min_len),
             "off_long_run_energy_ratio": off_long_run_energy_ratio,
+            "off_long_run_energy_ratio_raw": off_long_run_energy_ratio_raw,
             "off_long_run_pred_max": float(off_stats["off_long_run_pred_max"]),
+            "off_long_run_pred_max_raw": float(off_stats_raw["off_long_run_pred_max"]),
             "off_long_run_total_len": int(off_stats["off_long_run_total_len"]),
             "gate_prob_mean": gate_prob_mean,
             "collapse_flag": collapse_flag,
         }
         _append_jsonl(os.path.join(group_dir, "val_report.jsonl"), record)
         logging.info("VAL_REPORT_JSON: %s", json.dumps(record, ensure_ascii=False))
+
+        # Adaptive loss tuning using AdaptiveLossTuner
+        try:
+            device_type = str(getattr(self.expes_config, "device_type", "") or "")
+            appliance_name = str(getattr(self.expes_config, "appliance", "") or "")
+
+            # Handle early collapse
+            self.adaptive_tuner.handle_early_collapse(
+                pl_module, record, device_type, appliance_name, int(trainer.current_epoch)
+            )
+
+            # Tune from metrics if not collapsed
+            if not bool(record.get("collapse_flag", False)):
+                self.adaptive_tuner.tune_from_metrics(
+                    pl_module, record, metrics_timestamp, device_type, appliance_name
+                )
+        except Exception:
+            pass
+
         writer = None
         if trainer.logger is not None and hasattr(trainer.logger, "experiment"):
             writer = trainer.logger.experiment
@@ -880,13 +1094,61 @@ def suppress_short_activations(pred_inv, threshold_small_values, min_on_steps):
     return torch.from_numpy(pred_np).to(pred_inv.device)
 
 
-def _off_run_stats(target_np, pred_np, thr, min_len):
+def _pad_same_1d(x, kernel_size):
+    k = int(kernel_size)
+    if k <= 1:
+        return x
+    total = k - 1
+    left = total // 2
+    right = total - left
+    if left <= 0 and right <= 0:
+        return x
+    return F.pad(x, (left, right), mode="replicate")
+
+
+def suppress_long_off_with_gate(pred_inv, gate_prob, kernel_size, gate_avg_thr, gate_max_thr):
+    if pred_inv is None or gate_prob is None:
+        return pred_inv
+    if not torch.is_tensor(pred_inv) or not torch.is_tensor(gate_prob):
+        return pred_inv
+    if pred_inv.dim() != 3 or gate_prob.dim() != 3:
+        return pred_inv
+    if pred_inv.size() != gate_prob.size():
+        return pred_inv
+    k = int(kernel_size)
+    if k <= 1:
+        return pred_inv
+    k = min(k, int(pred_inv.size(-1)))
+    if k <= 1:
+        return pred_inv
+    gate_prob = torch.nan_to_num(gate_prob.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    x = gate_prob.reshape(-1, 1, gate_prob.size(-1))
+    x = _pad_same_1d(x, k)
+    gate_avg = F.avg_pool1d(x, kernel_size=k, stride=1, padding=0)
+    gate_max = F.max_pool1d(x, kernel_size=k, stride=1, padding=0)
+    gate_avg = gate_avg.reshape_as(gate_prob)
+    gate_max = gate_max.reshape_as(gate_prob)
+    gate_avg_thr = float(gate_avg_thr)
+    gate_max_thr = float(gate_max_thr)
+    mask = (gate_avg < gate_avg_thr) & (gate_max < gate_max_thr)
+    if not mask.any():
+        return pred_inv
+    out = pred_inv.clone()
+    out[mask] = 0.0
+    return out
+
+
+def _off_run_stats(target_np, pred_np, thr, min_len, pred_thr=None):
     off_mask = target_np <= float(thr)
     pred_off = pred_np[off_mask]
+    if pred_thr is None:
+        pred_thr = 0.0
+    else:
+        pred_thr = float(pred_thr)
     out = {
         "off_pred_sum": float(pred_off.sum()) if pred_off.size else 0.0,
         "off_pred_max": float(pred_off.max()) if pred_off.size else 0.0,
-        "off_pred_nonzero_rate": float((pred_off > 0.0).mean()) if pred_off.size else 0.0,
+        "off_pred_nonzero_rate": float((pred_off > pred_thr).mean()) if pred_off.size else 0.0,
         "off_long_run_pred_sum": 0.0,
         "off_long_run_pred_max": 0.0,
         "off_long_run_total_len": 0,
@@ -934,6 +1196,7 @@ def evaluate_nilm_split(
     mask,
     log_dict,
     min_on_duration_steps=0,
+    expes_config=None,
 ):
     metrics_helper = NILMmetrics()
     y = np.array([])
@@ -941,6 +1204,37 @@ def evaluate_nilm_split(
     y_win = np.array([])
     y_hat_win = np.array([])
     y_state = np.array([])
+    threshold_postprocess = float(threshold_small_values)
+    off_run_min_len = int(max(int(min_on_duration_steps or 0), 0))
+    postprocess_use_gate = True
+    post_gate_kernel = int(off_run_min_len)
+    post_gate_avg_thr = 0.35
+    post_gate_max_thr = 0.55
+    post_gate_soft_scale = None
+    gate_floor = 0.0
+    gate_soft_scale = 1.0
+    if expes_config is not None:
+        threshold_postprocess = float(
+            getattr(expes_config, "postprocess_threshold", threshold_postprocess)
+        )
+        postprocess_use_gate = bool(getattr(expes_config, "postprocess_use_gate", True))
+        off_run_min_len = int(
+            getattr(
+                expes_config,
+                "postprocess_gate_kernel",
+                getattr(expes_config, "state_zero_kernel", off_run_min_len),
+            )
+        )
+        post_gate_kernel = int(getattr(expes_config, "postprocess_gate_kernel", off_run_min_len))
+        post_gate_avg_thr = float(
+            getattr(expes_config, "postprocess_gate_avg_threshold", post_gate_avg_thr)
+        )
+        post_gate_max_thr = float(
+            getattr(expes_config, "postprocess_gate_max_threshold", post_gate_max_thr)
+        )
+        post_gate_soft_scale = getattr(expes_config, "postprocess_gate_soft_scale", None)
+        gate_floor = float(getattr(expes_config, "gate_floor", gate_floor))
+        gate_soft_scale = float(getattr(expes_config, "gate_soft_scale", gate_soft_scale))
     with torch.no_grad():
         iterator = data_loader
         try:
@@ -952,15 +1246,64 @@ def evaluate_nilm_split(
             model.eval()
             ts_agg_t = ts_agg.float().to(device)
             target = appl.float().to(device)
-            pred = model(ts_agg_t)
-            pred = torch.clamp(pred, min=0.0)
+            pred = None
+            gate_logits = None
+            if hasattr(model, "forward_with_gate"):
+                try:
+                    power_raw, gate_logits = model.forward_with_gate(ts_agg_t)
+                    gate_logits = torch.nan_to_num(
+                        gate_logits.float(), nan=0.0, posinf=0.0, neginf=0.0
+                    )
+                    soft_scale = float(gate_soft_scale)
+                    if not np.isfinite(soft_scale) or soft_scale <= 0.0:
+                        soft_scale = 1.0
+                    gate_prob = torch.sigmoid(
+                        torch.clamp(gate_logits * soft_scale, min=-50.0, max=50.0)
+                    )
+                    gf = float(gate_floor)
+                    if not np.isfinite(gf):
+                        gf = 0.0
+                    gf = min(max(gf, 0.0), 1.0)
+                    pred = power_raw * (gf + (1.0 - gf) * gate_prob)
+                except Exception:
+                    pred = None
+                    gate_logits = None
+            if pred is None:
+                pred = model(ts_agg_t)
             target_inv = scaler.inverse_transform_appliance(target)
             pred_inv = scaler.inverse_transform_appliance(pred)
-            pred_inv[pred_inv < threshold_small_values] = 0
+            pred_inv = torch.clamp(pred_inv, min=0.0)
+            pred_inv[pred_inv < threshold_postprocess] = 0
             if min_on_duration_steps and min_on_duration_steps > 1:
                 pred_inv = suppress_short_activations(
-                    pred_inv, threshold_small_values, min_on_duration_steps
+                    pred_inv, threshold_postprocess, min_on_duration_steps
                 )
+            if (
+                postprocess_use_gate
+                and gate_logits is not None
+                and pred_inv is not None
+                and pred_inv.dim() == 3
+                and int(post_gate_kernel or 0) > 1
+            ):
+                try:
+                    pscale = post_gate_soft_scale
+                    if pscale is None:
+                        pscale = max(float(gate_soft_scale), 1.0) * 3.0
+                    pscale = float(pscale)
+                    if not np.isfinite(pscale) or pscale <= 0.0:
+                        pscale = 1.0
+                    gate_prob_sharp = torch.sigmoid(
+                        torch.clamp(gate_logits * pscale, min=-50.0, max=50.0)
+                    )
+                    pred_inv = suppress_long_off_with_gate(
+                        pred_inv,
+                        gate_prob_sharp,
+                        int(post_gate_kernel),
+                        float(post_gate_avg_thr),
+                        float(post_gate_max_thr),
+                    )
+                except Exception:
+                    pass
             target_win = target_inv.sum(dim=-1)
             pred_win = pred_inv.sum(dim=-1)
             target_flat = torch.flatten(target_inv).detach().cpu().numpy()
@@ -986,7 +1329,7 @@ def evaluate_nilm_split(
     if not y.size:
         return {}, {}
     y_hat_state = (
-        (y_hat > threshold_small_values).astype(int) if y_state.size else None
+        (y_hat > threshold_postprocess).astype(int) if y_state.size else None
     )
     metrics_timestamp = metrics_helper(
         y=y,
@@ -1345,6 +1688,17 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         off_high_agg_penalty_weight = float(
             getattr(expes_config, "off_high_agg_penalty_weight", 0.0)
         )
+        off_state_penalty_weight = float(
+            getattr(expes_config, "off_state_penalty_weight", 0.0)
+        )
+        off_state_margin = float(getattr(expes_config, "off_state_margin", 0.0))
+        off_state_long_penalty_weight = float(
+            getattr(expes_config, "off_state_long_penalty_weight", 0.0)
+        )
+        off_state_long_kernel = int(getattr(expes_config, "off_state_long_kernel", 0))
+        off_state_long_margin = float(
+            getattr(expes_config, "off_state_long_margin", off_state_margin)
+        )
         lightning_module = SeqToSeqLightningModule(
             inst_model,
             learning_rate=float(expes_config.model_training_param.lr),
@@ -1371,6 +1725,11 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             zero_run_ratio=zero_run_ratio,
             loss_threshold=threshold_loss,
             off_high_agg_penalty_weight=off_high_agg_penalty_weight,
+            off_state_penalty_weight=off_state_penalty_weight,
+            off_state_margin=off_state_margin,
+            off_state_long_penalty_weight=off_state_long_penalty_weight,
+            off_state_long_kernel=off_state_long_kernel,
+            off_state_long_margin=off_state_long_margin,
             gate_cls_weight=float(getattr(expes_config, "gate_cls_weight", 0.0)),
             gate_window_weight=float(
                 getattr(expes_config, "gate_window_weight", 0.0)
@@ -1404,11 +1763,40 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             accelerator = "cpu"
     expes_config.device = accelerator if accelerator != "gpu" else "cuda"
     precision = "32"
-    if accelerator == "gpu":
-        if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
-            precision = "bf16-mixed"
+    try:
+        user_precision = getattr(expes_config, "precision", None)
+    except Exception:
+        user_precision = None
+    if user_precision is not None:
+        precision = str(user_precision)
+    elif accelerator == "gpu":
+        try:
+            device_type = str(getattr(expes_config, "device_type", "") or "")
+        except Exception:
+            device_type = ""
+        try:
+            appliance_name = str(getattr(expes_config, "appliance", "") or "")
+        except Exception:
+            appliance_name = ""
+        try:
+            loss_type_for_prec = str(getattr(expes_config, "loss_type", "") or "")
+        except Exception:
+            loss_type_for_prec = ""
+        force_fp32 = bool(
+            str(getattr(expes_config, "name_model", "")).lower() == "nilmformer"
+            and loss_type_for_prec in ("eaec", "ga_eaec")
+            and (
+                device_type in ("frequent_switching", "cycling_low_power")
+                or appliance_name.lower() in ("fridge",)
+            )
+        )
+        if force_fp32:
+            precision = "32"
         else:
-            precision = "16-mixed"
+            if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+                precision = "bf16-mixed"
+            else:
+                precision = "16-mixed"
     tb_root = os.path.join("log", "tensorboard")
     os.makedirs(tb_root, exist_ok=True)
     tb_name = "{}_{}_{}_{}_{}".format(
@@ -1448,8 +1836,27 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     )
     if accumulate_grad_batches < 1:
         accumulate_grad_batches = 1
+    max_epochs = int(expes_config.epochs)
+    if ckpt_path_resume is not None:
+        try:
+            ckpt_meta = torch.load(ckpt_path_resume, weights_only=False, map_location="cpu")
+            ckpt_epoch = ckpt_meta.get("epoch", None)
+            if ckpt_epoch is None:
+                ckpt_epoch = (
+                    ckpt_meta.get("loops", {})
+                    .get("fit_loop", {})
+                    .get("epoch_progress", {})
+                    .get("current", {})
+                    .get("completed", None)
+                )
+            if ckpt_epoch is not None:
+                ckpt_epoch = int(ckpt_epoch)
+                if max_epochs <= ckpt_epoch:
+                    max_epochs = (ckpt_epoch + 1) + max(1, int(expes_config.epochs))
+        except Exception:
+            pass
     trainer_kwargs = dict(
-        max_epochs=expes_config.epochs,
+        max_epochs=max_epochs,
         accelerator=accelerator,
         devices=devices,
         precision=precision,
@@ -1479,7 +1886,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     best_model_path = getattr(checkpoint_callback, "best_model_path", None)
     if best_model_path:
         try:
-            ckpt = torch.load(best_model_path, weights_only=False)
+            ckpt = torch.load(best_model_path, weights_only=False, map_location="cpu")
             lightning_module.load_state_dict(ckpt["state_dict"])
         except Exception as e:
             logging.warning(
@@ -1508,6 +1915,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             "valid_metrics",
             eval_log,
             min_on_steps,
+            expes_config,
         )
         logging.info("Eval test split metrics...")
         evaluate_nilm_split(
@@ -1520,6 +1928,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             "test_metrics",
             eval_log,
             min_on_steps,
+            expes_config,
         )
         if expes_config.name_model == "DiffNILM":
             eval_win_energy_aggregation(
@@ -1713,8 +2122,27 @@ def tser_model_training(inst_model, tuple_data, expes_config):
                 "Resume flag is set for TSER but no last checkpoint found at %s, train from scratch.",
                 ckpt_last_candidates[0],
             )
+    max_epochs = int(expes_config.epochs)
+    if ckpt_path_resume is not None:
+        try:
+            ckpt_meta = torch.load(ckpt_path_resume, weights_only=False, map_location="cpu")
+            ckpt_epoch = ckpt_meta.get("epoch", None)
+            if ckpt_epoch is None:
+                ckpt_epoch = (
+                    ckpt_meta.get("loops", {})
+                    .get("fit_loop", {})
+                    .get("epoch_progress", {})
+                    .get("current", {})
+                    .get("completed", None)
+                )
+            if ckpt_epoch is not None:
+                ckpt_epoch = int(ckpt_epoch)
+                if max_epochs <= ckpt_epoch:
+                    max_epochs = (ckpt_epoch + 1) + max(1, int(expes_config.epochs))
+        except Exception:
+            pass
     trainer = pl.Trainer(
-        max_epochs=expes_config.epochs,
+        max_epochs=max_epochs,
         accelerator=accelerator,
         devices=devices,
         precision=precision,
@@ -1741,7 +2169,7 @@ def tser_model_training(inst_model, tuple_data, expes_config):
     best_model_path = getattr(checkpoint_callback, "best_model_path", None)
     if best_model_path:
         try:
-            ckpt = torch.load(best_model_path, weights_only=False)
+            ckpt = torch.load(best_model_path, weights_only=False, map_location="cpu")
             lightning_module.load_state_dict(ckpt["state_dict"])
         except Exception as e:
             logging.warning(

@@ -161,6 +161,9 @@ class NILMFormer(nn.Module):
         # === Conv Head === #
         x = x.permute(0, 2, 1)  # (B, d_model, L)
         power_raw = self.DownstreamTaskHead(x)  # (B, c_out, L)
+        # Clamp before softplus for numerical stability (softplus(-10) ≈ 4.5e-5)
+        # Note: softplus always returns non-negative values, so output is >= 0
+        power_raw = torch.clamp(power_raw, min=-10.0)
         power = F.softplus(power_raw)
 
         alpha = float(getattr(self, "output_stats_alpha", 0.0))
@@ -205,6 +208,8 @@ class NILMFormer(nn.Module):
         alpha = float(getattr(self, "output_stats_alpha", 0.0))
         mean_max = float(getattr(self, "output_stats_mean_max", 0.0))
         std_max = float(getattr(self, "output_stats_std_max", 0.0))
+        # Clamp before softplus for numerical stability
+        power_raw = torch.clamp(power_raw, min=-10.0)
         power = F.softplus(power_raw)
         if alpha > 0.0 and (mean_max > 0.0 or std_max > 0.0):
             stats_out = self.ProjStats2(stats_feat).float()

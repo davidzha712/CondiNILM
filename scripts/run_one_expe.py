@@ -7,10 +7,15 @@
 
 import argparse
 import os
+import sys
 import yaml
 import logging
 
 logging.getLogger("torch.utils.flop_counter").disabled = True
+
+_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _ROOT_DIR not in sys.path:
+    sys.path.insert(0, _ROOT_DIR)
 
 import numpy as np
 import torch
@@ -28,46 +33,74 @@ from src.helpers.preprocessing import (
 )
 from src.helpers.dataset import NILMscaler
 from src.helpers.expes import launch_models_training
+from src.helpers.device_config import (
+    CYCLING_DEVICE_TYPES,
+    classify_device_type,
+    get_device_loss_params,
+    estimate_mean_run_length,
+    apply_device_type_config_defaults,
+)
 
 
-def _classify_device_type(duty_cycle, peak_power, mean_on, cv_on, mean_event_duration, n_events, total_samples):
-    """
-    根据统计特性分类设备类型。
-    
-    设备类型：
-    - sparse_high_power: 稀疏高功率设备（如Kettle, Microwave）
-    - frequent_switching: 频繁开关设备（如Fridge）
-    - long_cycle: 长周期运行设备（如WashingMachine, Dishwasher）
-    - always_on: 常开设备
-    - sparse_medium_power: 稀疏中等功率设备
-    """
-    event_rate = n_events / (total_samples / 1000 + 1e-6) if total_samples > 0 else 0
-    
-    # 长周期设备：事件持续时间长（优先于稀疏高功率，避免洗衣机/洗碗机被误判成Kettle）
-    if mean_event_duration > 30 and peak_power > 200 and cv_on > 0.2:
-        return "long_cycle"
+# Helper functions for config management
+def _set_cfg_value(expes_config, key, value, default_value=None):
+    """Set config value, optionally only if current equals default."""
+    if key not in expes_config:
+        expes_config[key] = value
+        return
+    if default_value is None:
+        return
+    try:
+        cur = float(getattr(expes_config, key))
+        if abs(cur - float(default_value)) < 1e-12:
+            expes_config[key] = value
+    except Exception as e:
+        logging.debug("_set_cfg_value(%s): %s", key, e)
 
-    # 稀疏高功率设备：duty_cycle低，峰值功率高，且事件持续时间短
-    if duty_cycle < 0.08 and peak_power > 1000 and mean_event_duration <= 15:
-        return "sparse_high_power"
-    
-    # 频繁开关设备：duty_cycle中等，事件频率高
-    if 0.3 <= duty_cycle <= 0.7 and event_rate > 5:
-        return "frequent_switching"
-    
-    # 长周期运行设备：duty_cycle不一定高，但事件时长长，功率变化较大
-    if duty_cycle <= 0.6 and mean_event_duration > 30 and cv_on > 0.3:
-        return "long_cycle"
-    
-    # 常开设备：duty_cycle很高
-    if duty_cycle > 0.8:
-        return "always_on"
-    
-    # 稀疏中等功率
-    if duty_cycle < 0.15 and peak_power > 200:
-        return "sparse_medium_power"
-    
-    return "unknown"
+
+def _maybe_denormalize_power_by_cutoff(power, expes_config):
+    try:
+        flat = power.reshape(-1)
+        if flat.size == 0:
+            return power
+        cutoff = float(getattr(expes_config, "cutoff", 0.0) or 0.0)
+        if cutoff > 0.0 and float(np.nanmax(np.abs(flat))) <= 1.5:
+            return power * cutoff
+    except Exception as e:
+        logging.debug("_maybe_denormalize_power_by_cutoff failed: %s", e)
+        return power
+    return power
+
+
+def _apply_cutoff_to_loss_params(expes_config):
+    try:
+        cutoff = float(getattr(expes_config, "cutoff", 0.0) or 0.0)
+        threshold = float(getattr(expes_config, "threshold", 0.0) or 0.0)
+        if cutoff <= 0.0 or threshold <= 0.0:
+            return
+        expes_config["loss_threshold"] = float(threshold) / float(cutoff)
+        if "loss_soft_temp_raw" in expes_config:
+            expes_config["loss_soft_temp"] = float(expes_config.loss_soft_temp_raw) / float(
+                cutoff
+            )
+        if "loss_edge_eps_raw" in expes_config:
+            expes_config["loss_edge_eps"] = float(expes_config.loss_edge_eps_raw) / float(
+                cutoff
+            )
+        if "loss_energy_floor_raw" in expes_config:
+            expes_config["loss_energy_floor"] = float(
+                expes_config.loss_energy_floor_raw
+            ) / float(cutoff)
+        if "loss_off_margin_raw" in expes_config:
+            raw = float(getattr(expes_config, "loss_off_margin_raw", 0.0) or 0.0)
+            if raw > 0.0:
+                expes_config["loss_off_margin"] = float(raw) / float(cutoff)
+                expes_config["loss_off_margin"] = float(
+                    min(max(expes_config["loss_off_margin"], 0.005), 0.05)
+                )
+    except Exception as e:
+        logging.debug("_apply_cutoff_to_loss_params failed: %s", e)
+        return
 
 
 def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
@@ -76,32 +109,28 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     
     支持的设备类型：
     1. sparse_high_power: 稀疏高功率设备（如Kettle, Microwave）- 强调ON事件检测
-    2. frequent_switching: 频繁开关设备（如Fridge）- 平衡ON/OFF，强化状态切换
-    3. long_cycle: 长周期运行设备（如WashingMachine）- 关注功率变化趋势
-    4. always_on: 常开设备 - 强调OFF事件检测（异常检测）
+    2. cycling_infrequent: 低占空比周期设备（如低频启动的Fridge）- 强化OFF段稳定与长OFF约束
+    3. cycling_low_power: 低功率周期设备（如Fridge）- 平衡ON/OFF，强化状态切换
+    4. frequent_switching: 频繁开关设备 - 强化状态切换
+    5. long_cycle: 长周期运行设备（如WashingMachine）- 关注功率变化趋势
+    6. always_on: 常开设备 - 强调OFF事件检测（异常检测）
     """
     try:
         if data.ndim != 4 or data.shape[1] < 2:
             return
         power = data[:, 1, 0, :].astype(np.float32)
         status = data[:, 1, 1, :].astype(np.float32)
+        power = _maybe_denormalize_power_by_cutoff(power, expes_config)
         flat = power.reshape(-1)
-        status_flat = (status.reshape(-1) > 0.5)
-    except Exception:
+        status_bin = (status > 0.5).astype(np.int8)
+    except Exception as e:
+        logging.debug("_configure_nilm_loss_hyperparams: data extraction failed: %s", e)
         return
     if flat.size == 0:
         return
-
-    try:
-        cutoff = float(getattr(expes_config, "cutoff", 0.0) or 0.0)
-        if cutoff > 0.0 and float(np.nanmax(np.abs(flat))) <= 1.5:
-            power = power * cutoff
-            flat = power.reshape(-1)
-    except Exception:
-        pass
     
     thr = float(threshold)
-    on_mask = status_flat  # 使用状态而不是功率阈值
+    on_mask = status_bin.reshape(-1) > 0
     duty_cycle = float(on_mask.mean())
     
     # ============== 基础统计 ==============
@@ -112,7 +141,8 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
         off_q99 = (
             float(np.quantile(np.abs(off_values), 0.99)) if off_values.size > 0 else 0.0
         )
-    except Exception:
+    except Exception as e:
+        logging.debug("_configure_nilm_loss_hyperparams: off_stats failed: %s", e)
         off_std = 0.0
         off_q99 = 0.0
     
@@ -121,29 +151,49 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     std_on = float(on_values.std()) if on_values.size > 1 else 0.0
     cv_on = std_on / (mean_on + 1e-6)  # 变异系数
     
-    # ============== ON事件统计 ==============
-    status_diff = np.diff(status_flat.astype(int))
-    on_starts = np.where(status_diff == 1)[0]
-    on_ends = np.where(status_diff == -1)[0]
-    
-    if status_flat[0]:
-        on_starts = np.concatenate([[0], on_starts])
-    if status_flat[-1] and len(on_ends) < len(on_starts):
-        on_ends = np.concatenate([on_ends, [len(status_flat) - 1]])
-    
-    n_events = min(len(on_starts), len(on_ends))
-    if n_events > 0:
-        event_durations = on_ends[:n_events] - on_starts[:n_events]
-        mean_event_duration = float(event_durations.mean())
-    else:
-        mean_event_duration = 0.0
+    # ============== ON事件统计（避免窗口拼接边界伪事件） ==============
+    total_samples = int(status_bin.size)
+    try:
+        if status_bin.ndim == 2 and status_bin.shape[0] > 0 and status_bin.shape[1] > 1:
+            diff_2d = np.diff(status_bin, axis=1)
+            n_events = int((diff_2d == 1).sum())
+        else:
+            n_events = 0
+    except Exception as e:
+        logging.debug("_configure_nilm_loss_hyperparams: event counting failed: %s", e)
+        n_events = 0
+
+    mean_event_duration = estimate_mean_run_length(status_bin, max_rows=4000)
+    event_rate = (
+        float(n_events) / float(total_samples / 1000.0 + 1e-6) if total_samples > 0 else 0.0
+    )
+    n_events_adj = int(n_events)
+    try:
+        overlap = float(getattr(expes_config, "overlap", 0.0) or 0.0)
+        overlap = float(min(max(overlap, 0.0), 0.95))
+        if overlap > 0.0:
+            scale = max(1e-3, 1.0 - overlap)
+            event_rate = float(event_rate) * float(scale)
+            n_events_adj = int(round(float(n_events) * float(scale)))
+    except Exception as e:
+        logging.debug("_configure_nilm_loss_hyperparams: overlap adjustment failed: %s", e)
+        n_events_adj = int(n_events)
     
     # ============== 设备类型分类 ==============
-    device_type = _classify_device_type(
-        duty_cycle, peak_power, mean_on, cv_on, mean_event_duration, n_events, len(flat)
+    device_type = classify_device_type(
+        duty_cycle,
+        peak_power,
+        mean_on,
+        cv_on,
+        mean_event_duration,
+        n_events_adj,
+        total_samples,
     )
     expes_config["device_type"] = device_type
-    logging.info(f"Detected device type: {device_type} (duty={duty_cycle:.2%}, peak={peak_power:.0f}W)")
+    logging.info(
+        f"Detected device type: {device_type} (duty={duty_cycle:.2%}, peak={peak_power:.0f}W, "
+        f"mean_on={mean_on:.0f}W, mean_dur={mean_event_duration:.1f} steps, event_rate={event_rate:.2f}/1k)"
+    )
 
     if "loss_type" not in expes_config and str(getattr(expes_config, "name_model", "")).lower() == "nilmformer":
         expes_config["loss_type"] = "ga_eaec"
@@ -182,111 +232,17 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     # 2. 添加ON召回惩罚（lambda_on_recall），确保ON时有输出
     # 3. 设置合理的off_margin，允许小噪声
     
-    if device_type == "sparse_high_power":
-        # 稀疏高功率设备（如Kettle, Microwave）
-        # 特点：ON事件稀少但功率很高，需要强调ON事件检测
-        alpha_on = 6.0
-        alpha_off = 0.5
-        lambda_zero = 0.02
-        lambda_sparse = 0.02
-        lambda_off_hard = 0.02
-        lambda_on_recall = 1.2
-        on_recall_margin = 0.8
-        lambda_gate_cls = 0.1
-        lambda_energy = 0.05
-        off_margin = 0.02
-        
-    elif device_type == "frequent_switching":
-        # 频繁开关设备（如Fridge）
-        # 特点：ON/OFF各约50%，频繁切换
-        alpha_on = 2.0
-        alpha_off = 1.5
-        lambda_zero = 0.05         # 降低
-        lambda_sparse = 0.01
-        lambda_off_hard = 0.05     # 大幅降低！
-        lambda_on_recall = 0.4     # 中等ON召回
-        on_recall_margin = 0.5     # ON时至少输出50%
-        lambda_gate_cls = 0.1
-        lambda_energy = 0.2
-        off_margin = 0.02
-        
-    elif device_type == "long_cycle":
-        # 长周期运行设备（如WashingMachine, Dishwasher）
-        # 特点：运行周期长，功率变化大
-        alpha_on = 4.0
-        alpha_off = 1.5
-        lambda_zero = 0.1
-        lambda_sparse = 0.02
-        lambda_off_hard = 0.08
-        lambda_on_recall = 0.8
-        on_recall_margin = 0.6
-        lambda_gate_cls = 0.1
-        lambda_energy = 0.15
-        off_margin = 0.02
-        if duty_cycle < 0.05:
-            alpha_on = 6.0
-            alpha_off = 0.8
-            lambda_zero = 0.05
-            lambda_sparse = 0.02
-            lambda_off_hard = 0.03
-            lambda_on_recall = 1.0
-            on_recall_margin = 0.7
-            lambda_gate_cls = 0.15
-            lambda_energy = 0.08
-            off_margin = 0.03
-        
-    elif device_type == "always_on":
-        # 常开设备
-        alpha_on = 1.0
-        alpha_off = 2.0
-        lambda_zero = 0.02
-        lambda_sparse = 0.005
-        lambda_off_hard = 0.02
-        lambda_on_recall = 0.2
-        on_recall_margin = 0.3
-        lambda_gate_cls = 0.05
-        lambda_energy = 0.25
-        off_margin = 0.03
-        
-    elif device_type == "sparse_medium_power":
-        # 稀疏中等功率
-        alpha_on = 4.0
-        alpha_off = 0.8
-        lambda_zero = 0.1
-        lambda_sparse = 0.02
-        lambda_off_hard = 0.05
-        lambda_on_recall = 0.4
-        on_recall_margin = 0.5
-        lambda_gate_cls = 0.1
-        lambda_energy = 0.08
-        off_margin = 0.02
-        
-    else:
-        # 默认参数
-        lambda_on_recall = 0.3
-        on_recall_margin = 0.5
-        off_margin = 0.02
-        lambda_gate_cls = 0.1
-        if duty_cycle < 0.01:
-            alpha_on, alpha_off = 5.0, 0.5
-            lambda_zero, lambda_sparse = 0.1, 0.03
-            lambda_off_hard = 0.05
-            lambda_energy = 0.02
-        elif duty_cycle < 0.05:
-            alpha_on, alpha_off = 4.0, 0.8
-            lambda_zero, lambda_sparse = 0.08, 0.02
-            lambda_off_hard = 0.05
-            lambda_energy = 0.05
-        elif duty_cycle < 0.15:
-            alpha_on, alpha_off = 3.0, 1.0
-            lambda_zero, lambda_sparse = 0.05, 0.02
-            lambda_off_hard = 0.05
-            lambda_energy = 0.08
-        else:
-            alpha_on, alpha_off = 2.0, 1.2
-            lambda_zero, lambda_sparse = 0.03, 0.01
-            lambda_off_hard = 0.05
-            lambda_energy = 0.15
+    device_params = get_device_loss_params(device_type, duty_cycle)
+    alpha_on = device_params["alpha_on"]
+    alpha_off = device_params["alpha_off"]
+    lambda_zero = device_params["lambda_zero"]
+    lambda_sparse = device_params["lambda_sparse"]
+    lambda_off_hard = device_params["lambda_off_hard"]
+    lambda_on_recall = device_params["lambda_on_recall"]
+    on_recall_margin = device_params["on_recall_margin"]
+    lambda_gate_cls = device_params["lambda_gate_cls"]
+    lambda_energy = device_params["lambda_energy"]
+    off_margin = device_params["off_margin"]
     
     # ============== soft_temp 和 edge_eps ==============
     soft_temp_raw = max(0.25 * thr, 2.0 * noise_level, 1.0)
@@ -302,7 +258,8 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
         elif device_type == "always_on":
             off_base_watts = off_base_watts * 1.5
         off_margin_raw = float(off_base_watts)
-    except Exception:
+    except Exception as e:
+        logging.debug("_configure_nilm_loss_hyperparams: off_margin calculation failed: %s", e)
         off_margin_raw = 0.0
     
     # ============== energy_floor ==============
@@ -318,7 +275,8 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
             energy_floor_raw = max(0.1 * thr * power.shape[-1], 0.05 * base_floor)
         else:
             energy_floor_raw = thr * power.shape[-1] * 0.1
-    except Exception:
+    except Exception as e:
+        logging.debug("_configure_nilm_loss_hyperparams: energy_floor calculation failed: %s", e)
         energy_floor_raw = thr * power.shape[-1] * 0.1
     
     # ============== 写入配置 ==============
@@ -331,112 +289,114 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     if "loss_lambda_sparse" not in expes_config or expes_config.loss_lambda_sparse == 0.0:
         expes_config["loss_lambda_sparse"] = float(lambda_sparse)
 
-    expes_config["loss_alpha_on"] = float(alpha_on)
-    expes_config["loss_alpha_off"] = float(alpha_off)
-    expes_config["loss_lambda_grad"] = float(lambda_grad)
-    expes_config["loss_lambda_energy"] = float(lambda_energy)
-    expes_config["loss_soft_temp_raw"] = float(soft_temp_raw)
-    expes_config["loss_edge_eps_raw"] = float(edge_eps_raw)
-    expes_config["loss_energy_floor_raw"] = float(energy_floor_raw)
+    _set_cfg_value(expes_config, "loss_alpha_on", float(alpha_on))
+    _set_cfg_value(expes_config, "loss_alpha_off", float(alpha_off))
+    _set_cfg_value(expes_config, "loss_lambda_grad", float(lambda_grad))
+    _set_cfg_value(expes_config, "loss_lambda_energy", float(lambda_energy))
+    _set_cfg_value(expes_config, "loss_soft_temp_raw", float(soft_temp_raw))
+    _set_cfg_value(expes_config, "loss_edge_eps_raw", float(edge_eps_raw))
+    _set_cfg_value(expes_config, "loss_energy_floor_raw", float(energy_floor_raw))
     try:
         cutoff = float(getattr(expes_config, "cutoff", 0.0) or 0.0)
         if cutoff > 0:
-            expes_config["loss_soft_temp"] = float(soft_temp_raw) / cutoff
-            expes_config["loss_edge_eps"] = float(edge_eps_raw) / cutoff
-            expes_config["loss_energy_floor"] = float(energy_floor_raw) / cutoff
-    except Exception:
-        pass
+            _set_cfg_value(expes_config, "loss_soft_temp", float(soft_temp_raw) / cutoff)
+            _set_cfg_value(expes_config, "loss_edge_eps", float(edge_eps_raw) / cutoff)
+            _set_cfg_value(
+                expes_config, "loss_energy_floor", float(energy_floor_raw) / cutoff
+            )
+    except Exception as e:
+        logging.debug("_configure_nilm_loss_hyperparams: cutoff normalization failed: %s", e)
     
     # OFF假阳性惩罚（温和）
-    expes_config["loss_lambda_off_hard"] = float(lambda_off_hard)
-    expes_config["loss_off_margin_raw"] = float(off_margin_raw)
+    _set_cfg_value(
+        expes_config, "loss_lambda_off_hard", float(lambda_off_hard), default_value=0.1
+    )
+    _set_cfg_value(expes_config, "loss_off_margin_raw", float(off_margin_raw))
     try:
         cutoff = float(getattr(expes_config, "cutoff", 0.0) or 0.0)
         if cutoff > 0.0 and off_margin_raw > 0.0:
-            expes_config["loss_off_margin"] = float(off_margin_raw) / float(cutoff)
-            expes_config["loss_off_margin"] = float(
-                min(max(expes_config["loss_off_margin"], 0.005), 0.05)
+            off_margin_val = float(off_margin_raw) / float(cutoff)
+            off_margin_val = float(min(max(off_margin_val, 0.005), 0.05))
+            _set_cfg_value(
+                expes_config, "loss_off_margin", off_margin_val, default_value=0.02
             )
         else:
-            expes_config["loss_off_margin"] = float(off_margin)
-    except Exception:
-        expes_config["loss_off_margin"] = float(off_margin)
+            _set_cfg_value(
+                expes_config,
+                "loss_off_margin",
+                float(off_margin),
+                default_value=0.02,
+            )
+    except Exception as e:
+        logging.debug("_configure_nilm_loss_hyperparams: off_margin normalization failed: %s", e)
+        _set_cfg_value(expes_config, "loss_off_margin", float(off_margin), default_value=0.02)
+
     # ON漏检惩罚（防止全0输出）
-    expes_config["loss_lambda_on_recall"] = float(lambda_on_recall)
-    expes_config["loss_on_recall_margin"] = float(on_recall_margin)
+    _set_cfg_value(
+        expes_config,
+        "loss_lambda_on_recall",
+        float(lambda_on_recall),
+        default_value=0.3,
+    )
+    _set_cfg_value(
+        expes_config,
+        "loss_on_recall_margin",
+        float(on_recall_margin),
+        default_value=0.5,
+    )
     # 门控分类
-    expes_config["loss_lambda_gate_cls"] = float(lambda_gate_cls)
-    if "gate_soft_scale" not in expes_config:
-        if device_type == "sparse_high_power":
-            expes_config["gate_soft_scale"] = 0.5
-        else:
-            expes_config["gate_soft_scale"] = 1.0
-    if "gate_floor" not in expes_config:
-        if device_type == "sparse_high_power":
-            expes_config["gate_floor"] = 0.4
-        else:
-            expes_config["gate_floor"] = 0.1
-    if "gate_duty_weight" not in expes_config:
-        if device_type in ["frequent_switching", "sparse_high_power", "sparse_medium_power"]:
-            expes_config["gate_duty_weight"] = 0.02
-        else:
-            expes_config["gate_duty_weight"] = 0.0
+    _set_cfg_value(
+        expes_config,
+        "loss_lambda_gate_cls",
+        float(lambda_gate_cls),
+        default_value=0.1,
+    )
+    apply_device_type_config_defaults(
+        expes_config,
+        device_type,
+        duty_cycle,
+        mean_on,
+        threshold,
+        mean_event_duration,
+        off_margin_raw,
+        off_margin,
+    )
 
-    if "postprocess_threshold" not in expes_config:
-        expes_config["postprocess_threshold"] = float(threshold)
-
-    default_post_min_on = 3
-    current_post_min_on = int(getattr(expes_config, "postprocess_min_on_steps", default_post_min_on))
-    if ("postprocess_min_on_steps" not in expes_config) or (current_post_min_on == default_post_min_on):
-        if device_type == "sparse_high_power":
-            expes_config["postprocess_min_on_steps"] = 1
-        elif device_type == "frequent_switching":
-            expes_config["postprocess_min_on_steps"] = 3
-        elif device_type == "long_cycle":
-            expes_config["postprocess_min_on_steps"] = 5
-        else:
-            expes_config["postprocess_min_on_steps"] = 2
-
-    default_zero_penalty_weight = 0.1
-    current_zero_penalty_weight = float(getattr(expes_config, "state_zero_penalty_weight", default_zero_penalty_weight))
-    if ("state_zero_penalty_weight" not in expes_config) or (abs(current_zero_penalty_weight - default_zero_penalty_weight) < 1e-12):
-        if device_type == "sparse_high_power":
-            expes_config["state_zero_penalty_weight"] = 0.02
-        elif device_type == "frequent_switching":
-            expes_config["state_zero_penalty_weight"] = 0.08
-        elif device_type == "long_cycle":
-            expes_config["state_zero_penalty_weight"] = 0.1
-        else:
-            expes_config["state_zero_penalty_weight"] = 0.05
-
-    default_zero_kernel = 48
-    current_zero_kernel = int(getattr(expes_config, "state_zero_kernel", default_zero_kernel))
-    if ("state_zero_kernel" not in expes_config) or (current_zero_kernel == default_zero_kernel):
-        if device_type == "sparse_high_power":
-            expes_config["state_zero_kernel"] = 6
-        elif device_type == "frequent_switching":
-            expes_config["state_zero_kernel"] = 24
-        elif device_type == "long_cycle":
-            expes_config["state_zero_kernel"] = 48
-        else:
-            expes_config["state_zero_kernel"] = 16
-
-    default_zero_ratio = 0.9
-    current_zero_ratio = float(getattr(expes_config, "state_zero_ratio", default_zero_ratio))
-    if ("state_zero_ratio" not in expes_config) or (abs(current_zero_ratio - default_zero_ratio) < 1e-12):
-        expes_config["state_zero_ratio"] = 0.9
-
-    default_off_high_agg_weight = 0.3
-    current_off_high_agg_weight = float(getattr(expes_config, "off_high_agg_penalty_weight", default_off_high_agg_weight))
-    if ("off_high_agg_penalty_weight" not in expes_config) or (abs(current_off_high_agg_weight - default_off_high_agg_weight) < 1e-12):
-        if device_type == "sparse_high_power":
-            expes_config["off_high_agg_penalty_weight"] = 0.0
-        elif device_type == "frequent_switching":
-            expes_config["off_high_agg_penalty_weight"] = 0.01
-        elif device_type == "long_cycle":
-            expes_config["off_high_agg_penalty_weight"] = 0.0 if duty_cycle < 0.05 else 0.01
-        else:
-            expes_config["off_high_agg_penalty_weight"] = 0.01
+    try:
+        tuned_keys = [
+            "device_type",
+            "loss_alpha_on",
+            "loss_alpha_off",
+            "loss_lambda_zero",
+            "loss_lambda_sparse",
+            "loss_lambda_grad",
+            "loss_lambda_energy",
+            "loss_lambda_off_hard",
+            "loss_off_margin",
+            "loss_lambda_on_recall",
+            "loss_on_recall_margin",
+            "loss_lambda_gate_cls",
+            "gate_soft_scale",
+            "gate_floor",
+            "gate_duty_weight",
+            "state_zero_penalty_weight",
+            "state_zero_kernel",
+            "off_high_agg_penalty_weight",
+            "off_state_penalty_weight",
+            "off_state_margin",
+            "off_state_long_penalty_weight",
+            "off_state_long_kernel",
+            "off_state_long_margin",
+            "postprocess_min_on_steps",
+        ]
+        parts = []
+        for k in tuned_keys:
+            if hasattr(expes_config, k):
+                parts.append(f"{k}={getattr(expes_config, k)}")
+        if parts:
+            logging.info("AUTO_CFG: " + ";".join(parts))
+    except Exception as e:
+        logging.debug("_configure_nilm_loss_hyperparams: logging AUTO_CFG failed: %s", e)
 
 
 def get_cache_path(expes_config: OmegaConf):
@@ -483,25 +443,7 @@ def launch_one_experiment(expes_config: OmegaConf):
         scaler = cache["scaler"]
         expes_config.cutoff = cache["cutoff"]
         expes_config.threshold = cache["threshold"]
-        try:
-            if expes_config.cutoff and float(expes_config.cutoff) > 0:
-                expes_config["loss_threshold"] = float(expes_config.threshold) / float(
-                    expes_config.cutoff
-                )
-                if "loss_soft_temp_raw" in expes_config:
-                    expes_config["loss_soft_temp"] = float(
-                        expes_config.loss_soft_temp_raw
-                    ) / float(expes_config.cutoff)
-                if "loss_edge_eps_raw" in expes_config:
-                    expes_config["loss_edge_eps"] = float(
-                        expes_config.loss_edge_eps_raw
-                    ) / float(expes_config.cutoff)
-                if "loss_energy_floor_raw" in expes_config:
-                    expes_config["loss_energy_floor"] = float(
-                        expes_config.loss_energy_floor_raw
-                    ) / float(expes_config.cutoff)
-        except Exception:
-            pass
+        _apply_cutoff_to_loss_params(expes_config)
         try:
             if isinstance(tuple_data, tuple) and len(tuple_data) >= 4:
                 data_for_stats = tuple_data[3]
@@ -615,29 +557,7 @@ def launch_one_experiment(expes_config: OmegaConf):
     data = scaler.fit_transform(data)
 
     expes_config.cutoff = float(scaler.appliance_stat2[0])
-    if expes_config.cutoff and expes_config.cutoff > 0:
-        expes_config["loss_threshold"] = float(expes_config.threshold) / float(
-            expes_config.cutoff
-        )
-        if "loss_soft_temp_raw" in expes_config:
-            expes_config["loss_soft_temp"] = float(expes_config.loss_soft_temp_raw) / float(
-                expes_config.cutoff
-            )
-        if "loss_edge_eps_raw" in expes_config:
-            expes_config["loss_edge_eps"] = float(expes_config.loss_edge_eps_raw) / float(
-                expes_config.cutoff
-            )
-        if "loss_energy_floor_raw" in expes_config:
-            expes_config["loss_energy_floor"] = float(
-                expes_config.loss_energy_floor_raw
-            ) / float(expes_config.cutoff)
-        if "loss_off_margin_raw" in expes_config:
-            raw = float(getattr(expes_config, "loss_off_margin_raw", 0.0) or 0.0)
-            if raw > 0.0:
-                expes_config["loss_off_margin"] = float(raw) / float(expes_config.cutoff)
-                expes_config["loss_off_margin"] = float(
-                    min(max(expes_config["loss_off_margin"], 0.005), 0.05)
-                )
+    _apply_cutoff_to_loss_params(expes_config)
 
     if expes_config.name_model in ["ConvNet", "ResNet", "Inception"]:
         X, y = nilmdataset_to_tser(data)

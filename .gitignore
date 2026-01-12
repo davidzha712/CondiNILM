@@ -9,6 +9,15 @@ wheels/
 # Virtual environments
 .venv
 
+# Local IDE/agent settings
+.claude/
+
+# OS junk
+.DS_Store
+
+# Windows-reserved path that breaks Git on Windows
+nul
+
 # Data and results folder
 example/
 *.ipynb
