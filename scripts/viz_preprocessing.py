@@ -266,9 +266,11 @@ def run_preprocessing_tab():
     
     sample = dataset[win_idx]
     
-    # NILMDataset returns a tuple: (Input, Target Power, Target State)
     if isinstance(sample, tuple):
-        model_input, target_power, target_state = sample
+        if len(sample) == 3:
+            model_input, target_power, target_state = sample
+        else:
+            model_input, target_power, target_state, _ = sample
         st.write(f"Dataset Output Shapes:")
         st.write(f"- Model Input: `{model_input.shape}`")
         st.write(f"- Target Power: `{target_power.shape}`")

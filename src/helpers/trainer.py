@@ -388,7 +388,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
 
     def forward(self, ts_agg):
         if isinstance(self.criterion, GAEAECLoss) and hasattr(self.model, "forward_with_gate"):
-            power, gate = self.model.forward_with_gate(ts_agg)
+            power, gate, _ = self.model.forward_with_gate(ts_agg)
             pred, _gate_prob = self._apply_soft_gate(power, gate)
             return pred
         return self.model(ts_agg)
@@ -420,10 +420,20 @@ class SeqToSeqLightningModule(pl.LightningModule):
             return logits.new_tensor(0.0)
         logits = logits.float()
         state = state.float()
-        window_label = (state.sum(dim=-1, keepdim=True) > 0.5).float()
-        pooled = logits.mean(dim=-1, keepdim=True)
-        pooled = pooled.view(pooled.size(0), -1)
+        if state.ndim == 3:
+            state_any = (state.sum(dim=1, keepdim=False) > 0.5).float()
+        else:
+            state_any = state
+        window_label = (state_any.sum(dim=-1, keepdim=True) > 0.5).float()
+        pooled = logits.mean(dim=-1)
+        if pooled.dim() == 3:
+            pooled = pooled.view(pooled.size(0), -1)
         window_label = window_label.view(window_label.size(0), -1)
+        if pooled.dim() == 2 and window_label.dim() == 2 and pooled.size(1) != window_label.size(1):
+            if window_label.size(1) == 1:
+                window_label = window_label.expand(-1, pooled.size(1))
+            else:
+                window_label = window_label[:, : pooled.size(1)]
         return F.binary_cross_entropy_with_logits(pooled, window_label)
 
     def _zero_run_penalty(self, pred, target):
@@ -605,14 +615,18 @@ class SeqToSeqLightningModule(pl.LightningModule):
         return penalties
 
     def training_step(self, batch, batch_idx):
-        ts_agg, appl, state = batch
+        if isinstance(batch, (list, tuple)) and len(batch) == 4:
+            ts_agg, appl, state, window_label = batch
+        else:
+            ts_agg, appl, state = batch
+            window_label = None
         ts_agg = torch.nan_to_num(ts_agg.float(), nan=0.0, posinf=0.0, neginf=0.0)
         target = torch.nan_to_num(appl.float(), nan=0.0, posinf=0.0, neginf=0.0)
         state = torch.nan_to_num(state.float(), nan=0.0, posinf=0.0, neginf=0.0)
         if isinstance(self.criterion, GAEAECLoss) and hasattr(
             self.model, "forward_with_gate"
         ):
-            power, gate = self.model.forward_with_gate(ts_agg)
+            power, gate, cls_logits = self.model.forward_with_gate(ts_agg)
             power = torch.nan_to_num(power, nan=0.0, posinf=1e4, neginf=-1e4)
             gate = torch.nan_to_num(gate, nan=0.0, posinf=1e4, neginf=-1e4)
             pred, gate_prob = self._apply_soft_gate(power, gate)
@@ -633,10 +647,23 @@ class SeqToSeqLightningModule(pl.LightningModule):
             gate_cls_loss = pred.new_tensor(0.0)
             gate_window_loss = pred.new_tensor(0.0)
             gate_duty_loss = pred.new_tensor(0.0)
+            cls_logits = None
+        if window_label is not None and cls_logits is not None:
+            window_label = torch.nan_to_num(window_label.float(), nan=0.0, posinf=0.0, neginf=0.0)
+            try:
+                cls_loss = F.binary_cross_entropy_with_logits(
+                    cls_logits.view(window_label.shape[0], -1),
+                    window_label.view(window_label.shape[0], -1),
+                )
+            except Exception:
+                cls_loss = pred.new_tensor(0.0)
+        else:
+            cls_loss = pred.new_tensor(0.0)
         loss_main = torch.nan_to_num(loss_main, nan=0.0, posinf=1e4, neginf=-1e4)
         penalties = self._compute_all_penalties(pred, target, state, ts_agg)
         loss = (
             loss_main
+            + cls_loss
             + penalties["zero_run"]
             + penalties["off_high_agg"]
             + penalties["off_state_long"]
@@ -651,7 +678,11 @@ class SeqToSeqLightningModule(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        ts_agg, appl, _ = batch
+        if isinstance(batch, (list, tuple)) and len(batch) >= 4:
+            ts_agg, appl, state, window_label = batch
+        else:
+            ts_agg, appl, _ = batch
+            window_label = None
         ts_agg = torch.nan_to_num(ts_agg.float(), nan=0.0, posinf=0.0, neginf=0.0)
         target = torch.nan_to_num(appl.float(), nan=0.0, posinf=0.0, neginf=0.0)
         state = None
@@ -660,10 +691,11 @@ class SeqToSeqLightningModule(pl.LightningModule):
                 state = torch.nan_to_num(batch[2].float(), nan=0.0, posinf=0.0, neginf=0.0)
         except Exception:
             state = None
+        cls_logits = None
         if isinstance(self.criterion, GAEAECLoss) and hasattr(
             self.model, "forward_with_gate"
         ):
-            power, gate = self.model.forward_with_gate(ts_agg)
+            power, gate, cls_logits = self.model.forward_with_gate(ts_agg)
             power = torch.nan_to_num(power, nan=0.0, posinf=1e4, neginf=-1e4)
             gate = torch.nan_to_num(gate, nan=0.0, posinf=1e4, neginf=-1e4)
             pred, _gate_prob = self._apply_soft_gate(power, gate)
@@ -673,10 +705,22 @@ class SeqToSeqLightningModule(pl.LightningModule):
             pred = self(ts_agg)
             pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
             loss_main = self.criterion(pred, target)
+        if window_label is not None and cls_logits is not None:
+            window_label = torch.nan_to_num(window_label.float(), nan=0.0, posinf=0.0, neginf=0.0)
+            try:
+                cls_loss = F.binary_cross_entropy_with_logits(
+                    cls_logits.view(window_label.shape[0], -1),
+                    window_label.view(window_label.shape[0], -1),
+                )
+            except Exception:
+                cls_loss = pred.new_tensor(0.0)
+        else:
+            cls_loss = pred.new_tensor(0.0)
         loss_main = torch.nan_to_num(loss_main, nan=0.0, posinf=1e4, neginf=-1e4)
         penalties = self._compute_all_penalties(pred, target, state, ts_agg)
         loss = (
             loss_main
+            + cls_loss
             + penalties["zero_run"]
             + penalties["off_high_agg"]
             + penalties["off_state_long"]

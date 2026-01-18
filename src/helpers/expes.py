@@ -119,7 +119,10 @@ def get_model_instance(name_model, c_in, window_size, **kwargs):
     elif name_model == "Inception":
         inst = Inception(in_channels=1, nb_class=1, **kwargs)
     elif name_model == "NILMFormer":
-        inst = NILMFormer(NILMFormerConfig(c_in=1, c_embedding=c_in - 1, **kwargs))
+        cfg = kwargs.copy()
+        c_out = int(cfg.get("c_out", 1))
+        cfg["c_out"] = c_out
+        inst = NILMFormer(NILMFormerConfig(c_in=1, c_embedding=c_in - 1, **cfg))
     else:
         raise ValueError("Model name {} unknown".format(name_model))
 
@@ -160,7 +163,14 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
     sample_idx = 0
     timestamps_set = set()
     with torch.no_grad():
-        for ts_agg, appl, _ in valid_loader:
+        for batch in valid_loader:
+            if isinstance(batch, (list, tuple)):
+                if len(batch) >= 2:
+                    ts_agg, appl = batch[0], batch[1]
+                else:
+                    continue
+            else:
+                continue
             model.eval()
             ts_agg_t = ts_agg.float().to(device)
             appl_t = appl.float().to(device)
@@ -308,27 +318,30 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
         target_all = []
     if not isinstance(appliance_names, list):
         appliance_names = []
-    if appliance_name is not None:
-        existing_indices = [
-            i for i, name in enumerate(appliance_names) if name == appliance_name
-        ]
+    group_members = getattr(expes_config, "appliance_group_members", None)
+    display_names = []
+    if isinstance(group_members, (list, tuple)) and len(group_members) == n_app:
+        display_names = [str(x) for x in group_members]
+    elif isinstance(appliance_name, str) and n_app == 1:
+        display_names = [appliance_name]
     else:
-        existing_indices = []
-    if existing_indices:
-        start_idx = existing_indices[0]
-        required_len = start_idx + n_app
-        if len(target_all) < required_len:
-            target_all.extend([[] for _ in range(required_len - len(target_all))])
-        for j in range(n_app):
-            target_all[start_idx + j] = target_concat[j]
-    else:
-        start_idx = len(target_all)
-        for j in range(n_app):
-            target_all.append(target_concat[j])
-            if appliance_name is not None:
-                appliance_names.append(appliance_name)
+        display_names = [str(j) for j in range(n_app)]
+    name_to_index = {str(name): idx for idx, name in enumerate(appliance_names)}
+    for j in range(n_app):
+        name_j = display_names[j]
+        key_j = str(name_j)
+        if key_j in name_to_index:
+            idx = name_to_index[key_j]
+            if idx < len(target_all):
+                target_all[idx] = target_concat[j]
             else:
-                appliance_names.append(str(start_idx + j))
+                target_all.append(target_concat[j])
+                appliance_names.append(name_j)
+                name_to_index[key_j] = len(target_all) - 1
+        else:
+            target_all.append(target_concat[j])
+            appliance_names.append(name_j)
+            name_to_index[key_j] = len(target_all) - 1
     payload["target"] = target_all
     if appliance_names:
         payload["appliance_names"] = appliance_names
@@ -567,17 +580,26 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
         }}
       }}
       let layout;
+      const baseLayout = {{
+        margin: {{t: 60, r: 20, b: 40, l: 60}},
+        legend: {{
+          orientation: 'h',
+          x: 0.5,
+          xanchor: 'center',
+          y: 1.1
+        }}
+      }};
       if (currentLayout && currentLayout.xaxis && currentLayout.yaxis) {{
         layout = {{
-          xaxis: {{range: currentLayout.xaxis.range}},
-          yaxis: {{range: currentLayout.yaxis.range}},
-          margin: {{t: 40}}
+          xaxis: {{range: currentLayout.xaxis.range, title: 'Time index'}},
+          yaxis: {{range: currentLayout.yaxis.range, title: 'Power'}},
+          ...baseLayout
         }};
       }} else {{
         layout = {{
           xaxis: {{title: 'Time index'}},
           yaxis: {{title: 'Power'}},
-          margin: {{t: 40}}
+          ...baseLayout
         }};
       }}
       Plotly.newPlot('plot', data, layout).then(function(gd) {{
@@ -656,6 +678,7 @@ class ValidationNILMMetricCallback(pl.Callback):
         y_win = np.array([])
         y_hat_win = np.array([])
         y_state = np.array([])
+        per_device_data = None
         stats = {
             "pred_scaled_sum": 0.0,
             "pred_scaled_sumsq": 0.0,
@@ -699,7 +722,17 @@ class ValidationNILMMetricCallback(pl.Callback):
             "off_long_run_total_len": 0,
         }
         with torch.no_grad():
-            for ts_agg, appl, state in self.valid_loader:
+            for batch in self.valid_loader:
+                if isinstance(batch, (list, tuple)):
+                    if len(batch) >= 3:
+                        ts_agg, appl, state = batch[0], batch[1], batch[2]
+                    elif len(batch) == 2:
+                        ts_agg, appl = batch
+                        state = None
+                    else:
+                        continue
+                else:
+                    continue
                 pl_module.eval()
                 ts_agg_t = ts_agg.float().to(device)
                 target = appl.float().to(device)
@@ -897,38 +930,60 @@ class ValidationNILMMetricCallback(pl.Callback):
 
                 target_win = target_inv.sum(dim=-1)
                 pred_win = pred_inv.sum(dim=-1)
-                target_flat = torch.flatten(target_inv).detach().cpu().numpy()
-                pred_flat = torch.flatten(pred_inv).detach().cpu().numpy()
-                target_win_flat = (
-                    torch.flatten(target_win).detach().cpu().numpy()
-                )
-                pred_win_flat = torch.flatten(pred_win).detach().cpu().numpy()
-                state_flat = state.flatten().detach().cpu().numpy()
-                y = (
-                    np.concatenate((y, target_flat))
-                    if y.size
-                    else target_flat
-                )
-                y_hat = (
-                    np.concatenate((y_hat, pred_flat))
-                    if y_hat.size
-                    else pred_flat
-                )
-                y_win = (
-                    np.concatenate((y_win, target_win_flat))
-                    if y_win.size
-                    else target_win_flat
-                )
-                y_hat_win = (
-                    np.concatenate((y_hat_win, pred_win_flat))
-                    if y_hat_win.size
-                    else pred_win_flat
-                )
-                y_state = (
-                    np.concatenate((y_state, state_flat))
-                    if y_state.size
-                    else state_flat
-                )
+                target_np_all = target_inv.detach().cpu().numpy()
+                pred_np_all = pred_inv.detach().cpu().numpy()
+                target_win_np_all = target_win.detach().cpu().numpy()
+                pred_win_np_all = pred_win.detach().cpu().numpy()
+                target_flat = target_np_all.reshape(-1)
+                pred_flat = pred_np_all.reshape(-1)
+                target_win_flat = target_win_np_all.reshape(-1)
+                pred_win_flat = pred_win_np_all.reshape(-1)
+                state_np_all = None
+                state_flat = np.array([])
+                if state is not None:
+                    state_np_all = state.detach().cpu().numpy()
+                    state_flat = state_np_all.reshape(-1)
+                y = np.concatenate((y, target_flat)) if y.size else target_flat
+                y_hat = np.concatenate((y_hat, pred_flat)) if y_hat.size else pred_flat
+                y_win = np.concatenate((y_win, target_win_flat)) if y_win.size else target_win_flat
+                y_hat_win = np.concatenate((y_hat_win, pred_win_flat)) if y_hat_win.size else pred_win_flat
+                y_state = np.concatenate((y_state, state_flat)) if y_state.size else state_flat
+                if state_np_all is not None and target_np_all.ndim == 3:
+                    if per_device_data is None:
+                        n_app = target_np_all.shape[1]
+                        per_device_data = {
+                            "y": [np.array([]) for _ in range(n_app)],
+                            "y_hat": [np.array([]) for _ in range(n_app)],
+                            "y_win": [np.array([]) for _ in range(n_app)],
+                            "y_hat_win": [np.array([]) for _ in range(n_app)],
+                            "y_state": [np.array([]) for _ in range(n_app)],
+                        }
+                    n_app = target_np_all.shape[1]
+                    for j in range(n_app):
+                        y_j = target_np_all[:, j, :].reshape(-1)
+                        y_hat_j = pred_np_all[:, j, :].reshape(-1)
+                        y_win_j = target_win_np_all[:, j].reshape(-1)
+                        y_hat_win_j = pred_win_np_all[:, j].reshape(-1)
+                        y_state_j = state_np_all[:, j, :].reshape(-1)
+                        if y_j.size:
+                            arr = per_device_data["y"][j]
+                            per_device_data["y"][j] = np.concatenate((arr, y_j)) if arr.size else y_j
+                        if y_hat_j.size:
+                            arr = per_device_data["y_hat"][j]
+                            per_device_data["y_hat"][j] = np.concatenate((arr, y_hat_j)) if arr.size else y_hat_j
+                        if y_win_j.size:
+                            arr = per_device_data["y_win"][j]
+                            per_device_data["y_win"][j] = np.concatenate((arr, y_win_j)) if arr.size else y_win_j
+                        if y_hat_win_j.size:
+                            arr = per_device_data["y_hat_win"][j]
+                            per_device_data["y_hat_win"][j] = (
+                                np.concatenate((arr, y_hat_win_j)) if arr.size else y_hat_win_j
+                            )
+                        if y_state_j.size:
+                            arr = per_device_data["y_state"][j]
+                            per_device_data["y_state"][j] = (
+                                np.concatenate((arr, y_state_j)) if arr.size else y_state_j
+                            )
         if not y.size:
             return
         y_hat_state = (
@@ -943,6 +998,31 @@ class ValidationNILMMetricCallback(pl.Callback):
             y_hat_state=y_hat_state,
         )
         metrics_win = self.metrics(y=y_win, y_hat=y_hat_win)
+        metrics_timestamp_per_device = {}
+        metrics_win_per_device = {}
+        if per_device_data is not None:
+            n_app = len(per_device_data["y"])
+            for j in range(n_app):
+                y_j = per_device_data["y"][j]
+                y_hat_j = per_device_data["y_hat"][j]
+                if y_j.size and y_hat_j.size:
+                    y_state_j = per_device_data["y_state"][j]
+                    y_hat_state_j = (
+                        (y_hat_j > threshold_postprocess).astype(int) if y_state_j.size else None
+                    )
+                    metrics_timestamp_per_device[str(j)] = self.metrics(
+                        y=y_j,
+                        y_hat=y_hat_j,
+                        y_state=y_state_j if y_state_j.size else None,
+                        y_hat_state=y_hat_state_j,
+                    )
+                y_win_j = per_device_data["y_win"][j]
+                y_hat_win_j = per_device_data["y_hat_win"][j]
+                if y_win_j.size and y_hat_win_j.size:
+                    metrics_win_per_device[str(j)] = self.metrics(
+                        y=y_win_j,
+                        y_hat=y_hat_win_j,
+                    )
 
         target_sum = float(stats["target_sum"])
         pred_post_sum = float(stats["pred_post_sum"])
@@ -1016,6 +1096,8 @@ class ValidationNILMMetricCallback(pl.Callback):
             "loss_threshold": float(getattr(self.expes_config, "loss_threshold", threshold_small_values)),
             "metrics_timestamp": metrics_timestamp,
             "metrics_win": metrics_win,
+            "metrics_timestamp_per_device": metrics_timestamp_per_device,
+            "metrics_win_per_device": metrics_win_per_device,
             "pred_scaled_max": float(stats["pred_scaled_max"]),
             "pred_raw_max": float(stats["pred_raw_max"]),
             "pred_post_max": float(stats["pred_post_max"]),
@@ -1069,6 +1151,20 @@ class ValidationNILMMetricCallback(pl.Callback):
             writer.add_scalar("valid_timestamp/" + name, float(value), epoch_idx)
         for name, value in metrics_win.items():
             writer.add_scalar("valid_win/" + name, float(value), epoch_idx)
+        for idx, mdict in metrics_timestamp_per_device.items():
+            for name, value in mdict.items():
+                writer.add_scalar(
+                    "valid_timestamp/" + name + "_app" + str(idx),
+                    float(value),
+                    epoch_idx,
+                )
+        for idx, mdict in metrics_win_per_device.items():
+            for name, value in mdict.items():
+                writer.add_scalar(
+                    "valid_win/" + name + "_app" + str(idx),
+                    float(value),
+                    epoch_idx,
+                )
 
 
 def suppress_short_activations(pred_inv, threshold_small_values, min_on_steps):
@@ -1204,6 +1300,7 @@ def evaluate_nilm_split(
     y_win = np.array([])
     y_hat_win = np.array([])
     y_state = np.array([])
+    per_device_data = None
     threshold_postprocess = float(threshold_small_values)
     off_run_min_len = int(max(int(min_on_duration_steps or 0), 0))
     postprocess_use_gate = True
@@ -1242,7 +1339,16 @@ def evaluate_nilm_split(
         except TypeError:
             total = None
         iterator = tqdm(iterator, total=total, desc=mask, leave=False)
-        for ts_agg, appl, state in iterator:
+        for batch in iterator:
+            if not isinstance(batch, (list, tuple)):
+                continue
+            if len(batch) >= 3:
+                ts_agg, appl, state = batch[0], batch[1], batch[2]
+            elif len(batch) == 2:
+                ts_agg, appl = batch
+                state = None
+            else:
+                continue
             model.eval()
             ts_agg_t = ts_agg.float().to(device)
             target = appl.float().to(device)
@@ -1306,11 +1412,19 @@ def evaluate_nilm_split(
                     pass
             target_win = target_inv.sum(dim=-1)
             pred_win = pred_inv.sum(dim=-1)
-            target_flat = torch.flatten(target_inv).detach().cpu().numpy()
-            pred_flat = torch.flatten(pred_inv).detach().cpu().numpy()
-            target_win_flat = torch.flatten(target_win).detach().cpu().numpy()
-            pred_win_flat = torch.flatten(pred_win).detach().cpu().numpy()
-            state_flat = state.flatten().detach().cpu().numpy()
+            target_np_all = target_inv.detach().cpu().numpy()
+            pred_np_all = pred_inv.detach().cpu().numpy()
+            target_win_np_all = target_win.detach().cpu().numpy()
+            pred_win_np_all = pred_win.detach().cpu().numpy()
+            target_flat = target_np_all.reshape(-1)
+            pred_flat = pred_np_all.reshape(-1)
+            target_win_flat = target_win_np_all.reshape(-1)
+            pred_win_flat = pred_win_np_all.reshape(-1)
+            state_np_all = None
+            state_flat = np.array([])
+            if state is not None:
+                state_np_all = state.detach().cpu().numpy()
+                state_flat = state_np_all.reshape(-1)
             y = np.concatenate((y, target_flat)) if y.size else target_flat
             y_hat = np.concatenate((y_hat, pred_flat)) if y_hat.size else pred_flat
             y_win = (
@@ -1323,9 +1437,43 @@ def evaluate_nilm_split(
                 if y_hat_win.size
                 else pred_win_flat
             )
-            y_state = (
-                np.concatenate((y_state, state_flat)) if y_state.size else state_flat
-            )
+            y_state = np.concatenate((y_state, state_flat)) if y_state.size else state_flat
+            if state_np_all is not None and target_np_all.ndim == 3:
+                if per_device_data is None:
+                    n_app = target_np_all.shape[1]
+                    per_device_data = {
+                        "y": [np.array([]) for _ in range(n_app)],
+                        "y_hat": [np.array([]) for _ in range(n_app)],
+                        "y_win": [np.array([]) for _ in range(n_app)],
+                        "y_hat_win": [np.array([]) for _ in range(n_app)],
+                        "y_state": [np.array([]) for _ in range(n_app)],
+                    }
+                n_app = target_np_all.shape[1]
+                for j in range(n_app):
+                    y_j = target_np_all[:, j, :].reshape(-1)
+                    y_hat_j = pred_np_all[:, j, :].reshape(-1)
+                    y_win_j = target_win_np_all[:, j].reshape(-1)
+                    y_hat_win_j = pred_win_np_all[:, j].reshape(-1)
+                    y_state_j = state_np_all[:, j, :].reshape(-1)
+                    if y_j.size:
+                        arr = per_device_data["y"][j]
+                        per_device_data["y"][j] = np.concatenate((arr, y_j)) if arr.size else y_j
+                    if y_hat_j.size:
+                        arr = per_device_data["y_hat"][j]
+                        per_device_data["y_hat"][j] = np.concatenate((arr, y_hat_j)) if arr.size else y_hat_j
+                    if y_win_j.size:
+                        arr = per_device_data["y_win"][j]
+                        per_device_data["y_win"][j] = np.concatenate((arr, y_win_j)) if arr.size else y_win_j
+                    if y_hat_win_j.size:
+                        arr = per_device_data["y_hat_win"][j]
+                        per_device_data["y_hat_win"][j] = (
+                            np.concatenate((arr, y_hat_win_j)) if arr.size else y_hat_win_j
+                        )
+                    if y_state_j.size:
+                        arr = per_device_data["y_state"][j]
+                        per_device_data["y_state"][j] = (
+                            np.concatenate((arr, y_state_j)) if arr.size else y_state_j
+                        )
     if not y.size:
         return {}, {}
     y_hat_state = (
@@ -1338,8 +1486,37 @@ def evaluate_nilm_split(
         y_hat_state=y_hat_state,
     )
     metrics_win = metrics_helper(y=y_win, y_hat=y_hat_win)
+    metrics_timestamp_per_device = {}
+    metrics_win_per_device = {}
+    if per_device_data is not None:
+        n_app = len(per_device_data["y"])
+        for j in range(n_app):
+            y_j = per_device_data["y"][j]
+            y_hat_j = per_device_data["y_hat"][j]
+            if y_j.size and y_hat_j.size:
+                y_state_j = per_device_data["y_state"][j]
+                y_hat_state_j = (
+                    (y_hat_j > threshold_postprocess).astype(int) if y_state_j.size else None
+                )
+                metrics_timestamp_per_device[str(j)] = metrics_helper(
+                    y=y_j,
+                    y_hat=y_hat_j,
+                    y_state=y_state_j if y_state_j.size else None,
+                    y_hat_state=y_hat_state_j,
+                )
+            y_win_j = per_device_data["y_win"][j]
+            y_hat_win_j = per_device_data["y_hat_win"][j]
+            if y_win_j.size and y_hat_win_j.size:
+                metrics_win_per_device[str(j)] = metrics_helper(
+                    y=y_win_j,
+                    y_hat=y_hat_win_j,
+                )
     log_dict[mask + "_timestamp"] = metrics_timestamp
     log_dict[mask + "_win"] = metrics_win
+    if metrics_timestamp_per_device:
+        log_dict[mask + "_timestamp_per_device"] = metrics_timestamp_per_device
+    if metrics_win_per_device:
+        log_dict[mask + "_win_per_device"] = metrics_win_per_device
     if save_outputs:
         log_dict[mask + "_yhat"] = y_hat
         if y_hat_win.size:
@@ -2192,6 +2369,23 @@ def launch_models_training(data_tuple, scaler, expes_config):
 
     if "threshold" in expes_config.model_kwargs:
         expes_config.model_kwargs.threshold = expes_config.threshold
+
+    if expes_config.name_model == "NILMFormer" and scaler is not None:
+        try:
+            n_app = int(getattr(scaler, "n_appliance", 1) or 1)
+        except Exception:
+            n_app = 1
+        if n_app < 1:
+            n_app = 1
+        try:
+            expes_config.model_kwargs["c_out"] = n_app
+        except Exception:
+            try:
+                tmp_kwargs = dict(expes_config.model_kwargs)
+                tmp_kwargs["c_out"] = n_app
+                expes_config.model_kwargs = tmp_kwargs
+            except Exception:
+                pass
 
     model_instance = get_model_instance(
         name_model=expes_config.name_model,

@@ -60,22 +60,27 @@ class NILMFormer(nn.Module):
         layers.append(nn.LayerNorm(d_model))
         self.EncoderBlock = nn.Sequential(*layers)
 
-        # ============ Downstream Task Head ============#
-        self.DownstreamTaskHead = nn.Conv1d(
+        self.SharedHead = nn.Conv1d(
             in_channels=d_model,
-            out_channels=c_out,
+            out_channels=d_model,
             kernel_size=kernel_size_head,
             padding=kernel_size_head // 2,
             padding_mode="replicate",
         )
 
+        self.PowerHead = nn.Conv1d(
+            in_channels=d_model,
+            out_channels=c_out,
+            kernel_size=1,
+        )
+
         self.GateHead = nn.Conv1d(
             in_channels=d_model,
-            out_channels=1,
-            kernel_size=kernel_size_head,
-            padding=kernel_size_head // 2,
-            padding_mode="replicate",
+            out_channels=c_out,
+            kernel_size=1,
         )
+
+        self.WindowClsHead = nn.Linear(d_model, c_out)
 
         self.output_stats_alpha = 0.0
         self.output_stats_mean_max = 0.0
@@ -158,11 +163,9 @@ class NILMFormer(nn.Module):
         stats_feat = x_full[:, -1:, :]
         x = x_full[:, :-1, :]  # (B, L, d_model)
 
-        # === Conv Head === #
-        x = x.permute(0, 2, 1)  # (B, d_model, L)
-        power_raw = self.DownstreamTaskHead(x)  # (B, c_out, L)
-        # Clamp before softplus for numerical stability (softplus(-10) ≈ 4.5e-5)
-        # Note: softplus always returns non-negative values, so output is >= 0
+        x = x.permute(0, 2, 1)
+        shared_feat = self.SharedHead(x)
+        power_raw = self.PowerHead(shared_feat)
         power_raw = torch.clamp(power_raw, min=-10.0)
         power = F.softplus(power_raw)
 
@@ -203,12 +206,12 @@ class NILMFormer(nn.Module):
         x_enc = self.EncoderBlock(x_enc)
         stats_feat = x_enc[:, -1:, :]
         x_feat = x_enc[:, :-1, :].permute(0, 2, 1)
-        power_raw = self.DownstreamTaskHead(x_feat)
-        gate = self.GateHead(x_feat)
+        shared_feat = self.SharedHead(x_feat)
+        power_raw = self.PowerHead(shared_feat)
+        gate = self.GateHead(shared_feat)
         alpha = float(getattr(self, "output_stats_alpha", 0.0))
         mean_max = float(getattr(self, "output_stats_mean_max", 0.0))
         std_max = float(getattr(self, "output_stats_std_max", 0.0))
-        # Clamp before softplus for numerical stability
         power_raw = torch.clamp(power_raw, min=-10.0)
         power = F.softplus(power_raw)
         if alpha > 0.0 and (mean_max > 0.0 or std_max > 0.0):
@@ -219,7 +222,8 @@ class NILMFormer(nn.Module):
             std = 1.0 + (alpha * std_max) * torch.sigmoid(raw_std)
             std = torch.clamp(std, min=1e-3)
             power = power * std + mean
-        return power, gate
+        cls_logits = self.WindowClsHead(stats_feat.squeeze(1))
+        return power, gate, cls_logits
 
     def forward_gated(self, x, gate_mode="soft", gate_threshold=0.5, soft_scale=1.0):
         """

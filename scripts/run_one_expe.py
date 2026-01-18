@@ -10,6 +10,7 @@ import os
 import sys
 import yaml
 import logging
+from collections.abc import Sequence
 
 logging.getLogger("torch.utils.flop_counter").disabled = True
 
@@ -546,7 +547,13 @@ def launch_one_experiment(expes_config: OmegaConf):
 
     logging.info("             ... Done.")
 
-    threshold = data_builder.appliance_param[expes_config.app]["min_threshold"]
+    app_key = expes_config.app
+    if isinstance(app_key, Sequence) and not isinstance(app_key, (str, bytes)):
+        candidates = [a for a in app_key if a in data_builder.appliance_param]
+        if len(candidates) == 0:
+            candidates = list(data_builder.appliance_param.keys())
+        app_key = candidates[0]
+    threshold = data_builder.appliance_param[app_key]["min_threshold"]
     expes_config.threshold = threshold
     _configure_nilm_loss_hyperparams(expes_config, data, threshold)
 
@@ -669,17 +676,71 @@ def main(
             )
         expes_config.update(baselines_config[model_key])
 
+    appliance_str = str(appliance).strip()
+    appliance_lower = appliance_str.lower()
     appliance_key_map = {k.lower(): k for k in datasets_config.keys()}
-    appliance_key = appliance_key_map.get(str(appliance).strip().lower())
-    if appliance_key is None:
-        available = ", ".join(sorted(datasets_config.keys()))
-        logging.error("Appliance '%s' not found in datasets_config.", appliance)
-        raise ValueError(
-            "Appliance {} unknown for dataset {}. Available appliances (case-insensitive): {}. Use -h to see argument help.".format(
-                appliance, dataset_key, available
+    selected_keys = []
+    if "," in appliance_str:
+        requested = [s.strip().lower() for s in appliance_str.split(",") if s.strip()]
+        for name in requested:
+            key = appliance_key_map.get(name)
+            if key is None:
+                available = ", ".join(sorted(datasets_config.keys()))
+                logging.error("Appliance '%s' not found in datasets_config.", name)
+                raise ValueError(
+                    "Appliance {} unknown for dataset {}. Available appliances (case-insensitive): {}. Use -h to see argument help.".format(
+                        name, dataset_key, available
+                    )
+                )
+            selected_keys.append(key)
+    elif appliance_lower == "multi":
+        selected_keys = list(datasets_config.keys())
+    else:
+        key = appliance_key_map.get(appliance_lower)
+        if key is None:
+            available = ", ".join(sorted(datasets_config.keys()))
+            logging.error("Appliance '%s' not found in datasets_config.", appliance)
+            raise ValueError(
+                "Appliance {} unknown for dataset {}. Available appliances (case-insensitive): {}. Use -h to see argument help.".format(
+                    appliance, dataset_key, available
+                )
             )
-        )
-    expes_config.update(datasets_config[appliance_key])
+        selected_keys.append(key)
+
+    if len(selected_keys) == 1:
+        appliance_key = selected_keys[0]
+        expes_config.update(datasets_config[appliance_key])
+        appliance_log = appliance_key
+        appliance_cfg_name = appliance_key
+    else:
+        appliance_key = "Multi"
+        base_entry = {}
+        for k in selected_keys:
+            cfg_k = datasets_config[k]
+            for ck, cv in cfg_k.items():
+                if ck == "app":
+                    continue
+                if ck not in base_entry:
+                    base_entry[ck] = cv
+                elif base_entry[ck] != cv:
+                    logging.warning(
+                        "Conflicting config value for key '%s' between appliances; using value from '%s'.",
+                        ck,
+                        selected_keys[0],
+                    )
+                    break
+        app_list = []
+        for k in selected_keys:
+            app_val = datasets_config[k].get("app", k)
+            if isinstance(app_val, list):
+                app_list.extend(list(app_val))
+            else:
+                app_list.append(app_val)
+        base_entry["app"] = app_list
+        expes_config.update(base_entry)
+        expes_config["appliance_group_members"] = selected_keys
+        appliance_log = "{} ({})".format(appliance_key, ", ".join(selected_keys))
+        appliance_cfg_name = appliance_key
 
     sampling_rate = str(sampling_rate).strip().lower()
 
@@ -687,13 +748,13 @@ def main(
     logging.info("      Dataset: %s", dataset_key)
     logging.info("      Sampling Rate: %s", sampling_rate)
     logging.info("      Window Size: %s", window_size)
-    logging.info("      Appliance : %s", appliance_key)
+    logging.info("      Appliance : %s", appliance_log)
     logging.info("      Model: %s", model_key)
     logging.info("      Seed: %s", seed)
     logging.info("--------------------------------------------------")
 
     expes_config["dataset"] = dataset_key
-    expes_config["appliance"] = appliance_key
+    expes_config["appliance"] = appliance_cfg_name
     expes_config["window_size"] = window_size
     expes_config["sampling_rate"] = sampling_rate
     expes_config["seed"] = seed
@@ -774,7 +835,8 @@ if __name__ == "__main__":
         required=True,
         type=str,
         help=(
-            "Selected appliance (non-case-insensitive). Available by dataset: {}.".format(
+            "Selected appliance (non-case-insensitive). Use single name, 'multi' for all, "
+            "or comma-separated list. Available by dataset: {}.".format(
                 _appliance_help
             )
         ),

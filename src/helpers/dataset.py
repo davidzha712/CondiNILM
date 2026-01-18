@@ -644,12 +644,9 @@ class NILMDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         """
-        Return Tuple as follow:
+        Return Tuple as follow (pretraining=False):
 
-            if self.pretraining:
-                Aggregate/Temp/Encoding
-            else:
-                Aggregate/Temp/Encoding, App. Power, App. Activation States
+            Aggregate/Temp/Encoding, All App. Power, All App. Activation States, Window-level ON/OFF labels
         """
         if self.use_temperature:
             tmp_sample = self.samples[idx, 0, :2, :].copy()
@@ -670,17 +667,19 @@ class NILMDataset(torch.utils.data.Dataset):
 
         tmp_sample = np.nan_to_num(tmp_sample, nan=0.0, posinf=0.0, neginf=0.0)
         target_power = np.nan_to_num(
-            self.samples[idx, 1:2, 0, :].astype(np.float32),
+            self.samples[idx, 1:, 0, :].astype(np.float32),
             nan=0.0,
             posinf=0.0,
             neginf=0.0,
         )
         target_state = np.nan_to_num(
-            self.samples[idx, 1:2, 1, :].astype(np.float32),
+            self.samples[idx, 1:, 1, :].astype(np.float32),
             nan=0.0,
             posinf=0.0,
             neginf=0.0,
         )
+
+        window_label = (target_state.sum(axis=-1) > 0).astype(np.float32)
 
         if self.pretraining:
             return tmp_sample.astype(np.float32)
@@ -689,4 +688,5 @@ class NILMDataset(torch.utils.data.Dataset):
                 tmp_sample.astype(np.float32),
                 target_power,
                 target_state,
+                window_label,
             )
