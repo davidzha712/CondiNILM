@@ -106,15 +106,18 @@ def _apply_cutoff_to_loss_params(expes_config):
 
 def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     """
-    根据设备的电气统计特性自动配置损失函数超参数。
-    
-    支持的设备类型：
-    1. sparse_high_power: 稀疏高功率设备（如Kettle, Microwave）- 强调ON事件检测
-    2. cycling_infrequent: 低占空比周期设备（如低频启动的Fridge）- 强化OFF段稳定与长OFF约束
-    3. cycling_low_power: 低功率周期设备（如Fridge）- 平衡ON/OFF，强化状态切换
-    4. frequent_switching: 频繁开关设备 - 强化状态切换
-    5. long_cycle: 长周期运行设备（如WashingMachine）- 关注功率变化趋势
-    6. always_on: 常开设备 - 强调OFF事件检测（异常检测）
+    Automatically configure loss hyperparameters based on the device's electrical statistics.
+
+    Supported device types:
+    1. sparse_high_power: sparse high-power appliances (e.g., Kettle, Microwave) –
+       emphasize ON-event detection
+    2. cycling_infrequent: low duty-cycle cycling devices (e.g., a fridge with infrequent
+       starts) – strengthen OFF-segment stability and long-OFF constraints
+    3. cycling_low_power: low-power cycling devices (e.g., fridge) – balance ON/OFF and
+       emphasize state transitions
+    4. frequent_switching: frequently switching devices – emphasize state transitions
+    5. long_cycle: long-cycle devices (e.g., WashingMachine) – focus on power trend changes
+    6. always_on: always-on devices – emphasize OFF-event detection (anomaly detection)
     """
     try:
         if data.ndim != 4 or data.shape[1] < 2:
@@ -133,8 +136,8 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     thr = float(threshold)
     on_mask = status_bin.reshape(-1) > 0
     duty_cycle = float(on_mask.mean())
-    
-    # ============== 基础统计 ==============
+
+    # ============== Basic statistics ==============
     on_values = flat[on_mask] if on_mask.any() else flat
     off_values = flat[~on_mask] if (~on_mask).any() else flat
     try:
@@ -150,9 +153,9 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     peak_power = float(on_values.max()) if on_values.size > 0 else 0.0
     mean_on = float(on_values.mean()) if on_values.size > 0 else 0.0
     std_on = float(on_values.std()) if on_values.size > 1 else 0.0
-    cv_on = std_on / (mean_on + 1e-6)  # 变异系数
-    
-    # ============== ON事件统计（避免窗口拼接边界伪事件） ==============
+    cv_on = std_on / (mean_on + 1e-6)  # coefficient of variation
+
+    # ============== ON-event statistics (avoid false events from window stitching) ==============
     total_samples = int(status_bin.size)
     try:
         if status_bin.ndim == 2 and status_bin.shape[0] > 0 and status_bin.shape[1] > 1:
@@ -179,8 +182,8 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     except Exception as e:
         logging.debug("_configure_nilm_loss_hyperparams: overlap adjustment failed: %s", e)
         n_events_adj = int(n_events)
-    
-    # ============== 设备类型分类 ==============
+
+    # ============== Device type classification ==============
     device_type = classify_device_type(
         duty_cycle,
         peak_power,
@@ -209,8 +212,8 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
             expes_config["output_stats_mean_max"] = 0.0
         if "output_stats_std_max" not in expes_config:
             expes_config["output_stats_std_max"] = 0.2
-    
-    # ============== 功率变化统计 ==============
+
+    # ============== Power change statistics ==============
     if flat.size > 1:
         diff_all = np.abs(np.diff(flat))
         diff_on = np.abs(np.diff(on_values)) if on_values.size > 1 else diff_all
@@ -226,13 +229,13 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     ratio = edge_level / (noise_level + 1e-6)
     ratio = 1.0 if not np.isfinite(ratio) else min(max(ratio, 1.0), 10.0)
     lambda_grad = 0.2 + (0.8 - 0.2) * (ratio - 1.0) / 9.0
-    
-    # ============== 根据设备类型设置参数 ==============
-    # 关键改进：
-    # 1. 降低OFF惩罚权重（lambda_off_hard），防止模型学会全输出0
-    # 2. 添加ON召回惩罚（lambda_on_recall），确保ON时有输出
-    # 3. 设置合理的off_margin，允许小噪声
-    
+
+    # ============== Set parameters based on device type ==============
+    # Key improvements:
+    # 1. Reduce OFF penalty weight (lambda_off_hard) to avoid all-zero outputs
+    # 2. Add ON recall penalty (lambda_on_recall) to ensure non-zero outputs when ON
+    # 3. Set a reasonable off_margin that allows small noise
+
     device_params = get_device_loss_params(device_type, duty_cycle)
     alpha_on = device_params["alpha_on"]
     alpha_off = device_params["alpha_off"]
@@ -244,8 +247,8 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     lambda_gate_cls = device_params["lambda_gate_cls"]
     lambda_energy = device_params["lambda_energy"]
     off_margin = device_params["off_margin"]
-    
-    # ============== soft_temp 和 edge_eps ==============
+
+    # ============== soft_temp and edge_eps ==============
     soft_temp_raw = max(0.25 * thr, 2.0 * noise_level, 1.0)
     edge_eps_raw = max(3.0 * noise_level, 0.5 * edge_level, 0.1 * thr, 1.0)
 
@@ -279,9 +282,9 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     except Exception as e:
         logging.debug("_configure_nilm_loss_hyperparams: energy_floor calculation failed: %s", e)
         energy_floor_raw = thr * power.shape[-1] * 0.1
-    
-    # ============== 写入配置 ==============
-    # 允许用户通过命令行/配置覆盖
+
+    # ============== Write back to config ==============
+    # Allow user overrides from command line / config files
     if "loss_lambda_zero" not in expes_config or expes_config.loss_lambda_zero == 0.0:
         expes_config["loss_lambda_zero"] = float(lambda_zero)
     else:
@@ -307,8 +310,8 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
             )
     except Exception as e:
         logging.debug("_configure_nilm_loss_hyperparams: cutoff normalization failed: %s", e)
-    
-    # OFF假阳性惩罚（温和）
+
+    # OFF false-positive penalty (mild)
     _set_cfg_value(
         expes_config, "loss_lambda_off_hard", float(lambda_off_hard), default_value=0.1
     )
@@ -332,7 +335,7 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
         logging.debug("_configure_nilm_loss_hyperparams: off_margin normalization failed: %s", e)
         _set_cfg_value(expes_config, "loss_off_margin", float(off_margin), default_value=0.02)
 
-    # ON漏检惩罚（防止全0输出）
+    # ON missed-detection penalty (prevents all-zero outputs)
     _set_cfg_value(
         expes_config,
         "loss_lambda_on_recall",
@@ -345,7 +348,7 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
         float(on_recall_margin),
         default_value=0.5,
     )
-    # 门控分类
+    # Gate classification
     _set_cfg_value(
         expes_config,
         "loss_lambda_gate_cls",

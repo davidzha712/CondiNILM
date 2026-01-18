@@ -1821,13 +1821,13 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                     center_ratio=center_ratio,
                 )
             else:
-                # OFF假阳性惩罚参数（温和设置）
+                # OFF false-positive penalty parameters (mild setting)
                 lambda_off_hard = float(getattr(expes_config, "loss_lambda_off_hard", 0.1))
                 off_margin = float(getattr(expes_config, "loss_off_margin", 0.02))
-                # ON漏检惩罚参数（防止全0输出）
+                # ON missed-detection penalty parameters (prevents all-zero outputs)
                 lambda_on_recall = float(getattr(expes_config, "loss_lambda_on_recall", 0.3))
                 on_recall_margin = float(getattr(expes_config, "loss_on_recall_margin", 0.5))
-                # 门控分类参数
+                # Gate classification parameters
                 lambda_gate_cls = float(getattr(expes_config, "loss_lambda_gate_cls", 0.1))
                 gate_focal_gamma = float(getattr(expes_config, "loss_gate_focal_gamma", 2.0))
                 criterion = GAEAECLoss(

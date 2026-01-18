@@ -185,8 +185,9 @@ class NILMFormer(nn.Module):
 
     def forward_with_gate(self, x):
         """
-        带门控的前向传播（用于训练）。
-        返回原始power和gate logits，让损失函数决定如何使用。
+        Forward pass with gate outputs for training.
+
+        Returns raw power and gate logits; the loss function decides how to use them.
         """
         encoding = x[:, 1:, :]
         x_main = x[:, :1, :]
@@ -227,41 +228,42 @@ class NILMFormer(nn.Module):
 
     def forward_gated(self, x, gate_mode="soft", gate_threshold=0.5, soft_scale=1.0):
         """
-        带门控的推理前向传播。
-        
-        推荐使用soft模式，避免硬门控导致的输出完全为0。
-        
+        Forward pass with gating for inference.
+
+        It is recommended to use the "soft" mode to avoid hard gating driving
+        the outputs to exactly zero.
+
         Args:
-            x: 输入序列 (B, 1+e, L)
-            gate_mode: 门控模式
-                - "none": 不使用门控，直接返回power（推荐用于调试）
-                - "soft": 软门控，power * sigmoid(gate * soft_scale)
-                - "soft_relu": 软门控 + ReLU，确保非负
-                - "hard": 硬门控，低于阈值的位置输出0（不推荐）
-            gate_threshold: 硬门控阈值（仅hard模式使用）
-            soft_scale: 软门控的缩放因子（越大越接近硬门控）
-        
+            x: input sequence (B, 1+e, L)
+            gate_mode: gating mode
+                - "none": no gating, return power directly (recommended for debugging)
+                - "soft": soft gating, power * sigmoid(gate * soft_scale)
+                - "soft_relu": soft gating with ReLU to ensure non-negative outputs
+                - "hard": hard gating, zero out positions below threshold (not recommended)
+            gate_threshold: hard-gating threshold (used only in "hard" mode)
+            soft_scale: scaling factor for soft gating (larger => closer to hard gating)
+
         Returns:
-            gated_power: 门控后的功率预测 (B, 1, L)
+            gated_power: gated power prediction (B, C_out, L)
         """
         power, gate = self.forward_with_gate(x)
-        
+
         if gate_mode == "none":
-            # 不使用门控，直接返回（用于调试）
+            # No gating; return raw power (for debugging)
             return power
-        
+
         gate_prob = torch.sigmoid(gate * soft_scale)
-        
+
         if gate_mode == "hard":
-            # 硬门控：二值化（不推荐，容易导致全0）
+            # Hard gating: binarize gate (not recommended, may lead to all-zero outputs)
             gate_mask = (gate_prob > gate_threshold).float()
             return power * gate_mask
-        
+
         elif gate_mode == "soft_relu":
-            # 软门控 + ReLU
+            # Soft gating with ReLU
             return power * gate_prob
-        
+
         else:  # "soft"
-            # 软门控（推荐）
-            # 使用软门控，让模型自然学习
+            # Soft gating (recommended)
+            # Use soft gating and let the model learn appropriate behavior
             return power * gate_prob

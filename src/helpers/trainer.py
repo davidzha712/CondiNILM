@@ -101,14 +101,15 @@ class EAECLoss(nn.Module):
 class GAEAECLoss(nn.Module):
     """
     Gate-Aware Energy-Aware Error Correction Loss.
-    
-    针对NILM问题优化，平衡处理：
-    1. ON/OFF状态不平衡问题
-    2. OFF状态时模型输出非零值的问题（假阳性）
-    3. ON状态时模型输出太低的问题（漏检/假阴性）
-    4. 显式门控学习，强化设备状态识别
-    
-    关键改进：添加ON漏检惩罚，防止模型学会"全部输出0"的安全策略
+
+    Optimized for NILM problems to balance:
+    1. ON/OFF state imbalance
+    2. Non-zero outputs in OFF state (false positives)
+    3. Too-low outputs in ON state (missed detections / false negatives)
+    4. Explicit gate learning to strengthen device state recognition
+
+    Key improvement: add an ON missed-detection penalty to prevent the trivial
+    "all-zero output" strategy.
     """
     def __init__(
         self,
@@ -123,14 +124,14 @@ class GAEAECLoss(nn.Module):
         lambda_sparse=0.0,
         lambda_zero=0.0,
         center_ratio=1.0,
-        # OFF惩罚参数
-        lambda_off_hard=0.1,    # OFF状态硬约束权重（降低！）
-        off_margin=0.02,        # OFF状态的容忍边界（允许小噪声）
-        # ON召回参数（新增！防止全0输出）
-        lambda_on_recall=0.3,   # ON漏检惩罚权重
-        on_recall_margin=0.5,   # ON时输出至少达到目标的多少比例
-        # 门控分类参数
-        lambda_gate_cls=0.1,    # 门控分类损失权重（降低！）
+        # OFF-state penalty parameters
+        lambda_off_hard=0.1,    # OFF-state hard constraint weight (reduce this)
+        off_margin=0.02,        # OFF-state tolerance margin (allows small noise)
+        # ON recall parameters (prevents all-zero outputs)
+        lambda_on_recall=0.3,   # ON missed-detection penalty weight
+        on_recall_margin=0.5,   # Minimum fraction of target reached when ON
+        # Gate classification parameters
+        lambda_gate_cls=0.1,    # Gate classification loss weight (reduce this)
         gate_focal_gamma=2.0,   # Focal Loss gamma
     ):
         super().__init__()
@@ -170,18 +171,18 @@ class GAEAECLoss(nn.Module):
         loss_point = self.base_loss(pred, target)
         eps = 1e-6
         thr = float(self.threshold)
-        
-        # 计算ON/OFF概率（基于目标值）
+
+        # Compute ON/OFF probabilities (based on target values)
         temp = max(self.soft_temp, eps)
         p_on_target = torch.sigmoid((target - thr) / temp)
         p_off_target = 1.0 - p_on_target
-        
-        # 硬掩码（基于真实目标）
+
+        # Hard masks derived from true targets
         hard_off_mask = (target <= thr).float()
         hard_on_mask = (target > thr).float()
-        
-        # ==================== 主损失：加权回归损失 ====================
-        # 使用目标值的软权重，而不是门控输出
+
+        # ==================== Main loss: weighted regression loss ====================
+        # Use soft weights from target values instead of gate outputs
         loss_on = (loss_point * p_on_target).sum() / (p_on_target.sum() + eps)
         loss_off = (loss_point * p_off_target).sum() / (p_off_target.sum() + eps)
         loss_main = self.alpha_on * loss_on + self.alpha_off * loss_off
@@ -197,7 +198,7 @@ class GAEAECLoss(nn.Module):
         else:
             loss_grad = pred.new_tensor(0.0)
 
-        # ==================== 能量损失 ====================
+        # ==================== Energy loss ====================
         energy_pred_on = (pred * p_on_target).sum(dim=-1)
         energy_target_on = (target * p_on_target).sum(dim=-1)
         floor = max(float(self.energy_floor), 1e-6)
@@ -210,55 +211,55 @@ class GAEAECLoss(nn.Module):
             loss_energy = (loss_energy_sample * energy_mask).sum() / (energy_mask.sum() + eps)
         else:
             loss_energy = pred.new_tensor(0.0)
-        
+
         if self.lambda_sparse > 0 and p_on_target.sum() > 0:
             sparse_penalty = (pred.abs() * p_on_target).sum() / (p_on_target.sum() + eps)
         else:
             sparse_penalty = pred.new_tensor(0.0)
 
-        # ==================== OFF假阳性惩罚（温和版本） ====================
-        # 只惩罚OFF时超过margin的输出，使用线性惩罚而非平方
+        # ==================== OFF false-positive penalty (mild version) ====================
+        # Penalize outputs above the margin in OFF state using a linear penalty
         if hard_off_mask.sum() > 0 and self.lambda_off_hard > 0:
             margin = max(float(self.off_margin), 0.0)
             pred_excess = torch.relu(pred.abs() - margin)
-            # 使用线性惩罚（更温和）
+            # Use linear penalty (milder)
             off_fp_penalty = (pred_excess * hard_off_mask).sum() / (hard_off_mask.sum() + eps)
         else:
             off_fp_penalty = pred.new_tensor(0.0)
 
-        # ==================== ON漏检惩罚（关键！防止全0输出） ====================
-        # 惩罚ON时输出太低的情况
+        # ==================== ON missed-detection penalty (critical; prevents all-zero output) ====================
+        # Penalize predictions that are too low when the device is ON
         if hard_on_mask.sum() > 0 and self.lambda_on_recall > 0:
-            # 计算ON时预测值与目标值的差距
+            # Compute gap between prediction and target when ON
             recall_margin = max(float(self.on_recall_margin), 0.1)
-            # 目标：pred >= target * recall_margin
+            # Target constraint: pred >= target * recall_margin
             min_expected = target * recall_margin
-            # 惩罚低于预期的输出
+            # Penalize outputs below the expected level
             on_shortfall = torch.relu(min_expected - pred)
             on_fn_penalty = (on_shortfall * hard_on_mask).sum() / (hard_on_mask.sum() + eps)
         else:
             on_fn_penalty = pred.new_tensor(0.0)
         
-        # ==================== 门控分类损失（平衡版本） ====================
+        # ==================== Gate classification loss (balanced version) ====================
         if gate is not None and self.lambda_gate_cls > 0:
             gate_target = hard_on_mask
             gate_prob = torch.sigmoid(gate.float())
             gate_prob = torch.clamp(gate_prob, eps, 1.0 - eps)
-            
-            # 计算ON/OFF比例
+
+            # Compute ON/OFF ratio
             on_ratio = hard_on_mask.mean()
             off_ratio = 1.0 - on_ratio
-            
-            # 平衡的类别权重：少数类获得更高权重
-            # 但限制权重比例，避免极端不平衡
+
+            # Class-balanced weights: minority class gets higher weight
+            # Limit the ratio to avoid extreme imbalance
             weight_on = torch.clamp(off_ratio / (on_ratio + eps), 1.0, 5.0)
             weight_off = 1.0
             
             # Binary Cross Entropy with class weights
             bce_on = -torch.log(gate_prob) * gate_target * weight_on
             bce_off = -torch.log(1.0 - gate_prob) * (1.0 - gate_target) * weight_off
-            
-            # Focal modulation（可选，gamma=0时退化为普通BCE）
+
+            # Focal modulation (optional; gamma=0 reduces to standard BCE)
             gamma = max(float(self.gate_focal_gamma), 0.0)
             if gamma > 0:
                 pt = gate_prob * gate_target + (1.0 - gate_prob) * (1.0 - gate_target)
@@ -268,22 +269,22 @@ class GAEAECLoss(nn.Module):
                 gate_cls_loss = (bce_on + bce_off).mean()
         else:
             gate_cls_loss = pred.new_tensor(0.0)
-        
-        # ==================== 软零惩罚（原有，保持温和） ====================
+
+        # ==================== Soft zero penalty (original, mild) ====================
         if hard_off_mask.sum() > 0 and self.lambda_zero > 0:
             zero_penalty = (pred.abs() * hard_off_mask).sum() / (hard_off_mask.sum() + eps)
         else:
             zero_penalty = pred.new_tensor(0.0)
-        
-        # ==================== 组合总损失 ====================
+
+        # ==================== Total loss ====================
         total_loss = (
             loss_main 
             + self.lambda_grad * loss_grad
             + self.lambda_energy * loss_energy 
             + self.lambda_sparse * sparse_penalty
             + self.lambda_zero * zero_penalty
-            + self.lambda_off_hard * off_fp_penalty      # OFF假阳性惩罚
-            + self.lambda_on_recall * on_fn_penalty      # ON漏检惩罚（新增！）
+            + self.lambda_off_hard * off_fp_penalty      # OFF false-positive penalty
+            + self.lambda_on_recall * on_fn_penalty      # ON missed-detection penalty
             + self.lambda_gate_cls * gate_cls_loss
         )
         

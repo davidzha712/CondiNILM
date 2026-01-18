@@ -49,33 +49,33 @@ postprocess_min_on_steps: 3
 
 off_high_agg_penalty_weight: 0.3
 
-# ============== 损失函数参数（自动根据设备类型调整） ==============
-# 这些是默认值，会被 _configure_nilm_loss_hyperparams 根据设备类型自动覆盖
+# ============== Loss function hyperparameters (auto-adjusted by appliance type) ==============
+# These are default values and will be overridden by _configure_nilm_loss_hyperparams based on appliance type
 #
-# 支持的设备类型：
-#   - sparse_high_power:    稀疏高功率设备（如Kettle, Microwave）
-#   - frequent_switching:   频繁开关设备（如Fridge）
-#   - long_cycle:           长周期运行设备（如WashingMachine, Dishwasher）
-#   - always_on:            常开设备
-#   - sparse_medium_power:  稀疏中等功率设备
-
-# ===== OFF假阳性惩罚（温和设置，防止模型学会全输出0） =====
-# lambda_off_hard: OFF状态硬约束权重（降低！）
+# Supported appliance types:
+#   - sparse_high_power:    sparse high-power appliances (e.g., Kettle, Microwave)
+#   - frequent_switching:   frequently switching appliances (e.g., Fridge)
+#   - long_cycle:           long-cycle appliances (e.g., WashingMachine, Dishwasher)
+#   - always_on:            always-on appliances
+#   - sparse_medium_power:  sparse medium-power appliances
+#
+# ===== OFF false-positive penalty (mild, prevents learning all-zero output) =====
+# lambda_off_hard: OFF-state hard constraint weight (lower!)
 loss_lambda_off_hard: 0.1
 
-# off_margin: OFF状态的功率容忍边界（归一化后），允许小噪声
+# off_margin: power tolerance margin in OFF state (after normalization), allowing small noise
 loss_off_margin: 0.02
 
-# ===== ON漏检惩罚（关键！防止全0输出） =====
-# lambda_on_recall: ON漏检惩罚权重，惩罚ON时输出太低
+# ===== ON missed-detection penalty (critical! prevents all-zero output) =====
+# lambda_on_recall: ON missed-detection penalty weight, penalizing too-low outputs when ON
 loss_lambda_on_recall: 0.3
 
-# on_recall_margin: ON时输出至少达到目标的多少比例
+# on_recall_margin: minimum fraction of target output when ON
 loss_on_recall_margin: 0.5
 
-# ===== 门控分类（温和设置） =====
-# lambda_gate_cls: 门控分类损失权重（降低！）
+# ===== Gate classification (mild setting) =====
+# lambda_gate_cls: gate classification loss weight (lower!)
 loss_lambda_gate_cls: 0.1
 
-# gate_focal_gamma: Focal Loss gamma参数
+# gate_focal_gamma: Focal Loss gamma parameter
 loss_gate_focal_gamma: 2.0

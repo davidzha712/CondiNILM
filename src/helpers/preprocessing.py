@@ -438,8 +438,8 @@ def create_exogene(
 
 # ===================== UKDALE DataBuilder =====================#
 
-# 设备别名映射：允许类似设备合并学习
-# 键是目标设备名，值是可以作为替代的设备名列表
+# Appliance alias mapping: allow similar devices to be merged for learning
+# Keys are target appliance names; values are lists of alternative names
 APPLIANCE_ALIASES = {
     "fridge": ["freezer", "fridge_freezer", "fridge-freezer"],
     "freezer": ["fridge", "fridge_freezer", "fridge-freezer"],
@@ -459,7 +459,7 @@ class UKDALE_DataBuilder(object):
         window_stride=None,
         soft_label=False,
         use_status_from_kelly_paper=True,
-        use_appliance_aliases=True,  # 新增：是否使用设备别名
+        use_appliance_aliases=True,  # Whether to use appliance aliases
     ):
         # =============== Class variables =============== #
         self.data_path = data_path
@@ -791,16 +791,16 @@ class UKDALE_DataBuilder(object):
             house_data = house_data[house_data.index >= tmp_min.index[0]]
 
         for appliance in self.mask_app[1:]:
-            # 尝试找到设备：首先尝试精确匹配，然后尝试别名
+            # Try to find device: first exact match, then aliases
             matched_name = None
             matched_id = None
-            
-            # 1. 首先尝试精确匹配
+
+            # 1. First attempt exact matching
             exact_match = house_label.loc[house_label["appliance_name"] == appliance]["id"].values
             if len(exact_match) != 0:
                 matched_name = appliance
                 matched_id = exact_match[0]
-            # 2. 如果没有精确匹配且启用别名，尝试别名
+            # 2. If no exact match and aliases enabled, try aliases
             elif self.use_appliance_aliases and appliance in APPLIANCE_ALIASES:
                 for alias in APPLIANCE_ALIASES[appliance]:
                     alias_match = house_label.loc[house_label["appliance_name"] == alias]["id"].values
@@ -816,7 +816,7 @@ class UKDALE_DataBuilder(object):
                 appl_data = pd.read_csv(
                     path_house + "channel_" + str(i) + ".dat", sep=" ", header=None
                 )
-                # 使用目标设备名作为列名（不是别名）
+                # Use the target appliance name as the column name (not the alias)
                 appl_data.columns = ["time", appliance]
                 appl_data["time"] = pd.to_datetime(appl_data["time"], unit="s")
                 appl_data = appl_data.set_index("time")

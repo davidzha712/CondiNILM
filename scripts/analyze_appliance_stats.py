@@ -22,13 +22,16 @@ from src.helpers.preprocessing import UKDALE_DataBuilder
 
 def compute_appliance_stats_from_array(power: np.ndarray, status: np.ndarray) -> Dict[str, Any]:
     """
-    计算设备的电气统计特性，用于识别不同类型的设备：
-    
-    设备类型分类：
-    1. 频繁开关设备（如Fridge）：duty_cycle ~50%, 中等功率，频繁切换
-    2. 稀疏高功率设备（如Kettle, Microwave）：duty_cycle <5%, 高峰值功率，短时使用
-    3. 长时间运行设备（如WashingMachine）：duty_cycle中等，功率变化大，运行周期长
-    4. 常开设备：duty_cycle >80%, 功率稳定
+    Compute electrical statistics of an appliance to identify its device type.
+
+    Device type categories:
+    1. Frequent-switching devices (e.g., fridge): duty_cycle ~50%, medium power,
+       frequent ON/OFF transitions
+    2. Sparse high-power devices (e.g., Kettle, Microwave): duty_cycle <5%, high
+       peak power, short usage
+    3. Long-duration devices (e.g., WashingMachine): moderate duty_cycle, large
+       power variation, long running cycles
+    4. Always-on devices: duty_cycle >80%, stable power
     """
     power_flat = power.reshape(-1).astype(np.float64)
     status_flat = status.reshape(-1).astype(np.float64) > 0.5
@@ -41,8 +44,8 @@ def compute_appliance_stats_from_array(power: np.ndarray, status: np.ndarray) ->
     duty = float(status_flat.mean())
     on_mask = status_flat
     off_mask = ~status_flat
-    
-    # 基础统计
+
+    # Basic statistics
     if on_mask.any():
         on_values = power_flat[on_mask]
         peak = float(on_values.max())
@@ -59,13 +62,13 @@ def compute_appliance_stats_from_array(power: np.ndarray, status: np.ndarray) ->
     
     mean_all = float(power_flat.mean())
     std_all = float(power_flat.std())
-    
-    # ============== 新增：高级统计量 ==============
-    
-    # 1. 峰值功率比（识别高功率设备）
+
+    # ============== Additional advanced statistics ==============
+
+    # 1. Peak-to-mean power ratio (for detecting high-power devices)
     peak_to_mean_ratio = peak / (mean_on + 1e-6) if mean_on > 0 else 0.0
     
-    # 2. 功率变化率（检测瞬间高功率设备）
+    # 2. Power change rate (for detecting short high-power bursts)
     if power_flat.size > 1:
         power_diff = np.abs(np.diff(power_flat))
         max_power_change = float(power_diff.max())
@@ -75,18 +78,18 @@ def compute_appliance_stats_from_array(power: np.ndarray, status: np.ndarray) ->
         max_power_change = 0.0
         mean_power_change = 0.0
         p99_power_change = 0.0
-    
-    # 3. ON事件统计（检测使用模式）
+
+    # 3. ON-event statistics (usage pattern)
     status_diff = np.diff(status_flat.astype(int))
     on_starts = np.where(status_diff == 1)[0]
     on_ends = np.where(status_diff == -1)[0]
-    
-    # 处理边界情况
+
+    # Handle boundary cases
     if status_flat[0]:
         on_starts = np.concatenate([[0], on_starts])
     if status_flat[-1] and len(on_ends) < len(on_starts):
         on_ends = np.concatenate([on_ends, [len(status_flat) - 1]])
-    
+
     n_events = min(len(on_starts), len(on_ends))
     if n_events > 0:
         event_durations = on_ends[:n_events] - on_starts[:n_events]
@@ -101,19 +104,19 @@ def compute_appliance_stats_from_array(power: np.ndarray, status: np.ndarray) ->
         max_event_duration = 0.0
         min_event_duration = 0.0
         n_on_events = 0
-    
-    # 4. 功率稳定性（ON时的变异系数）
-    cv_on = std_on / (mean_on + 1e-6) if mean_on > 0 else 0.0
-    
-    # 5. 稀疏性指标（识别稀疏但高功率的设备）
-    # 时间平均功率 vs ON时平均功率的比值
-    sparsity_ratio = mean_all / (mean_on + 1e-6) if mean_on > 0 else 0.0
-    
-    # 6. 瞬时功率密度（高功率短时设备的特征）
-    # 峰值功率 × duty_cycle
-    power_density = peak * duty
-    
-    # ============== 设备类型分类 ==============
+
+    # 4. Power stability (coefficient of variation during ON state)
+        cv_on = std_on / (mean_on + 1e-6) if mean_on > 0 else 0.0
+
+    # 5. Sparsity metric (for sparse but high-power devices)
+    # Ratio of time-averaged power to ON-state mean power
+        sparsity_ratio = mean_all / (mean_on + 1e-6) if mean_on > 0 else 0.0
+
+    # 6. Instantaneous power density (feature of short, high-power devices)
+    # peak power × duty_cycle
+        power_density = peak * duty
+
+    # ============== Device type classification ==============
     device_type = classify_device_type(
         duty_cycle=duty,
         peak_power=peak,
@@ -125,7 +128,7 @@ def compute_appliance_stats_from_array(power: np.ndarray, status: np.ndarray) ->
     )
     
     return {
-        # 基础统计
+        # Basic statistics
         "duty_cycle": duty,
         "peak_power": peak,
         "p95_on_power": p95_on,
@@ -134,21 +137,21 @@ def compute_appliance_stats_from_array(power: np.ndarray, status: np.ndarray) ->
         "std_on_power": std_on,
         "mean_all_power": mean_all,
         "std_all_power": std_all,
-        # 高级统计
+        # Advanced statistics
         "peak_to_mean_ratio": peak_to_mean_ratio,
         "max_power_change": max_power_change,
         "mean_power_change": mean_power_change,
         "p99_power_change": p99_power_change,
-        "cv_on": cv_on,  # 变异系数
+        "cv_on": cv_on,  # coefficient of variation
         "sparsity_ratio": sparsity_ratio,
         "power_density": power_density,
-        # ON事件统计
+        # ON-event statistics
         "n_on_events": n_on_events,
         "mean_event_duration": mean_event_duration,
         "median_event_duration": median_event_duration,
         "max_event_duration": max_event_duration,
         "min_event_duration": min_event_duration,
-        # 设备类型分类
+        # Device type classification
         "device_type": device_type,
     }
 
@@ -163,41 +166,41 @@ def classify_device_type(
     total_samples: int,
 ) -> str:
     """
-    根据统计特性分类设备类型，用于自动调整损失函数参数。
-    
+    Classify the device type from statistics to auto-tune loss function parameters.
+
     Returns:
-        设备类型字符串：
-        - "sparse_high_power": 稀疏高功率设备（如Kettle, Microwave）
-        - "frequent_switching": 频繁开关设备（如Fridge）
-        - "long_cycle": 长周期运行设备（如WashingMachine, Dishwasher）
-        - "always_on": 常开设备
-        - "low_power": 低功率设备
-        - "unknown": 无法分类
+        Device type string:
+        - "sparse_high_power": sparse high-power devices (e.g., Kettle, Microwave)
+        - "frequent_switching": frequently switching devices (e.g., fridge)
+        - "long_cycle": long-cycle devices (e.g., WashingMachine, Dishwasher)
+        - "always_on": always-on devices
+        - "low_power": low-power devices
+        - "unknown": cannot be classified
     """
-    # 事件频率（每1000个样本的ON事件数）
+    # Event frequency (ON events per 1000 samples)
     event_rate = n_on_events / (total_samples / 1000 + 1e-6) if total_samples > 0 else 0
-    
-    # 1. 稀疏高功率设备：duty_cycle低，峰值功率高
+
+    # 1. Sparse high-power devices: low duty_cycle, high peak power
     if duty_cycle < 0.05 and peak_power > 1000:
         return "sparse_high_power"
-    
-    # 2. 频繁开关设备：duty_cycle中等，事件频率高
+
+    # 2. Frequent-switching devices: medium duty_cycle, high event rate
     if 0.3 <= duty_cycle <= 0.7 and event_rate > 5:
         return "frequent_switching"
-    
-    # 3. 长周期运行设备：duty_cycle中等，事件时长长，功率变化大
+
+    # 3. Long-cycle devices: medium duty_cycle, long events, large power variation
     if 0.05 <= duty_cycle <= 0.5 and mean_event_duration > 30 and cv_on > 0.3:
         return "long_cycle"
-    
-    # 4. 常开设备：duty_cycle很高
+
+    # 4. Always-on devices: very high duty_cycle
     if duty_cycle > 0.8:
         return "always_on"
-    
-    # 5. 低功率设备：峰值功率低
+
+    # 5. Low-power devices: low peak power
     if peak_power < 100:
         return "low_power"
-    
-    # 6. 稀疏中等功率（介于稀疏高功率和频繁开关之间）
+
+    # 6. Sparse medium-power devices (between sparse high-power and frequent-switching)
     if duty_cycle < 0.15 and peak_power > 200:
         return "sparse_medium_power"
     
@@ -206,27 +209,27 @@ def classify_device_type(
 
 def get_recommended_loss_params(device_type: str, stats: Dict[str, Any]) -> Dict[str, Any]:
     """
-    根据设备类型返回推荐的损失函数参数。
+    Return recommended loss-function parameters for a given device type.
     """
     duty = stats.get("duty_cycle", 0.5)
     peak = stats.get("peak_power", 100)
     
     if device_type == "sparse_high_power":
-        # 稀疏高功率设备（如Kettle, Microwave）
-        # 特点：ON事件稀少但功率很高，需要强调ON事件的准确捕获
+        # Sparse high-power devices (e.g., Kettle, Microwave)
+        # Characteristics: rare ON events but very high power; emphasize ON detection
         return {
-            "alpha_on": 8.0,      # 极高ON权重，因为ON很稀少
-            "alpha_off": 0.3,     # 低OFF权重
-            "lambda_zero": 0.8,   # 高OFF惩罚
-            "lambda_off_hard": 1.5,  # 强OFF约束
-            "lambda_gate_cls": 0.8,  # 高门控分类权重
-            "lambda_energy": 0.05,   # 低能量约束（因为总能量低）
-            "description": "稀疏高功率设备：强调ON事件检测，严格OFF约束",
+            "alpha_on": 8.0,      # very high ON weight, because ON is rare
+            "alpha_off": 0.3,     # low OFF weight
+            "lambda_zero": 0.8,   # strong OFF penalty
+            "lambda_off_hard": 1.5,  # strong OFF constraint
+            "lambda_gate_cls": 0.8,  # high gate classification weight
+            "lambda_energy": 0.05,   # low energy constraint (total energy is small)
+            "description": "Sparse high-power device: emphasize ON-event detection and strict OFF constraints.",
         }
     
     elif device_type == "frequent_switching":
-        # 频繁开关设备（如Fridge）
-        # 特点：ON/OFF各约50%，频繁切换
+        # Frequently switching devices (e.g., fridge)
+        # Characteristics: duty_cycle around 50%, frequent ON/OFF transitions
         return {
             "alpha_on": 1.5,
             "alpha_off": 1.2,
@@ -234,12 +237,12 @@ def get_recommended_loss_params(device_type: str, stats: Dict[str, Any]) -> Dict
             "lambda_off_hard": 1.2,
             "lambda_gate_cls": 0.5,
             "lambda_energy": 0.25,
-            "description": "频繁开关设备：平衡ON/OFF权重，强化状态切换学习",
+            "description": "Frequent-switching device: balance ON/OFF and strengthen transition learning.",
         }
     
     elif device_type == "long_cycle":
-        # 长周期运行设备（如WashingMachine, Dishwasher）
-        # 特点：运行周期长，功率变化大
+        # Long-cycle devices (e.g., WashingMachine, Dishwasher)
+        # Characteristics: long cycles with large power variations
         return {
             "alpha_on": 3.0,
             "alpha_off": 1.0,
@@ -247,11 +250,11 @@ def get_recommended_loss_params(device_type: str, stats: Dict[str, Any]) -> Dict
             "lambda_off_hard": 0.5,
             "lambda_gate_cls": 0.3,
             "lambda_energy": 0.15,
-            "description": "长周期设备：中等权重平衡，关注功率变化趋势",
+            "description": "Long-cycle device: medium-weight balance, focus on power trends.",
         }
     
     elif device_type == "always_on":
-        # 常开设备
+        # Always-on devices
         return {
             "alpha_on": 1.0,
             "alpha_off": 3.0,
@@ -259,11 +262,11 @@ def get_recommended_loss_params(device_type: str, stats: Dict[str, Any]) -> Dict
             "lambda_off_hard": 0.2,
             "lambda_gate_cls": 0.1,
             "lambda_energy": 0.3,
-            "description": "常开设备：强调OFF事件检测（异常检测）",
+            "description": "Always-on device: emphasize OFF-event detection (anomaly detection).",
         }
     
     elif device_type == "sparse_medium_power":
-        # 稀疏中等功率
+        # Sparse medium-power devices
         return {
             "alpha_on": 5.0,
             "alpha_off": 0.8,
@@ -271,11 +274,11 @@ def get_recommended_loss_params(device_type: str, stats: Dict[str, Any]) -> Dict
             "lambda_off_hard": 1.0,
             "lambda_gate_cls": 0.5,
             "lambda_energy": 0.08,
-            "description": "稀疏中等功率设备",
+            "description": "Sparse medium-power device.",
         }
     
     else:
-        # 默认参数
+        # Default parameters
         return {
             "alpha_on": 3.0,
             "alpha_off": 1.0,
@@ -283,7 +286,7 @@ def get_recommended_loss_params(device_type: str, stats: Dict[str, Any]) -> Dict
             "lambda_off_hard": 0.5,
             "lambda_gate_cls": 0.3,
             "lambda_energy": 0.1,
-            "description": "默认参数",
+            "description": "Default parameters.",
         }
 
 
@@ -399,26 +402,26 @@ def main():
         print(f"📊 {app} [{device_type}]")
         print(f"{'─' * 40}")
         
-        # 核心指标
+        # Core metrics
         print(f"  Duty Cycle:        {stats.get('duty_cycle', 0):.2%}")
         print(f"  Peak Power:        {stats.get('peak_power', 0):.1f} W")
         print(f"  Mean ON Power:     {stats.get('mean_on_power', 0):.1f} W")
         print(f"  Mean ALL Power:    {stats.get('mean_all_power', 0):.1f} W")
-        
-        # ON事件统计
+
+        # ON-event statistics
         print(f"\n  ON Event Stats:")
         print(f"    Number of events:    {stats.get('n_on_events', 0)}")
         print(f"    Mean duration:       {stats.get('mean_event_duration', 0):.1f} samples")
         print(f"    Median duration:     {stats.get('median_event_duration', 0):.1f} samples")
-        
-        # 功率特性
+
+        # Power characteristics
         print(f"\n  Power Characteristics:")
         print(f"    Peak/Mean ratio:     {stats.get('peak_to_mean_ratio', 0):.2f}")
         print(f"    CV (ON):             {stats.get('cv_on', 0):.3f}")
         print(f"    Max power change:    {stats.get('max_power_change', 0):.1f} W")
         print(f"    Sparsity ratio:      {stats.get('sparsity_ratio', 0):.3f}")
-        
-        # 推荐参数
+
+        # Recommended parameters
         recommended = get_recommended_loss_params(device_type, stats)
         print(f"\n  📋 Recommended Loss Parameters:")
         print(f"    Description: {recommended.get('description', '')}")
@@ -431,11 +434,11 @@ def main():
     
     print(f"\n{'=' * 80}")
     print("Legend:")
-    print("  - sparse_high_power:    稀疏高功率设备（如Kettle, Microwave）")
-    print("  - frequent_switching:   频繁开关设备（如Fridge）")
-    print("  - long_cycle:           长周期运行设备（如WashingMachine）")
-    print("  - always_on:            常开设备")
-    print("  - sparse_medium_power:  稀疏中等功率设备")
+    print("  - sparse_high_power:    sparse high-power devices (e.g., Kettle, Microwave)")
+    print("  - frequent_switching:   frequent-switching devices (e.g., fridge)")
+    print("  - long_cycle:           long-cycle devices (e.g., WashingMachine)")
+    print("  - always_on:            always-on devices")
+    print("  - sparse_medium_power:  sparse medium-power devices")
     print("=" * 80)
 
 
