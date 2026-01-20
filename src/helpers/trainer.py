@@ -99,18 +99,6 @@ class EAECLoss(nn.Module):
 
 
 class GAEAECLoss(nn.Module):
-    """
-    Gate-Aware Energy-Aware Error Correction Loss.
-
-    Optimized for NILM problems to balance:
-    1. ON/OFF state imbalance
-    2. Non-zero outputs in OFF state (false positives)
-    3. Too-low outputs in ON state (missed detections / false negatives)
-    4. Explicit gate learning to strengthen device state recognition
-
-    Key improvement: add an ON missed-detection penalty to prevent the trivial
-    "all-zero output" strategy.
-    """
     def __init__(
         self,
         threshold=10.0,
@@ -291,6 +279,238 @@ class GAEAECLoss(nn.Module):
         return total_loss
 
 
+class GAEAECLossAuto(nn.Module):
+    def __init__(
+        self,
+        threshold=10.0,
+        alpha_on=3.0,
+        alpha_off=1.0,
+        soft_temp=10.0,
+        edge_eps=5.0,
+        energy_floor=1.0,
+        center_ratio=1.0,
+        off_margin=0.02,
+        gate_focal_gamma=2.0,
+        lambda_off_hard=0.1,
+        lambda_on_recall=0.3,
+        on_recall_margin=0.5,
+        lambda_gate_cls=0.1,
+    ):
+        super().__init__()
+        self.threshold = float(threshold)
+        self.alpha_on = float(alpha_on)
+        self.alpha_off = float(alpha_off)
+        self.soft_temp = float(soft_temp)
+        self.edge_eps = float(edge_eps)
+        self.energy_floor = float(energy_floor)
+        self.off_margin = float(off_margin)
+        self.gate_focal_gamma = float(gate_focal_gamma)
+        self.center_ratio = float(center_ratio)
+        self.lambda_off_hard = float(lambda_off_hard)
+        self.lambda_on_recall = float(lambda_on_recall)
+        self.on_recall_margin = float(on_recall_margin)
+        self.lambda_gate_cls = float(lambda_gate_cls)
+        self.base_loss = nn.SmoothL1Loss(reduction="none")
+        self.log_w_grad = nn.Parameter(torch.zeros(1))
+        self.log_w_energy = nn.Parameter(torch.zeros(1))
+        self.log_w_sparse = nn.Parameter(torch.tensor([-2.0]))
+        self.log_w_zero = nn.Parameter(torch.tensor([-2.0]))
+        self.log_w_off_fp = nn.Parameter(torch.zeros(1))
+        self.log_w_on_recall = nn.Parameter(torch.zeros(1))
+        self.log_w_gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, pred, target, gate=None):
+        pred = pred.float()
+        target = target.float()
+        time_len = pred.size(-1)
+        ratio = float(self.center_ratio)
+        if time_len > 1 and 0.0 < ratio < 1.0:
+            center_len = max(1, int(round(time_len * ratio)))
+            start = (time_len - center_len) // 2
+            end = start + center_len
+            pred = pred[..., start:end]
+            target = target[..., start:end]
+            if gate is not None:
+                gate = gate[..., start:end]
+        loss_point = self.base_loss(pred, target)
+        eps = 1e-6
+        thr = float(self.threshold)
+        temp = max(self.soft_temp, eps)
+        p_on_target = torch.sigmoid((target - thr) / temp)
+        p_off_target = 1.0 - p_on_target
+        hard_off_mask = (target <= thr).float()
+        hard_on_mask = (target > thr).float()
+        loss_on = (loss_point * p_on_target).sum() / (p_on_target.sum() + eps)
+        loss_off = (loss_point * p_off_target).sum() / (p_off_target.sum() + eps)
+        loss_main = self.alpha_on * loss_on + self.alpha_off * loss_off
+        if pred.size(-1) > 1:
+            d_pred = pred[..., 1:] - pred[..., :-1]
+            d_target = target[..., 1:] - target[..., :-1]
+            grad_point = self.base_loss(d_pred, d_target)
+            p_on_mid = torch.maximum(p_on_target[..., 1:], p_on_target[..., :-1])
+            edge_mask = (d_target.abs() > float(self.edge_eps)).float()
+            w_grad_mask = torch.maximum(p_on_mid, edge_mask)
+            loss_grad = (grad_point * w_grad_mask).sum() / (w_grad_mask.sum() + eps)
+        else:
+            loss_grad = pred.new_tensor(0.0)
+        energy_pred_on = (pred * p_on_target).sum(dim=-1)
+        energy_target_on = (target * p_on_target).sum(dim=-1)
+        floor = max(float(self.energy_floor), 1e-6)
+        denom = energy_target_on.abs() + floor
+        loss_energy_sample = (energy_pred_on - energy_target_on).abs() / denom
+        on_coverage = p_on_target.sum(dim=-1)
+        min_on_steps = max(1.0, 0.02 * float(pred.size(-1)))
+        energy_mask = (on_coverage > min_on_steps).float()
+        if energy_mask.sum() > 0:
+            loss_energy = (loss_energy_sample * energy_mask).sum() / (energy_mask.sum() + eps)
+        else:
+            loss_energy = pred.new_tensor(0.0)
+        if p_on_target.sum() > 0:
+            sparse_penalty = (pred.abs() * p_on_target).sum() / (p_on_target.sum() + eps)
+        else:
+            sparse_penalty = pred.new_tensor(0.0)
+        if hard_off_mask.sum() > 0:
+            margin = max(float(self.off_margin), 0.0)
+            pred_excess = torch.relu(pred.abs() - margin)
+            off_fp_penalty = (pred_excess * hard_off_mask).sum() / (hard_off_mask.sum() + eps)
+        else:
+            off_fp_penalty = pred.new_tensor(0.0)
+        if hard_on_mask.sum() > 0:
+            recall_margin = max(float(self.on_recall_margin), 0.0)
+            min_expected = target * recall_margin
+            on_shortfall = torch.relu(min_expected - pred)
+            on_fn_penalty = (on_shortfall * hard_on_mask).sum() / (hard_on_mask.sum() + eps)
+        else:
+            on_fn_penalty = pred.new_tensor(0.0)
+        if gate is not None:
+            gate_target = hard_on_mask
+            gate_prob = torch.sigmoid(gate.float())
+            gate_prob = torch.clamp(gate_prob, eps, 1.0 - eps)
+            on_ratio = hard_on_mask.mean()
+            off_ratio = 1.0 - on_ratio
+            weight_on = torch.clamp(off_ratio / (on_ratio + eps), 1.0, 5.0)
+            weight_off = 1.0
+            bce_on = -torch.log(gate_prob) * gate_target * weight_on
+            bce_off = -torch.log(1.0 - gate_prob) * (1.0 - gate_target) * weight_off
+            gamma = max(float(self.gate_focal_gamma), 0.0)
+            if gamma > 0:
+                pt = gate_prob * gate_target + (1.0 - gate_prob) * (1.0 - gate_target)
+                focal_weight = (1.0 - pt) ** gamma
+                gate_cls_loss = (focal_weight * (bce_on + bce_off)).mean()
+            else:
+                gate_cls_loss = (bce_on + bce_off).mean()
+        else:
+            gate_cls_loss = pred.new_tensor(0.0)
+        w_grad = F.softplus(self.log_w_grad)
+        w_energy = F.softplus(self.log_w_energy)
+        w_sparse = F.softplus(self.log_w_sparse)
+        w_zero = F.softplus(self.log_w_zero)
+        w_off_fp = F.softplus(self.log_w_off_fp)
+        w_on_recall = F.softplus(self.log_w_on_recall)
+        w_gate = F.softplus(self.log_w_gate)
+        w_grad = torch.clamp(w_grad, 0.0, 5.0)
+        w_energy = torch.clamp(w_energy, 0.0, 5.0)
+        w_sparse = torch.clamp(w_sparse, 0.0, 2.0)
+        w_zero = torch.clamp(w_zero, 0.0, 2.0)
+        w_off_fp = torch.clamp(
+            w_off_fp * max(float(self.lambda_off_hard), 0.0), 0.0, 5.0
+        )
+        w_on_recall = torch.clamp(
+            w_on_recall * max(float(self.lambda_on_recall), 0.0), 0.0, 5.0
+        )
+        w_gate = torch.clamp(
+            w_gate * max(float(self.lambda_gate_cls), 0.0), 0.0, 5.0
+        )
+        total_loss = (
+            loss_main
+            + w_grad * loss_grad
+            + w_energy * loss_energy
+            + w_sparse * sparse_penalty
+            + w_zero * (pred.abs() * hard_off_mask).sum() / (hard_off_mask.sum() + eps)
+            + w_off_fp * off_fp_penalty
+            + w_on_recall * on_fn_penalty
+            + w_gate * gate_cls_loss
+        )
+        return total_loss
+
+
+class PerDeviceGAEAECLossAuto(nn.Module):
+    def __init__(self, per_device_params, base_params):
+        super().__init__()
+        self.losses = nn.ModuleList()
+        n = len(per_device_params) if per_device_params is not None else 0
+        allowed_keys = {
+            "threshold",
+            "alpha_on",
+            "alpha_off",
+            "soft_temp",
+            "edge_eps",
+            "energy_floor",
+            "center_ratio",
+            "off_margin",
+            "gate_focal_gamma",
+            "lambda_off_hard",
+            "lambda_on_recall",
+            "on_recall_margin",
+            "lambda_gate_cls",
+        }
+        for i in range(max(n, 1)):
+            params = {k: v for k, v in base_params.items() if k in allowed_keys}
+            if per_device_params is not None and i < len(per_device_params):
+                p = per_device_params[i]
+                if isinstance(p, dict):
+                    for k, v in p.items():
+                        if k in allowed_keys:
+                            params[k] = v
+            self.losses.append(GAEAECLossAuto(**params))
+
+    def forward(self, pred, target, gate=None):
+        if pred.dim() < 3:
+            return self.losses[0](pred, target, gate=gate)
+        C = int(pred.size(1))
+        total = pred.new_tensor(0.0)
+        count = 0
+        for c in range(min(C, len(self.losses))):
+            p_c = pred[:, c : c + 1, :]
+            t_c = target[:, c : c + 1, :] if target is not None else None
+            g_c = gate[:, c : c + 1, :] if gate is not None else None
+            total = total + self.losses[c](p_c, t_c, gate=g_c)
+            count += 1
+        if count == 0:
+            return pred.new_tensor(0.0)
+        return total / float(count)
+
+
+class PerDeviceGAEAECLoss(nn.Module):
+    def __init__(self, per_device_params, base_params):
+        super().__init__()
+        self.losses = nn.ModuleList()
+        n = len(per_device_params) if per_device_params is not None else 0
+        for i in range(max(n, 1)):
+            params = base_params.copy()
+            if per_device_params is not None and i < len(per_device_params):
+                p = per_device_params[i]
+                if isinstance(p, dict):
+                    params.update(p)
+            self.losses.append(GAEAECLoss(**params))
+
+    def forward(self, pred, target, gate=None):
+        if pred.dim() < 3:
+            return self.losses[0](pred, target, gate=gate)
+        C = int(pred.size(1))
+        total = pred.new_tensor(0.0)
+        count = 0
+        for c in range(min(C, len(self.losses))):
+            p_c = pred[:, c : c + 1, :]
+            t_c = target[:, c : c + 1, :] if target is not None else None
+            g_c = gate[:, c : c + 1, :] if gate is not None else None
+            total = total + self.losses[c](p_c, t_c, gate=g_c)
+            count += 1
+        if count == 0:
+            return pred.new_tensor(0.0)
+        return total / float(count)
+
+
 class SeqToSeqLightningModule(pl.LightningModule):
     def __init__(
         self,
@@ -324,6 +544,11 @@ class SeqToSeqLightningModule(pl.LightningModule):
         gate_soft_scale=1.0,
         gate_floor=0.1,
         gate_duty_weight=0.0,
+        train_crop_len=0,
+        train_crop_ratio=0.0,
+        train_num_crops=1,
+        train_crop_event_bias=0.0,
+        anti_collapse_weight=0.0,
     ):
         super().__init__()
         self.model = model
@@ -359,11 +584,76 @@ class SeqToSeqLightningModule(pl.LightningModule):
         self.gate_soft_scale = float(gate_soft_scale)
         self.gate_floor = float(gate_floor)
         self.gate_duty_weight = float(gate_duty_weight)
+        self.train_crop_len = int(train_crop_len) if train_crop_len is not None else 0
+        self.train_crop_ratio = float(train_crop_ratio) if train_crop_ratio is not None else 0.0
+        self.train_num_crops = int(train_num_crops) if train_num_crops is not None else 1
+        self.train_crop_event_bias = float(train_crop_event_bias) if train_crop_event_bias is not None else 0.0
+        self.anti_collapse_weight = float(anti_collapse_weight)
         self.best_val_loss = float("inf")
         self.best_epoch = -1
         self.best_model_state_dict = None
         self.loss_train_history = []
         self.loss_valid_history = []
+
+    def _maybe_multi_crop(self, ts_agg, target, state):
+        k = max(int(self.train_num_crops), 1)
+        crop_len = int(self.train_crop_len) if self.train_crop_len is not None else 0
+        if ts_agg.ndim != 3:
+            return ts_agg, target, state, None
+        L = int(ts_agg.size(-1))
+        if crop_len <= 0:
+            ratio = float(self.train_crop_ratio)
+            if 0.0 < ratio < 1.0:
+                crop_len = max(1, int(round(float(L) * ratio)))
+        if k <= 1 or crop_len <= 0:
+            return ts_agg, target, state, None
+        if crop_len >= L:
+            return ts_agg, target, state, None
+        if state is None or state.ndim != 3 or state.size(-1) != L:
+            return ts_agg, target, state, None
+
+        B = int(ts_agg.size(0))
+        Cx = int(ts_agg.size(1))
+        Cy = int(target.size(1)) if target is not None and target.ndim == 3 else 0
+        device = ts_agg.device
+        max_start = L - crop_len
+        if max_start <= 0:
+            return ts_agg, target, state, None
+
+        on_any = (state > 0.5).any(dim=1).float()
+        w = on_any + 1e-6
+        on_idx = torch.multinomial(w, num_samples=k, replacement=True)
+        rand_start = torch.randint(0, max_start + 1, (B, k), device=device)
+        start_event = torch.clamp(on_idx - (crop_len // 2), min=0, max=max_start)
+        p = float(self.train_crop_event_bias)
+        if p <= 0.0:
+            starts = rand_start
+        elif p >= 1.0:
+            starts = start_event
+        else:
+            use_event = torch.rand((B, k), device=device) < p
+            starts = torch.where(use_event, start_event, rand_start)
+        starts = starts.reshape(-1)
+
+        ar = torch.arange(crop_len, device=device).view(1, -1)
+        idx = starts.view(-1, 1) + ar
+
+        ts_rep = ts_agg.repeat_interleave(k, dim=0)
+        idx_x = idx.view(-1, 1, crop_len).expand(-1, Cx, -1)
+        ts_crop = torch.gather(ts_rep, dim=-1, index=idx_x)
+
+        target_crop = target
+        if target is not None and target.ndim == 3 and Cy > 0 and target.size(-1) == L:
+            y_rep = target.repeat_interleave(k, dim=0)
+            idx_y = idx.view(-1, 1, crop_len).expand(-1, Cy, -1)
+            target_crop = torch.gather(y_rep, dim=-1, index=idx_y)
+
+        state_rep = state.repeat_interleave(k, dim=0)
+        idx_s = idx.view(-1, 1, crop_len).expand(-1, int(state.size(1)), -1)
+        state_crop = torch.gather(state_rep, dim=-1, index=idx_s)
+
+        window_label = (state_crop.sum(dim=-1) > 0).float()
+        return ts_crop, target_crop, state_crop, window_label
 
     def _compute_output_stats_alpha(self, epoch_idx: int) -> float:
         if self.output_stats_mean_max <= 0.0 and self.output_stats_std_max <= 0.0:
@@ -388,7 +678,10 @@ class SeqToSeqLightningModule(pl.LightningModule):
         )
 
     def forward(self, ts_agg):
-        if isinstance(self.criterion, GAEAECLoss) and hasattr(self.model, "forward_with_gate"):
+        if isinstance(
+            self.criterion,
+            (GAEAECLoss, GAEAECLossAuto, PerDeviceGAEAECLoss, PerDeviceGAEAECLossAuto),
+        ) and hasattr(self.model, "forward_with_gate"):
             power, gate, _ = self.model.forward_with_gate(ts_agg)
             pred, _gate_prob = self._apply_soft_gate(power, gate)
             return pred
@@ -412,6 +705,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
 
     def _apply_soft_gate(self, power, gate_logits):
         gate_floor = min(max(self.gate_floor, 0.0), 1.0)
+        gate_floor = max(gate_floor, 1e-3)
         soft_scale = max(self.gate_soft_scale, 0.0)
         gate_prob = torch.sigmoid(gate_logits.float() * soft_scale)
         return power * (gate_floor + (1.0 - gate_floor) * gate_prob), gate_prob
@@ -451,32 +745,16 @@ class SeqToSeqLightningModule(pl.LightningModule):
         min_len = min(int(self.zero_run_kernel), target.size(-1))
         if min_len <= 1:
             return pred.new_tensor(0.0)
-        long_zero_mask = torch.zeros_like(zero_mask)
         B, C, L = zero_mask.shape
-        for b in range(B):
-            for c in range(C):
-                row = zero_mask[b, c]  # [L]
-                if row.sum() <= 0:
-                    continue
-                diff = row[1:] - row[:-1]
-                starts = (diff == 1).nonzero(as_tuple=False).flatten() + 1
-                ends = (diff == -1).nonzero(as_tuple=False).flatten() + 1
-                if row[0] > 0.5:
-                    starts = torch.cat(
-                        [torch.tensor([0], device=row.device, dtype=starts.dtype), starts]
-                    )
-                if row[-1] > 0.5:
-                    ends = torch.cat(
-                        [ends, torch.tensor([L], device=row.device, dtype=ends.dtype)]
-                    )
-                if starts.numel() == 0 or ends.numel() == 0:
-                    continue
-                n_seg = min(starts.numel(), ends.numel())
-                starts = starts[:n_seg]
-                ends = ends[:n_seg]
-                for s, e in zip(starts.tolist(), ends.tolist()):
-                    if e - s >= min_len:
-                        long_zero_mask[b, c, s:e] = 1.0
+        z = zero_mask.view(B * C, 1, L)
+        kernel = torch.ones((1, 1, min_len), device=z.device, dtype=z.dtype)
+        counts = F.conv1d(z, kernel, stride=1, padding=0)
+        full_zero = (counts >= float(min_len) - 0.5).to(dtype=z.dtype)
+        if full_zero.sum() <= 0:
+            return pred.new_tensor(0.0)
+        long_mask = F.conv_transpose1d(full_zero, kernel, stride=1, padding=0)
+        long_mask = (long_mask > 0.0).to(dtype=z.dtype)
+        long_zero_mask = long_mask.view(B, C, L)
         ratio_thr = float(getattr(self, "zero_run_ratio", 0.0))
         if ratio_thr > 0.0:
             mostly_off = (zero_mask.mean(dim=-1, keepdim=True) >= ratio_thr).float()
@@ -595,6 +873,33 @@ class SeqToSeqLightningModule(pl.LightningModule):
         penalty = (excess * off_mask).sum() / (off_mask.sum() + eps)
         return penalty * float(self.off_state_penalty_weight)
 
+    def _anti_collapse_penalty(self, pred, target):
+        if self.anti_collapse_weight <= 0.0:
+            return pred.new_tensor(0.0)
+        if target is None:
+            return pred.new_tensor(0.0)
+        eps = 1e-6
+        thr = max(float(self.loss_threshold), 0.0)
+        target = target.float().abs()
+        pred = pred.float().abs()
+        if thr > 0.0:
+            on_mask = (target >= thr).float()
+        else:
+            k = max(1, int(target.size(-1) * 0.1))
+            topk, _ = torch.topk(target, k, dim=-1)
+            min_top = topk[..., -1:].detach()
+            on_mask = (target >= min_top).float()
+        energy_pred = (pred * on_mask).sum(dim=-1)
+        energy_target = (target * on_mask).sum(dim=-1)
+        valid = (energy_target > 0.0).float()
+        if valid.sum() <= 0:
+            return pred.new_tensor(0.0)
+        ratio = energy_pred / (energy_target + eps)
+        r_min = 0.05
+        deficit = torch.relu(r_min - ratio) * valid
+        penalty = deficit.sum() / (valid.sum() + eps)
+        return penalty
+
     def _compute_all_penalties(self, pred, target, state, ts_agg):
         """Compute all auxiliary penalties and return them as a dict."""
         penalties = {}
@@ -613,6 +918,9 @@ class SeqToSeqLightningModule(pl.LightningModule):
         penalties["off_state"] = torch.nan_to_num(
             self._off_state_penalty(pred, state), nan=0.0, posinf=1e4, neginf=-1e4
         )
+        penalties["anti_collapse"] = torch.nan_to_num(
+            self._anti_collapse_penalty(pred, target), nan=0.0, posinf=1e4, neginf=-1e4
+        )
         return penalties
 
     def training_step(self, batch, batch_idx):
@@ -624,9 +932,13 @@ class SeqToSeqLightningModule(pl.LightningModule):
         ts_agg = torch.nan_to_num(ts_agg.float(), nan=0.0, posinf=0.0, neginf=0.0)
         target = torch.nan_to_num(appl.float(), nan=0.0, posinf=0.0, neginf=0.0)
         state = torch.nan_to_num(state.float(), nan=0.0, posinf=0.0, neginf=0.0)
-        if isinstance(self.criterion, GAEAECLoss) and hasattr(
-            self.model, "forward_with_gate"
-        ):
+        ts_agg, target, state, window_label_crop = self._maybe_multi_crop(ts_agg, target, state)
+        if window_label_crop is not None:
+            window_label = window_label_crop
+        if isinstance(
+            self.criterion,
+            (GAEAECLoss, GAEAECLossAuto, PerDeviceGAEAECLoss, PerDeviceGAEAECLossAuto),
+        ) and hasattr(self.model, "forward_with_gate"):
             power, gate, cls_logits = self.model.forward_with_gate(ts_agg)
             power = torch.nan_to_num(power, nan=0.0, posinf=1e4, neginf=-1e4)
             gate = torch.nan_to_num(gate, nan=0.0, posinf=1e4, neginf=-1e4)
@@ -673,6 +985,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
             + self.gate_cls_weight * gate_cls_loss
             + self.gate_window_weight * gate_window_loss
             + self.gate_duty_weight * gate_duty_loss
+            + self.anti_collapse_weight * penalties["anti_collapse"]
         )
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
@@ -693,9 +1006,10 @@ class SeqToSeqLightningModule(pl.LightningModule):
         except Exception:
             state = None
         cls_logits = None
-        if isinstance(self.criterion, GAEAECLoss) and hasattr(
-            self.model, "forward_with_gate"
-        ):
+        if isinstance(
+            self.criterion,
+            (GAEAECLoss, GAEAECLossAuto, PerDeviceGAEAECLoss, PerDeviceGAEAECLossAuto),
+        ) and hasattr(self.model, "forward_with_gate"):
             power, gate, cls_logits = self.model.forward_with_gate(ts_agg)
             power = torch.nan_to_num(power, nan=0.0, posinf=1e4, neginf=-1e4)
             gate = torch.nan_to_num(gate, nan=0.0, posinf=1e4, neginf=-1e4)
@@ -727,6 +1041,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
             + penalties["off_state_long"]
             + penalties["off_state"]
             + self.neg_penalty_weight * penalties["neg"]
+            + self.anti_collapse_weight * penalties["anti_collapse"]
         )
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)

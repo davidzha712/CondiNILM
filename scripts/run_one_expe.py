@@ -137,6 +137,67 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     on_mask = status_bin.reshape(-1) > 0
     duty_cycle = float(on_mask.mean())
 
+    try:
+        n_ch = int(data.shape[1] - 1)
+    except Exception:
+        n_ch = 1
+    if n_ch > 1:
+        try:
+            names = []
+            members = getattr(expes_config, "appliance_group_members", None)
+            if isinstance(members, Sequence) and not isinstance(members, (str, bytes)):
+                names = [str(x) for x in list(members)]
+            apps = getattr(expes_config, "app", None)
+            if not names and isinstance(apps, Sequence) and not isinstance(apps, (str, bytes)):
+                names = [str(x) for x in list(apps)]
+            if not names:
+                names = [str(i) for i in range(n_ch)]
+            names = names[:n_ch] + [str(i) for i in range(len(names), n_ch)]
+            per_device = {}
+            per_device_params = {}
+            for i in range(n_ch):
+                p_i = data[:, 1 + i, 0, :].astype(np.float32)
+                s_i = data[:, 1 + i, 1, :].astype(np.float32)
+                p_i = _maybe_denormalize_power_by_cutoff(p_i, expes_config)
+                s_bin_i = (s_i > 0.5).astype(np.int8)
+                flat_i = p_i.reshape(-1)
+                if flat_i.size == 0:
+                    continue
+                on_i = s_bin_i.reshape(-1) > 0
+                duty_i = float(on_i.mean())
+                on_vals = flat_i[on_i] if on_i.any() else flat_i
+                peak_i = float(on_vals.max()) if on_vals.size else 0.0
+                mean_on_i = float(on_vals.mean()) if on_vals.size else 0.0
+                std_on_i = float(on_vals.std()) if on_vals.size > 1 else 0.0
+                cv_i = float(std_on_i / (mean_on_i + 1e-6))
+                try:
+                    if s_bin_i.ndim == 2 and s_bin_i.shape[0] > 0 and s_bin_i.shape[1] > 1:
+                        diff_2d = np.diff(s_bin_i, axis=1)
+                        n_events_i = int((diff_2d == 1).sum())
+                    else:
+                        n_events_i = 0
+                except Exception:
+                    n_events_i = 0
+                mean_dur_i = estimate_mean_run_length(s_bin_i, max_rows=4000)
+                total_i = int(s_bin_i.size)
+                dev_type_i = classify_device_type(
+                    duty_i,
+                    peak_i,
+                    mean_on_i,
+                    cv_i,
+                    mean_dur_i,
+                    int(n_events_i),
+                    total_i,
+                )
+                per_device[names[i]] = dev_type_i
+                per_device_params[names[i]] = get_device_loss_params(dev_type_i, duty_i)
+            if per_device:
+                expes_config["device_type_per_device"] = per_device
+            if per_device_params:
+                expes_config["loss_params_per_device"] = per_device_params
+        except Exception:
+            pass
+
     # ============== Basic statistics ==============
     on_values = flat[on_mask] if on_mask.any() else flat
     off_values = flat[~on_mask] if (~on_mask).any() else flat
@@ -237,6 +298,34 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     # 3. Set a reasonable off_margin that allows small noise
 
     device_params = get_device_loss_params(device_type, duty_cycle)
+    try:
+        is_multi = False
+        app_name = str(getattr(expes_config, "appliance", "") or "")
+        if app_name.lower() == "multi":
+            is_multi = True
+        else:
+            app_val = getattr(expes_config, "app", None)
+            if isinstance(app_val, Sequence) and not isinstance(app_val, (str, bytes)):
+                if len(app_val) > 1:
+                    is_multi = True
+        if is_multi:
+            lam_off = float(device_params.get("lambda_off_hard", 0.0))
+            lam_on = float(device_params.get("lambda_on_recall", 0.0))
+            lam_gate = float(device_params.get("lambda_gate_cls", 0.0))
+            device_params["lambda_off_hard"] = max(0.02, lam_off * 0.4)
+            device_params["lambda_on_recall"] = min(3.0, lam_on * 1.5)
+            device_params["lambda_gate_cls"] = min(0.3, lam_gate * 1.2)
+            try:
+                cur_anti = float(getattr(expes_config, "anti_collapse_weight", 0.0) or 0.0)
+            except Exception:
+                cur_anti = 0.0
+            expes_config["anti_collapse_weight"] = max(cur_anti, 0.5)
+            expes_config["state_zero_penalty_weight"] = 0.0
+            expes_config["off_high_agg_penalty_weight"] = 0.0
+            expes_config["off_state_penalty_weight"] = 0.0
+            expes_config["off_state_long_penalty_weight"] = 0.0
+    except Exception:
+        pass
     alpha_on = device_params["alpha_on"]
     alpha_off = device_params["alpha_off"]
     lambda_zero = device_params["lambda_zero"]
@@ -399,6 +488,13 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                 parts.append(f"{k}={getattr(expes_config, k)}")
         if parts:
             logging.info("AUTO_CFG: " + ";".join(parts))
+        per_device_params = getattr(expes_config, "loss_params_per_device", None)
+        if isinstance(per_device_params, dict) and per_device_params:
+            for name, params in per_device_params.items():
+                if not isinstance(params, dict):
+                    continue
+                kv = [f"{k}={v}" for k, v in params.items()]
+                logging.info("AUTO_CFG_PER_DEVICE[%s]: %s", str(name), ";".join(kv))
     except Exception as e:
         logging.debug("_configure_nilm_loss_hyperparams: logging AUTO_CFG failed: %s", e)
 

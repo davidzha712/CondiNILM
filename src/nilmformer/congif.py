@@ -28,6 +28,10 @@ class NILMFormerConfig:
     n_head: int = 8
     norm_eps: float = 1e-5
     mask_diagonal: bool = True
+    use_freq_features: bool = True
+    use_elec_features: bool = True
+    use_film: bool = True
+    film_hidden_dim: int = 32
 
     def __post_init__(self):
         self.c_in = int(self.c_in)
@@ -47,3 +51,7 @@ class NILMFormerConfig:
         self.n_head = int(self.n_head)
         self.norm_eps = float(self.norm_eps)
         self.mask_diagonal = bool(self.mask_diagonal)
+        self.use_freq_features = bool(self.use_freq_features)
+        self.use_elec_features = bool(self.use_elec_features)
+        self.use_film = bool(self.use_film)
+        self.film_hidden_dim = int(self.film_hidden_dim)

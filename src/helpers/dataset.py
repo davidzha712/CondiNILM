@@ -337,6 +337,7 @@ class TSDatasetScaling(torch.utils.data.Dataset):
         freq="30T",
         cosinbase=True,
         newRange=(-1, 1),
+        exo_cache_size=2048,
     ):
         self.scale_data = scale_data
         self.inst_scaling = inst_scaling
@@ -346,6 +347,7 @@ class TSDatasetScaling(torch.utils.data.Dataset):
         self.cosinbase = cosinbase
         self.newRange = newRange
         self.L = X.shape[-1]
+        self.exo_cache_size = exo_cache_size
 
         if st_date is not None:
             assert list_exo_variables is not None and len(list_exo_variables) > 0, (
@@ -356,6 +358,11 @@ class TSDatasetScaling(torch.utils.data.Dataset):
             )
 
             self.st_date = st_date[mask_date].values.flatten()
+            self._st_date64 = np.asarray(self.st_date, dtype="datetime64[ns]")
+            self._freq_td64 = pd.Timedelta(self.freq).to_timedelta64()
+            self._time_offsets = np.arange(self.L, dtype=np.int64) * self._freq_td64
+            self._exo_cache = {}
+            self._exo_cache_keys = []
 
             if self.cosinbase:
                 self.n_var = 2 * len(self.list_exo_variables)
@@ -363,6 +370,11 @@ class TSDatasetScaling(torch.utils.data.Dataset):
                 self.n_var = len(self.list_exo_variables)
         else:
             self.n_var = None
+            self._st_date64 = None
+            self._freq_td64 = None
+            self._time_offsets = None
+            self._exo_cache = None
+            self._exo_cache_keys = None
 
         if isinstance(X, pd.core.frame.DataFrame):
             X = X.values
@@ -391,65 +403,80 @@ class TSDatasetScaling(torch.utils.data.Dataset):
             self.labels = labels
 
     def _create_exogene(self, idx):
-        np_extra = np.zeros((self.n_var, self.L)).astype(np.float32)
-        tmp = pd.date_range(start=self.st_date[idx], periods=self.L, freq=self.freq)
+        cached = self._exo_cache.get(idx)
+        if cached is not None:
+            return cached
+
+        dt = self._st_date64[idx] + self._time_offsets
+        month = (dt.astype("datetime64[M]").astype(np.int64) % 12) + 1
+        dom = (
+            (dt.astype("datetime64[D]") - dt.astype("datetime64[M]"))
+            .astype("timedelta64[D]")
+            .astype(np.int64)
+            + 1
+        )
+        dow = (dt.astype("datetime64[D]").astype(np.int64) + 3) % 7
+        hour = dt.astype("datetime64[h]").astype(np.int64) % 24
+        minute = dt.astype("datetime64[m]").astype(np.int64) % 60
+
+        np_extra = np.zeros((self.n_var, self.L), dtype=np.float32)
 
         k = 0
         for exo_var in self.list_exo_variables:
             if exo_var == "month":
                 if self.cosinbase:
-                    np_extra[k, :] = np.sin(2 * np.pi * (tmp.month.values - 1) / 12.0)
+                    np_extra[k, :] = np.sin(2 * np.pi * (month - 1) / 12.0)
                     np_extra[k + 1, :] = np.cos(
-                        2 * np.pi * (tmp.month.values - 1) / 12.0
+                        2 * np.pi * (month - 1) / 12.0
                     )
                     k += 2
                 else:
                     np_extra[k, :] = self._normalize(
-                        tmp.month.values, xmin=1, xmax=12, newRange=self.newRange
+                        month, xmin=1, xmax=12, newRange=self.newRange
                     )
                     k += 1
             elif exo_var == "dom":
                 if self.cosinbase:
-                    np_extra[k, :] = np.sin(2 * np.pi * (tmp.day.values - 1) / 31.0)
-                    np_extra[k + 1, :] = np.cos(2 * np.pi * (tmp.day.values - 1) / 31.0)
+                    np_extra[k, :] = np.sin(2 * np.pi * (dom - 1) / 31.0)
+                    np_extra[k + 1, :] = np.cos(2 * np.pi * (dom - 1) / 31.0)
                     k += 2
                 else:
                     np_extra[k, :] = self._normalize(
-                        tmp.month.values, xmin=1, xmax=12, newRange=self.newRange
+                        dom, xmin=1, xmax=31, newRange=self.newRange
                     )
                     k += 1
             elif exo_var == "dow":
                 if self.cosinbase:
                     np_extra[k, :] = np.sin(
-                        2 * np.pi * (tmp.dayofweek.values - 1) / 7.0
+                        2 * np.pi * (dow - 1) / 7.0
                     )
                     np_extra[k + 1, :] = np.cos(
-                        2 * np.pi * (tmp.dayofweek.values - 1) / 7.0
+                        2 * np.pi * (dow - 1) / 7.0
                     )
                     k += 2
                 else:
                     np_extra[k, :] = self._normalize(
-                        tmp.month.values, xmin=1, xmax=7, newRange=self.newRange
+                        dow, xmin=1, xmax=7, newRange=self.newRange
                     )
                     k += 1
             elif exo_var == "hour":
                 if self.cosinbase:
-                    np_extra[k, :] = np.sin(2 * np.pi * tmp.hour.values / 24.0)
-                    np_extra[k + 1, :] = np.cos(2 * np.pi * tmp.hour.values / 24.0)
+                    np_extra[k, :] = np.sin(2 * np.pi * hour / 24.0)
+                    np_extra[k + 1, :] = np.cos(2 * np.pi * hour / 24.0)
                     k += 2
                 else:
                     np_extra[k, :] = self._normalize(
-                        tmp.month.values, xmin=0, xmax=24, newRange=self.newRange
+                        hour, xmin=0, xmax=24, newRange=self.newRange
                     )
                     k += 1
             elif exo_var == "minute":
                 if self.cosinbase:
-                    np_extra[k, :] = np.sin(2 * np.pi * tmp.minute.values / 60.0)
-                    np_extra[k + 1, :] = np.cos(2 * np.pi * tmp.minute.values / 60.0)
+                    np_extra[k, :] = np.sin(2 * np.pi * minute / 60.0)
+                    np_extra[k + 1, :] = np.cos(2 * np.pi * minute / 60.0)
                     k += 2
                 else:
-                    np_extra[k, :] = self.normalize(
-                        tmp.minute.values, xmin=0, xmax=60, newRange=self.newRange
+                    np_extra[k, :] = self._normalize(
+                        minute, xmin=0, xmax=60, newRange=self.newRange
                     )
                     k += 1
             else:
@@ -458,6 +485,13 @@ class TSDatasetScaling(torch.utils.data.Dataset):
                         exo_var
                     )
                 )
+
+        if self.exo_cache_size > 0:
+            if len(self._exo_cache_keys) >= self.exo_cache_size:
+                old = self._exo_cache_keys.pop(0)
+                self._exo_cache.pop(old, None)
+            self._exo_cache[idx] = np_extra
+            self._exo_cache_keys.append(idx)
 
         return np_extra
 
@@ -521,12 +555,14 @@ class NILMDataset(torch.utils.data.Dataset):
         cosinbase=True,
         newRange=(-1, 1),
         inst_scaling=False,
+        exo_cache_size=2048,
     ):
         self.samples = X
 
         self.pretraining = pretraining
         self.use_temperature = use_temperature
         self.inst_scaling = inst_scaling
+        self.exo_cache_size = exo_cache_size
 
         self.mask_date = mask_date
         self.freq = freq
@@ -547,6 +583,11 @@ class NILMDataset(torch.utils.data.Dataset):
             )
 
             self.st_date = st_date[mask_date].values.flatten()
+            self._st_date64 = np.asarray(self.st_date, dtype="datetime64[ns]")
+            self._freq_td64 = pd.Timedelta(self.freq).to_timedelta64()
+            self._time_offsets = np.arange(self.L, dtype=np.int64) * self._freq_td64
+            self._exo_cache = {}
+            self._exo_cache_keys = []
 
             if self.cosinbase:
                 self.n_var = 2 * len(self.list_exo_variables)
@@ -554,6 +595,11 @@ class NILMDataset(torch.utils.data.Dataset):
                 self.n_var = len(self.list_exo_variables)
         else:
             self.n_var = None
+            self._st_date64 = None
+            self._freq_td64 = None
+            self._time_offsets = None
+            self._exo_cache = None
+            self._exo_cache_keys = None
 
         if cam is not None:
             self.cam = cam
@@ -563,59 +609,74 @@ class NILMDataset(torch.utils.data.Dataset):
             self.cam = None
 
     def _create_exogene(self, idx):
-        np_extra = np.zeros((self.n_var, self.L)).astype(np.float32)
-        tmp = pd.date_range(start=self.st_date[idx], periods=self.L, freq=self.freq)
+        cached = self._exo_cache.get(idx)
+        if cached is not None:
+            return cached
+
+        dt = self._st_date64[idx] + self._time_offsets
+        month = (dt.astype("datetime64[M]").astype(np.int64) % 12) + 1
+        dom = (
+            (dt.astype("datetime64[D]") - dt.astype("datetime64[M]"))
+            .astype("timedelta64[D]")
+            .astype(np.int64)
+            + 1
+        )
+        dow = (dt.astype("datetime64[D]").astype(np.int64) + 3) % 7
+        hour = dt.astype("datetime64[h]").astype(np.int64) % 24
+        minute = dt.astype("datetime64[m]").astype(np.int64) % 60
+
+        np_extra = np.zeros((self.n_var, self.L), dtype=np.float32)
 
         k = 0
         for exo_var in self.list_exo_variables:
             if exo_var == "month":
                 if self.cosinbase:
-                    np_extra[k, :] = np.sin(2 * np.pi * tmp.month.values / 12.0)
-                    np_extra[k + 1, :] = np.cos(2 * np.pi * tmp.month.values / 12.0)
+                    np_extra[k, :] = np.sin(2 * np.pi * month / 12.0)
+                    np_extra[k + 1, :] = np.cos(2 * np.pi * month / 12.0)
                     k += 2
                 else:
                     np_extra[k, :] = self._normalize(
-                        tmp.month.values, xmin=1, xmax=12, newRange=self.newRange
+                        month, xmin=1, xmax=12, newRange=self.newRange
                     )
                     k += 1
             elif exo_var == "dom":
                 if self.cosinbase:
-                    np_extra[k, :] = np.sin(2 * np.pi * tmp.day.values / 31.0)
-                    np_extra[k + 1, :] = np.cos(2 * np.pi * tmp.day.values / 31.0)
+                    np_extra[k, :] = np.sin(2 * np.pi * dom / 31.0)
+                    np_extra[k + 1, :] = np.cos(2 * np.pi * dom / 31.0)
                     k += 2
                 else:
                     np_extra[k, :] = self._normalize(
-                        tmp.day.values, xmin=1, xmax=31, newRange=self.newRange
+                        dom, xmin=1, xmax=31, newRange=self.newRange
                     )
                     k += 1
             elif exo_var == "dow":
                 if self.cosinbase:
-                    np_extra[k, :] = np.sin(2 * np.pi * tmp.dayofweek.values / 7.0)
-                    np_extra[k + 1, :] = np.cos(2 * np.pi * tmp.dayofweek.values / 7.0)
+                    np_extra[k, :] = np.sin(2 * np.pi * dow / 7.0)
+                    np_extra[k + 1, :] = np.cos(2 * np.pi * dow / 7.0)
                     k += 2
                 else:
                     np_extra[k, :] = self._normalize(
-                        tmp.dayofweek.values, xmin=1, xmax=7, newRange=self.newRange
+                        dow, xmin=1, xmax=7, newRange=self.newRange
                     )
                     k += 1
             elif exo_var == "hour":
                 if self.cosinbase:
-                    np_extra[k, :] = np.sin(2 * np.pi * tmp.hour.values / 24.0)
-                    np_extra[k + 1, :] = np.cos(2 * np.pi * tmp.hour.values / 24.0)
+                    np_extra[k, :] = np.sin(2 * np.pi * hour / 24.0)
+                    np_extra[k + 1, :] = np.cos(2 * np.pi * hour / 24.0)
                     k += 2
                 else:
                     np_extra[k, :] = self._normalize(
-                        tmp.hour.values, xmin=0, xmax=24, newRange=self.newRange
+                        hour, xmin=0, xmax=24, newRange=self.newRange
                     )
                     k += 1
             elif exo_var == "minute":
                 if self.cosinbase:
-                    np_extra[k, :] = np.sin(2 * np.pi * tmp.minute.values / 60.0)
-                    np_extra[k + 1, :] = np.cos(2 * np.pi * tmp.minute.values / 60.0)
+                    np_extra[k, :] = np.sin(2 * np.pi * minute / 60.0)
+                    np_extra[k + 1, :] = np.cos(2 * np.pi * minute / 60.0)
                     k += 2
                 else:
-                    np_extra[k, :] = self.normalize(
-                        tmp.minute.values, xmin=0, xmax=60, newRange=self.newRange
+                    np_extra[k, :] = self._normalize(
+                        minute, xmin=0, xmax=60, newRange=self.newRange
                     )
                     k += 1
             else:
@@ -624,6 +685,13 @@ class NILMDataset(torch.utils.data.Dataset):
                         exo_var
                     )
                 )
+
+        if self.exo_cache_size > 0:
+            if len(self._exo_cache_keys) >= self.exo_cache_size:
+                old = self._exo_cache_keys.pop(0)
+                self._exo_cache.pop(old, None)
+            self._exo_cache[idx] = np_extra
+            self._exo_cache_keys.append(idx)
 
         return np_extra
 

@@ -3,7 +3,7 @@ result_path:  result/
 dataset:  UKDALE
 name_model:  NILMFormer
 sampling_rate:  1min
-window_size: 256
+window_size: 128
 list_exo_variables:
   - minute
   - hour
@@ -13,7 +13,7 @@ list_exo_variables:
 power_scaling_type:  MaxScaling
 appliance_scaling_type:  MaxScaling
 
-batch_size:  64
+batch_size:  128
 epochs:  25
 p_es:  null
 p_rlr:  3
@@ -22,7 +22,12 @@ n_warmup_epochs:  0
 device:  auto          # auto / cuda / mps / cpu
 accumulate_grad_batches: 1
 
-num_workers: 10
+num_workers: 8
+prefetch_factor: 4
+
+train_num_crops: 4
+train_crop_ratio: 0.75
+train_crop_event_bias: 0.8
 
 # EAEC Related Parameters
 p_es_eaec:  null
@@ -59,6 +64,9 @@ off_high_agg_penalty_weight: 0.3
 #   - always_on:            always-on appliances
 #   - sparse_medium_power:  sparse medium-power appliances
 #
+# 使用自动权重版 GA-EAEC Loss，减少手工调节的权重超参数
+loss_type: ga_eaec_auto
+
 # ===== OFF false-positive penalty (mild, prevents learning all-zero output) =====
 # lambda_off_hard: OFF-state hard constraint weight (lower!)
 loss_lambda_off_hard: 0.1

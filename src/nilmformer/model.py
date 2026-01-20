@@ -86,9 +86,85 @@ class NILMFormer(nn.Module):
         self.output_stats_mean_max = 0.0
         self.output_stats_std_max = 0.0
         self.inst_norm_min_std = 1e-2
+        self.use_freq_features = bool(getattr(NFConfig, "use_freq_features", True))
+        self.use_elec_features = bool(getattr(NFConfig, "use_elec_features", True))
+        self.use_film = bool(getattr(NFConfig, "use_film", True)) and c_out >= 1
+        film_hidden_dim = int(getattr(NFConfig, "film_hidden_dim", 32))
+        self.film_hidden_dim = film_hidden_dim
+        if self.use_film:
+            d_feat = 0
+            if self.use_elec_features:
+                d_feat += 5
+            if self.use_freq_features:
+                d_feat += 8
+            self.device_embed = nn.Embedding(c_out, film_hidden_dim)
+            self.film_fc1 = nn.Linear(d_feat + film_hidden_dim, film_hidden_dim)
+            self.film_fc2 = nn.Linear(film_hidden_dim, 2)
 
         # ============ Initialize Weights ============#
         self.initialize_weights()
+
+    def _compute_condition_features(self, x_main):
+        x_main = x_main.float()
+        if x_main.dim() == 2:
+            x_main = x_main.unsqueeze(1)
+        B, C, L = x_main.shape
+        main = x_main[:, 0, :]
+        feats = []
+        if self.use_elec_features:
+            mean = main.mean(dim=-1)
+            std = main.std(dim=-1, unbiased=False)
+            rms = torch.sqrt((main.pow(2).mean(dim=-1)) + 1e-6)
+            peak = main.abs().amax(dim=-1)
+            crest = peak / (rms + 1e-6)
+            feats.append(mean)
+            feats.append(std)
+            feats.append(rms)
+            feats.append(peak)
+            feats.append(crest)
+        if self.use_freq_features:
+            x_centered = main - main.mean(dim=-1, keepdim=True)
+            spec = torch.fft.rfft(x_centered, dim=-1)
+            mag = spec.abs()
+            F = mag.size(-1)
+            n_bands = min(8, F)
+            band_size = F // n_bands
+            band_feats = []
+            for i in range(n_bands):
+                start = i * band_size
+                if i == n_bands - 1:
+                    end = F
+                else:
+                    end = (i + 1) * band_size
+                band = mag[:, start:end]
+                if band.numel() == 0:
+                    band_mean = mag.new_zeros(B)
+                else:
+                    band_mean = band.mean(dim=-1)
+                band_feats.append(band_mean)
+            feats.extend(band_feats)
+        if not feats:
+            return x_main.new_zeros(B, 1)
+        return torch.stack(feats, dim=1)
+
+    def _compute_film_params(self, x_main):
+        if not self.use_film:
+            return None, None
+        cond = self._compute_condition_features(x_main)
+        B = cond.size(0)
+        C_out = self.NFConfig.c_out
+        device_ids = torch.arange(C_out, device=x_main.device)
+        dev_emb = self.device_embed(device_ids)
+        dev_emb = dev_emb.unsqueeze(0).expand(B, -1, -1)
+        cond_exp = cond.unsqueeze(1).expand(-1, C_out, -1)
+        inp = torch.cat([cond_exp, dev_emb], dim=-1)
+        h = torch.relu(self.film_fc1(inp))
+        gb = self.film_fc2(h)
+        raw_gamma = gb[..., 0:1]
+        raw_beta = gb[..., 1:2]
+        gamma = 0.1 * torch.tanh(raw_gamma)
+        beta = 0.1 * torch.tanh(raw_beta)
+        return gamma, beta
 
     def set_output_stats(self, alpha=None, mean_max=None, std_max=None):
         if alpha is not None:
@@ -130,8 +206,8 @@ class NILMFormer(nn.Module):
         # Separate the channels:
         #   x[:, :1, :] => load curve
         #   x[:, 1:, :] => exogenous input(s)
-        encoding = x[:, 1:, :]  # shape: (B, e, L)
-        x = x[:, :1, :]  # shape: (B, 1, L)
+        encoding = x[:, 1:, :]
+        x = x[:, :1, :]
 
         # === Instance Normalization === #
         inst_mean = torch.mean(x, dim=-1, keepdim=True).detach()
@@ -140,32 +216,29 @@ class NILMFormer(nn.Module):
         ).detach()
         inst_std = torch.clamp(inst_std, min=float(getattr(self, "inst_norm_min_std", 1e-2)))
 
-        x = (x - inst_mean) / inst_std  # shape still (B, 1, L)
+        x = (x - inst_mean) / inst_std
 
         # === Embedding === #
         # 1) Dilated Conv block
-        x = self.EmbedBlock(
-            x
-        )  # shape: (B, [d_model_], L) => typically (B, 72, L) if d_model=96
-        # 2) Project exogenous features
-        encoding = self.ProjEmbedding(encoding)  # shape: (B, d_model//4, L)
-        # 3) Concatenate
-        x = torch.cat([x, encoding], dim=1).permute(0, 2, 1)  # (B, L, d_model)
+        x = self.EmbedBlock(x)
+        encoding = self.ProjEmbedding(encoding)
+        x = torch.cat([x, encoding], dim=1).permute(0, 2, 1)
 
         # === Mean/Std tokens === #
-        stats_token = self.ProjStats1(
-            torch.cat([inst_mean, inst_std], dim=1).permute(0, 2, 1)
-        )  # (B, 1, d_model)
-        x = torch.cat([x, stats_token], dim=1)  # (B, L + 1, d_model)
+        stats_token = self.ProjStats1(torch.cat([inst_mean, inst_std], dim=1).permute(0, 2, 1))
+        x = torch.cat([x, stats_token], dim=1)
 
         # === Transformer Encoder === #
-        x_full = self.EncoderBlock(x)  # (B, L + 1, d_model)
+        x_full = self.EncoderBlock(x)
         stats_feat = x_full[:, -1:, :]
         x = x_full[:, :-1, :]  # (B, L, d_model)
 
         x = x.permute(0, 2, 1)
         shared_feat = self.SharedHead(x)
+        gamma, beta = self._compute_film_params(x_main=x)
         power_raw = self.PowerHead(shared_feat)
+        if gamma is not None and beta is not None:
+            power_raw = (1.0 + gamma) * power_raw + beta
         power_raw = torch.clamp(power_raw, min=-10.0)
         power = F.softplus(power_raw)
 
@@ -208,8 +281,11 @@ class NILMFormer(nn.Module):
         stats_feat = x_enc[:, -1:, :]
         x_feat = x_enc[:, :-1, :].permute(0, 2, 1)
         shared_feat = self.SharedHead(x_feat)
+        gamma, beta = self._compute_film_params(x_main=x[:, :1, :])
         power_raw = self.PowerHead(shared_feat)
         gate = self.GateHead(shared_feat)
+        if gamma is not None and beta is not None:
+            power_raw = (1.0 + gamma) * power_raw + beta
         alpha = float(getattr(self, "output_stats_alpha", 0.0))
         mean_max = float(getattr(self, "output_stats_mean_max", 0.0))
         std_max = float(getattr(self, "output_stats_std_max", 0.0))

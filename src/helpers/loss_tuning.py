@@ -146,9 +146,6 @@ class AdaptiveLossTuner:
         if not (collapse_flag and collapsed_to_zero):
             return False
 
-        if not self.should_tune(device_type, appliance_name):
-            return False
-
         # Reset penalties to allow model to learn
         _safe_setattr(pl_module, "zero_run_kernel", 1)
         _safe_setattr(pl_module, "state_zero_penalty_weight", 0.0)

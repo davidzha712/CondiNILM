@@ -15,6 +15,7 @@ import json
 import pandas as pd
 import pytorch_lightning as pl
 from tqdm import tqdm
+from collections.abc import Sequence
 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,6 +23,9 @@ import torch.nn.functional as F
 from src.helpers.trainer import (
     EAECLoss,
     GAEAECLoss,
+    GAEAECLossAuto,
+    PerDeviceGAEAECLossAuto,
+    PerDeviceGAEAECLoss,
     SeqToSeqLightningModule,
     TserLightningModule,
     DiffNILMLightningModule,
@@ -36,6 +40,27 @@ def _append_jsonl(path, record):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _sanitize_tb_tag(value):
+    s = str(value)
+    s = s.replace("/", "_").replace("\\", "_").replace(" ", "_")
+    return s
+
+
+def _coerce_appliance_names(expes_config, n_app, fallback_name=None):
+    group_members = None
+    if expes_config is not None:
+        group_members = getattr(expes_config, "appliance_group_members", None)
+    if group_members is not None and not isinstance(group_members, str):
+        try:
+            if isinstance(group_members, Sequence) and len(group_members) == int(n_app):
+                return [str(x) for x in list(group_members)]
+        except Exception:
+            pass
+    if isinstance(fallback_name, str) and fallback_name and int(n_app) == 1:
+        return [str(fallback_name)]
+    return [str(j) for j in range(int(n_app))]
 
 
 # ==== SotA NILM baselines ==== #
@@ -82,6 +107,51 @@ def get_device():
             return "cuda"
         return "cpu"
     return "cpu"
+
+
+def _get_num_workers(num_workers):
+    try:
+        cpu_count = os.cpu_count()
+    except Exception:
+        cpu_count = None
+    if cpu_count is None or cpu_count < 1:
+        cpu_count = 1
+    if isinstance(num_workers, int) and num_workers > 0:
+        if num_workers > cpu_count:
+            return cpu_count
+        return num_workers
+    
+    base = max(1, cpu_count - 1)
+    
+    if base > 16:
+        base = 16
+    return base
+
+
+def _set_default_thread_env():
+    if platform.system() != "Windows":
+        return
+    defaults = {
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "VECLIB_MAXIMUM_THREADS": "1",
+        "NUMEXPR_NUM_THREADS": "1",
+    }
+    for k, v in defaults.items():
+        os.environ.setdefault(k, v)
+    try:
+        torch.set_num_threads(int(os.environ.get("TORCH_NUM_THREADS", "1")))
+    except Exception:
+        pass
+    try:
+        torch.set_num_interop_threads(int(os.environ.get("TORCH_INTEROP_THREADS", "1")))
+    except Exception:
+        pass
+
+
+def _dataloader_worker_init(worker_id):
+    _set_default_thread_env()
 
 
 def get_model_instance(name_model, c_in, window_size, **kwargs):
@@ -183,12 +253,12 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
             gate_logits = None
             if hasattr(model, "model") and hasattr(model.model, "forward_with_gate"):
                 try:
-                    _power_raw, gate_logits = model.model.forward_with_gate(ts_agg_t)
+                    _power_raw, gate_logits, _cls_logits = model.model.forward_with_gate(ts_agg_t)
                 except Exception:
                     gate_logits = None
             elif hasattr(model, "forward_with_gate"):
                 try:
-                    _power_raw, gate_logits = model.forward_with_gate(ts_agg_t)
+                    _power_raw, gate_logits, _cls_logits = model.forward_with_gate(ts_agg_t)
                 except Exception:
                     gate_logits = None
 
@@ -318,14 +388,7 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
         target_all = []
     if not isinstance(appliance_names, list):
         appliance_names = []
-    group_members = getattr(expes_config, "appliance_group_members", None)
-    display_names = []
-    if isinstance(group_members, (list, tuple)) and len(group_members) == n_app:
-        display_names = [str(x) for x in group_members]
-    elif isinstance(appliance_name, str) and n_app == 1:
-        display_names = [appliance_name]
-    else:
-        display_names = [str(j) for j in range(n_app)]
+    display_names = _coerce_appliance_names(expes_config, n_app, appliance_name)
     name_to_index = {str(name): idx for idx, name in enumerate(appliance_names)}
     for j in range(n_app):
         name_j = display_names[j]
@@ -349,6 +412,7 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
     models = payload.get("models", {})
     if not isinstance(models, dict):
         models = {}
+    name_to_index = {str(name): idx for idx, name in enumerate(appliance_names)}
     for name_m, data_m in list(models.items()):
         if not isinstance(data_m, dict):
             data_m = {}
@@ -413,7 +477,11 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
             pred_list = pred_list[:total_n]
         target_run["pred"] = pred_list
     for j in range(n_app):
-        pred_list[start_idx + j] = pred_concat[j]
+        key_j = str(display_names[j])
+        idx = name_to_index.get(key_j)
+        if idx is None or idx >= total_n:
+            continue
+        pred_list[idx] = pred_concat[j]
     target_run["pred"] = pred_list
     model_data["runs"] = runs
     models[model_name] = model_data
@@ -770,7 +838,7 @@ class ValidationNILMMetricCallback(pl.Callback):
                     )
                 if hasattr(pl_module, "model") and hasattr(pl_module.model, "forward_with_gate"):
                     try:
-                        _power_raw, gate_logits = pl_module.model.forward_with_gate(ts_agg_t)
+                        _power_raw, gate_logits, _cls_logits = pl_module.model.forward_with_gate(ts_agg_t)
                         soft_scale = float(getattr(pl_module, "gate_soft_scale", 1.0))
                         post_scale = float(
                             getattr(
@@ -1002,6 +1070,9 @@ class ValidationNILMMetricCallback(pl.Callback):
         metrics_win_per_device = {}
         if per_device_data is not None:
             n_app = len(per_device_data["y"])
+            device_names = _coerce_appliance_names(
+                self.expes_config, n_app, getattr(self.expes_config, "appliance", None)
+            )
             for j in range(n_app):
                 y_j = per_device_data["y"][j]
                 y_hat_j = per_device_data["y_hat"][j]
@@ -1010,7 +1081,7 @@ class ValidationNILMMetricCallback(pl.Callback):
                     y_hat_state_j = (
                         (y_hat_j > threshold_postprocess).astype(int) if y_state_j.size else None
                     )
-                    metrics_timestamp_per_device[str(j)] = self.metrics(
+                    metrics_timestamp_per_device[str(device_names[j])] = self.metrics(
                         y=y_j,
                         y_hat=y_hat_j,
                         y_state=y_state_j if y_state_j.size else None,
@@ -1019,7 +1090,7 @@ class ValidationNILMMetricCallback(pl.Callback):
                 y_win_j = per_device_data["y_win"][j]
                 y_hat_win_j = per_device_data["y_hat_win"][j]
                 if y_win_j.size and y_hat_win_j.size:
-                    metrics_win_per_device[str(j)] = self.metrics(
+                    metrics_win_per_device[str(device_names[j])] = self.metrics(
                         y=y_win_j,
                         y_hat=y_hat_win_j,
                     )
@@ -1154,14 +1225,14 @@ class ValidationNILMMetricCallback(pl.Callback):
         for idx, mdict in metrics_timestamp_per_device.items():
             for name, value in mdict.items():
                 writer.add_scalar(
-                    "valid_timestamp/" + name + "_app" + str(idx),
+                    "valid_timestamp/" + name + "_app_" + _sanitize_tb_tag(idx),
                     float(value),
                     epoch_idx,
                 )
         for idx, mdict in metrics_win_per_device.items():
             for name, value in mdict.items():
                 writer.add_scalar(
-                    "valid_win/" + name + "_app" + str(idx),
+                    "valid_win/" + name + "_app_" + _sanitize_tb_tag(idx),
                     float(value),
                     epoch_idx,
                 )
@@ -1356,7 +1427,7 @@ def evaluate_nilm_split(
             gate_logits = None
             if hasattr(model, "forward_with_gate"):
                 try:
-                    power_raw, gate_logits = model.forward_with_gate(ts_agg_t)
+                    power_raw, gate_logits, _cls_logits = model.forward_with_gate(ts_agg_t)
                     gate_logits = torch.nan_to_num(
                         gate_logits.float(), nan=0.0, posinf=0.0, neginf=0.0
                     )
@@ -1490,6 +1561,9 @@ def evaluate_nilm_split(
     metrics_win_per_device = {}
     if per_device_data is not None:
         n_app = len(per_device_data["y"])
+        device_names = _coerce_appliance_names(
+            expes_config, n_app, getattr(expes_config, "appliance", None) if expes_config is not None else None
+        )
         for j in range(n_app):
             y_j = per_device_data["y"][j]
             y_hat_j = per_device_data["y_hat"][j]
@@ -1498,7 +1572,7 @@ def evaluate_nilm_split(
                 y_hat_state_j = (
                     (y_hat_j > threshold_postprocess).astype(int) if y_state_j.size else None
                 )
-                metrics_timestamp_per_device[str(j)] = metrics_helper(
+                metrics_timestamp_per_device[str(device_names[j])] = metrics_helper(
                     y=y_j,
                     y_hat=y_hat_j,
                     y_state=y_state_j if y_state_j.size else None,
@@ -1507,7 +1581,7 @@ def evaluate_nilm_split(
             y_win_j = per_device_data["y_win"][j]
             y_hat_win_j = per_device_data["y_hat_win"][j]
             if y_win_j.size and y_hat_win_j.size:
-                metrics_win_per_device[str(j)] = metrics_helper(
+                metrics_win_per_device[str(device_names[j])] = metrics_helper(
                     y=y_win_j,
                     y_hat=y_hat_win_j,
                 )
@@ -1578,7 +1652,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
 
     default_loss_type = "ga_eaec" if expes_config.name_model == "NILMFormer" else "eaec"
     loss_type = str(getattr(expes_config, "loss_type", default_loss_type))
-    if loss_type in ["eaec", "ga_eaec"] and expes_config.name_model == "NILMFormer":
+    if loss_type in ["eaec", "ga_eaec", "ga_eaec_auto"] and expes_config.name_model == "NILMFormer":
         p_es_eaec = getattr(expes_config, "p_es_eaec", None)
         if p_es_eaec is not None:
             expes_config.p_es = p_es_eaec
@@ -1625,7 +1699,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     if (
         balance_window_sampling
         and str(getattr(expes_config, "name_model", "")).lower() == "nilmformer"
-        and loss_type in ["eaec", "ga_eaec"]
+        and loss_type in ["eaec", "ga_eaec", "ga_eaec_auto"]
     ):
         try:
             train_states = tuple_data[0][:, 1, 1, :]
@@ -1668,12 +1742,16 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         except Exception as e:
             logging.warning("Could not build balanced sampler: %s", e)
 
-    num_workers = getattr(expes_config, "num_workers", 0)
-    if os.name == "nt" and num_workers:
-        num_workers = 0
+    num_workers = _get_num_workers(getattr(expes_config, "num_workers", None))
     persistent_workers = num_workers > 0
     pin_memory = expes_config.device == "cuda"
+    _set_default_thread_env()
     batch_size = expes_config.batch_size
+    prefetch_factor = int(getattr(expes_config, "prefetch_factor", 2))
+    dl_kwargs = {}
+    if num_workers > 0:
+        dl_kwargs["prefetch_factor"] = prefetch_factor
+        dl_kwargs["worker_init_fn"] = _dataloader_worker_init
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -1682,6 +1760,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         num_workers=num_workers,
         persistent_workers=persistent_workers,
         pin_memory=pin_memory,
+        **dl_kwargs,
     )
     valid_loader = torch.utils.data.DataLoader(
         valid_dataset,
@@ -1690,6 +1769,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         num_workers=num_workers,
         persistent_workers=persistent_workers,
         pin_memory=pin_memory,
+        **dl_kwargs,
     )
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
@@ -1698,6 +1778,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         num_workers=num_workers,
         persistent_workers=persistent_workers,
         pin_memory=pin_memory,
+        **dl_kwargs,
     )
 
     metric_callback = ValidationNILMMetricCallback(valid_loader, scaler, expes_config)
@@ -1777,7 +1858,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                 threshold_loss = threshold_loss_raw / cutoff
         except Exception:
             threshold_loss = threshold_loss_raw
-        if loss_type in ["eaec", "ga_eaec"]:
+        if loss_type in ["eaec", "ga_eaec", "ga_eaec_auto"]:
             alpha_on = float(getattr(expes_config, "loss_alpha_on", 3.0))
             alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
             lambda_grad = float(getattr(expes_config, "loss_lambda_grad", 0.5))
@@ -1793,6 +1874,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             lambda_sparse = float(getattr(expes_config, "loss_lambda_sparse", 0.0))
             lambda_zero = float(getattr(expes_config, "loss_lambda_zero", 0.0))
             center_ratio = float(getattr(expes_config, "loss_center_ratio", 1.0))
+            logging.info("Using loss_center_ratio=%.3f", center_ratio)
             energy_floor_default = threshold_loss * float(expes_config.window_size) * 0.1
             if hasattr(expes_config, "loss_energy_floor"):
                 energy_floor = float(expes_config.loss_energy_floor)
@@ -1820,35 +1902,108 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                     lambda_zero=lambda_zero,
                     center_ratio=center_ratio,
                 )
-            else:
-                # OFF false-positive penalty parameters (mild setting)
+            elif loss_type == "ga_eaec_auto":
                 lambda_off_hard = float(getattr(expes_config, "loss_lambda_off_hard", 0.1))
                 off_margin = float(getattr(expes_config, "loss_off_margin", 0.02))
-                # ON missed-detection penalty parameters (prevents all-zero outputs)
                 lambda_on_recall = float(getattr(expes_config, "loss_lambda_on_recall", 0.3))
                 on_recall_margin = float(getattr(expes_config, "loss_on_recall_margin", 0.5))
-                # Gate classification parameters
                 lambda_gate_cls = float(getattr(expes_config, "loss_lambda_gate_cls", 0.1))
                 gate_focal_gamma = float(getattr(expes_config, "loss_gate_focal_gamma", 2.0))
-                criterion = GAEAECLoss(
-                    threshold=threshold_loss,
-                    alpha_on=alpha_on,
-                    alpha_off=alpha_off,
-                    lambda_grad=lambda_grad,
-                    lambda_energy=lambda_energy,
-                    soft_temp=soft_temp,
-                    edge_eps=edge_eps,
-                    energy_floor=energy_floor,
-                    lambda_sparse=lambda_sparse,
-                    lambda_zero=lambda_zero,
-                    center_ratio=center_ratio,
-                    lambda_off_hard=lambda_off_hard,
-                    off_margin=off_margin,
-                    lambda_on_recall=lambda_on_recall,
-                    on_recall_margin=on_recall_margin,
-                    lambda_gate_cls=lambda_gate_cls,
-                    gate_focal_gamma=gate_focal_gamma,
-                )
+                base_params = {
+                    "threshold": threshold_loss,
+                    "alpha_on": alpha_on,
+                    "alpha_off": alpha_off,
+                    "soft_temp": soft_temp,
+                    "edge_eps": edge_eps,
+                    "energy_floor": energy_floor,
+                    "center_ratio": center_ratio,
+                    "off_margin": off_margin,
+                    "gate_focal_gamma": gate_focal_gamma,
+                    "lambda_off_hard": lambda_off_hard,
+                    "lambda_on_recall": lambda_on_recall,
+                    "on_recall_margin": on_recall_margin,
+                    "lambda_gate_cls": lambda_gate_cls,
+                }
+                per_device_params = None
+                n_app = 1
+                if scaler is not None:
+                    try:
+                        n_app = int(getattr(scaler, "n_appliance", 1) or 1)
+                    except Exception:
+                        n_app = 1
+                if n_app < 1:
+                    n_app = 1
+                cfg_per_device = getattr(expes_config, "loss_params_per_device", None)
+                if isinstance(cfg_per_device, dict) and n_app > 1:
+                    device_names = _coerce_appliance_names(
+                        expes_config,
+                        n_app,
+                        getattr(expes_config, "appliance", None)
+                        if expes_config is not None
+                        else None,
+                    )
+                    per_device_list = []
+                    for j in range(n_app):
+                        name_j = str(device_names[j]) if j < len(device_names) else str(j)
+                        params_j = cfg_per_device.get(name_j)
+                        per_device_list.append(params_j if isinstance(params_j, dict) else None)
+                    per_device_params = per_device_list
+                if per_device_params is not None:
+                    criterion = PerDeviceGAEAECLossAuto(per_device_params, base_params)
+                else:
+                    criterion = GAEAECLossAuto(**base_params)
+            else:
+                lambda_off_hard = float(getattr(expes_config, "loss_lambda_off_hard", 0.1))
+                off_margin = float(getattr(expes_config, "loss_off_margin", 0.02))
+                lambda_on_recall = float(getattr(expes_config, "loss_lambda_on_recall", 0.3))
+                on_recall_margin = float(getattr(expes_config, "loss_on_recall_margin", 0.5))
+                lambda_gate_cls = float(getattr(expes_config, "loss_lambda_gate_cls", 0.1))
+                gate_focal_gamma = float(getattr(expes_config, "loss_gate_focal_gamma", 2.0))
+                base_params = {
+                    "threshold": threshold_loss,
+                    "alpha_on": alpha_on,
+                    "alpha_off": alpha_off,
+                    "lambda_grad": lambda_grad,
+                    "lambda_energy": lambda_energy,
+                    "soft_temp": soft_temp,
+                    "edge_eps": edge_eps,
+                    "energy_floor": energy_floor,
+                    "lambda_sparse": lambda_sparse,
+                    "lambda_zero": lambda_zero,
+                    "center_ratio": center_ratio,
+                    "lambda_off_hard": lambda_off_hard,
+                    "off_margin": off_margin,
+                    "lambda_on_recall": lambda_on_recall,
+                    "on_recall_margin": on_recall_margin,
+                    "lambda_gate_cls": lambda_gate_cls,
+                    "gate_focal_gamma": gate_focal_gamma,
+                }
+                per_device_params = None
+                n_app = 1
+                if scaler is not None:
+                    try:
+                        n_app = int(getattr(scaler, "n_appliance", 1) or 1)
+                    except Exception:
+                        n_app = 1
+                if n_app < 1:
+                    n_app = 1
+                cfg_per_device = getattr(expes_config, "loss_params_per_device", None)
+                if isinstance(cfg_per_device, dict) and n_app > 1:
+                    device_names = _coerce_appliance_names(
+                        expes_config,
+                        n_app,
+                        getattr(expes_config, "appliance", None) if expes_config is not None else None,
+                    )
+                    per_device_list = []
+                    for j in range(n_app):
+                        name_j = str(device_names[j]) if j < len(device_names) else str(j)
+                        params_j = cfg_per_device.get(name_j)
+                        per_device_list.append(params_j if isinstance(params_j, dict) else None)
+                    per_device_params = per_device_list
+                if per_device_params is not None:
+                    criterion = PerDeviceGAEAECLoss(per_device_params, base_params)
+                else:
+                    criterion = GAEAECLoss(**base_params)
         elif loss_type == "smoothl1":
             criterion = nn.SmoothL1Loss()
         elif loss_type == "mse":
@@ -1915,6 +2070,13 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             gate_soft_scale=float(getattr(expes_config, "gate_soft_scale", 1.0)),
             gate_floor=float(getattr(expes_config, "gate_floor", 0.1)),
             gate_duty_weight=float(getattr(expes_config, "gate_duty_weight", 0.0)),
+            train_crop_len=int(getattr(expes_config, "train_crop_len", 0) or 0),
+            train_crop_ratio=float(getattr(expes_config, "train_crop_ratio", 0.0) or 0.0),
+            train_num_crops=int(getattr(expes_config, "train_num_crops", 1) or 1),
+            train_crop_event_bias=float(
+                getattr(expes_config, "train_crop_event_bias", 0.0) or 0.0
+            ),
+            anti_collapse_weight=float(getattr(expes_config, "anti_collapse_weight", 0.0)),
         )
     accelerator = "cpu"
     devices = 1
@@ -2006,7 +2168,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             )
     loss_type = str(getattr(expes_config, "loss_type", "eaec"))
     gradient_clip_val = 0.0
-    if loss_type in ["eaec", "ga_eaec"]:
+    if loss_type in ["eaec", "ga_eaec", "ga_eaec_auto"]:
         gradient_clip_val = float(getattr(expes_config, "gradient_clip_val_eaec", 1.0))
     accumulate_grad_batches = int(
         getattr(expes_config, "accumulate_grad_batches", 1)
@@ -2165,12 +2327,15 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     result_root = os.path.dirname(
         os.path.dirname(os.path.dirname(expes_config.result_path))
     )
-    html_path = os.path.join(
+    group_dir = os.path.join(
         result_root,
         "{}_{}".format(expes_config.dataset, expes_config.sampling_rate),
         str(expes_config.window_size),
-        "val_compare.html",
     )
+    appliance_name = getattr(expes_config, "appliance", None)
+    if appliance_name is not None:
+        group_dir = os.path.join(group_dir, str(appliance_name))
+    html_path = os.path.join(group_dir, "val_compare.html")
     logging.info(
         "Training and eval completed! Best checkpoint: %s, TensorBoard logdir: %s, HTML: %s",
         best_model_path,
@@ -2193,11 +2358,15 @@ def tser_model_training(inst_model, tuple_data, expes_config):
     valid_dataset = TSDatasetScaling(tuple_data[1][0], tuple_data[1][1])
     test_dataset = TSDatasetScaling(tuple_data[2][0], tuple_data[2][1])
 
-    num_workers = getattr(expes_config, "num_workers", 0)
-    if os.name == "nt" and num_workers:
-        num_workers = 0
+    num_workers = _get_num_workers(getattr(expes_config, "num_workers", None))
     persistent_workers = num_workers > 0
     pin_memory = expes_config.device == "cuda"
+    _set_default_thread_env()
+    prefetch_factor = int(getattr(expes_config, "prefetch_factor", 2))
+    dl_kwargs = {}
+    if num_workers > 0:
+        dl_kwargs["prefetch_factor"] = prefetch_factor
+        dl_kwargs["worker_init_fn"] = _dataloader_worker_init
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=expes_config.batch_size,
@@ -2205,6 +2374,7 @@ def tser_model_training(inst_model, tuple_data, expes_config):
         num_workers=num_workers,
         persistent_workers=persistent_workers,
         pin_memory=pin_memory,
+        **dl_kwargs,
     )
     valid_loader = torch.utils.data.DataLoader(
         valid_dataset,
@@ -2213,6 +2383,7 @@ def tser_model_training(inst_model, tuple_data, expes_config):
         num_workers=num_workers,
         persistent_workers=persistent_workers,
         pin_memory=pin_memory,
+        **dl_kwargs,
     )
     test_loader = torch.utils.data.DataLoader(
         test_dataset,
@@ -2221,6 +2392,7 @@ def tser_model_training(inst_model, tuple_data, expes_config):
         num_workers=num_workers,
         persistent_workers=persistent_workers,
         pin_memory=pin_memory,
+        **dl_kwargs,
     )
 
     lightning_module = TserLightningModule(
