@@ -6,6 +6,8 @@
 #
 #################################################################################################################
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -511,6 +513,520 @@ class PerDeviceGAEAECLoss(nn.Module):
         return total / float(count)
 
 
+class MultiDeviceNILMLoss(nn.Module):
+    """
+    Multi-device NILM loss combining best practices from GAEAECLoss and modern multi-task learning.
+
+    Design principles:
+    1. Preserves GAEAECLoss's core components: soft ON/OFF weighting, energy loss, focal gate loss
+    2. Adds uncertainty weighting for automatic device balancing (Kendall et al., 2018)
+    3. Uses normalized thresholds that work with scaled data
+    4. Strong anti-collapse mechanism with dynamic adjustment
+    5. Minimal manual hyperparameters - most are auto-computed from device statistics
+
+    Key differences from GAEAECLoss:
+    - Threshold auto-adapts to data scale (works with normalized data)
+    - Multi-device weighting is learned, not averaged
+    - Removed conflicting penalties (lambda_sparse, lambda_zero)
+    - Stronger ON recall penalty to prevent collapse
+
+    Reference:
+    - Multi-Task Learning Using Uncertainty to Weigh Losses (Kendall et al., 2018)
+    - UNet-NILM: Multi-task appliances' state detection and power estimation
+    """
+
+    def __init__(
+        self,
+        n_devices: int,
+        device_stats: list = None,  # List of {duty_cycle, peak_power, mean_on}
+        # Core parameters (auto-computed if not provided)
+        alpha_on: float = None,  # Will be computed from duty_cycle
+        alpha_off: float = None,
+        # Energy loss
+        lambda_energy: float = 0.3,
+        # Gate classification
+        lambda_gate_cls: float = 0.2,
+        gate_focal_gamma: float = 2.0,
+        # Anti-collapse (critical for multi-device)
+        lambda_on_recall: float = 2.0,  # Stronger than GAEAECLoss default
+        on_recall_margin: float = 0.3,
+        # OFF penalty (much weaker than GAEAECLoss)
+        lambda_off: float = 0.05,
+        # Uncertainty weighting
+        use_uncertainty_weighting: bool = True,
+        # Center ratio (from GAEAECLoss)
+        center_ratio: float = 1.0,
+    ):
+        super().__init__()
+        self.n_devices = max(n_devices, 1)
+        self.lambda_energy = float(lambda_energy)
+        self.lambda_gate_cls = float(lambda_gate_cls)
+        self.gate_focal_gamma = float(gate_focal_gamma)
+        self.lambda_on_recall = float(lambda_on_recall)
+        self.on_recall_margin = float(on_recall_margin)
+        self.lambda_off = float(lambda_off)
+        self.use_uncertainty_weighting = use_uncertainty_weighting
+        self.center_ratio = float(center_ratio)
+
+        # Per-device parameters (auto-computed from statistics)
+        self.device_alpha_on = []
+        self.device_alpha_off = []
+        self.device_thresholds = []  # Normalized thresholds
+        init_log_vars = []
+
+        for i in range(self.n_devices):
+            stats = device_stats[i] if device_stats and i < len(device_stats) else {}
+            duty = float(stats.get("duty_cycle", 0.1))
+            peak = float(stats.get("peak_power", 1000.0))
+            mean_on = float(stats.get("mean_on", 500.0))
+
+            # Auto-compute alpha weights based on duty cycle
+            # Low duty = focus on ON detection, High duty = balanced
+            if alpha_on is not None:
+                a_on = float(alpha_on)
+            else:
+                if duty < 0.05:
+                    a_on = 6.0
+                elif duty < 0.15:
+                    a_on = 4.0
+                elif duty < 0.3:
+                    a_on = 2.5
+                else:
+                    a_on = 1.5
+
+            if alpha_off is not None:
+                a_off = float(alpha_off)
+            else:
+                if duty < 0.1:
+                    a_off = 0.3
+                elif duty < 0.3:
+                    a_off = 0.6
+                else:
+                    a_off = 1.0
+
+            self.device_alpha_on.append(a_on)
+            self.device_alpha_off.append(a_off)
+
+            # Normalized threshold: ~1% of normalized scale
+            # Assumes data is normalized to [0, 1] with MaxScaling
+            self.device_thresholds.append(0.01)
+
+            # Initialize uncertainty based on device complexity
+            if duty < 0.05:
+                init_log_vars.append(0.5)  # Higher uncertainty for sparse
+            elif duty < 0.2:
+                init_log_vars.append(0.0)
+            else:
+                init_log_vars.append(-0.3)
+
+        # Learnable uncertainty parameters
+        if use_uncertainty_weighting:
+            self.log_vars = nn.Parameter(torch.tensor(init_log_vars, dtype=torch.float32))
+        else:
+            self.register_buffer("log_vars", torch.zeros(self.n_devices))
+
+        self.base_loss = nn.SmoothL1Loss(reduction="none")
+
+    def _compute_single_device_loss(self, pred, target, device_idx, gate=None):
+        """
+        Compute loss for a single device.
+        Adapted from GAEAECLoss with improvements.
+        """
+        eps = 1e-6
+        threshold = self.device_thresholds[device_idx]
+        alpha_on = self.device_alpha_on[device_idx]
+        alpha_off = self.device_alpha_off[device_idx]
+
+        # ===== Soft ON/OFF weights (from GAEAECLoss) =====
+        soft_temp = max(threshold * 2.0, 0.01)
+        p_on = torch.sigmoid((target - threshold) / soft_temp)
+        p_off = 1.0 - p_on
+
+        # Hard masks
+        hard_on_mask = (target > threshold).float()
+        hard_off_mask = 1.0 - hard_on_mask
+        n_on = hard_on_mask.sum() + eps
+        n_off = hard_off_mask.sum() + eps
+
+        # ===== Main regression loss (from GAEAECLoss) =====
+        loss_point = self.base_loss(pred, target)
+        loss_on = (loss_point * p_on).sum() / (p_on.sum() + eps)
+        loss_off = (loss_point * p_off).sum() / (p_off.sum() + eps)
+        loss_main = alpha_on * loss_on + alpha_off * loss_off
+
+        # ===== Energy conservation loss (from GAEAECLoss) =====
+        energy_pred = (pred * hard_on_mask).sum(dim=-1)
+        energy_target = (target * hard_on_mask).sum(dim=-1)
+        energy_floor = target.abs().max() * 0.01 + eps
+        loss_energy = ((energy_pred - energy_target).abs() / (energy_target.abs() + energy_floor)).mean()
+
+        # ===== ON recall penalty (strengthened from GAEAECLoss) =====
+        # Critical for preventing all-zero collapse
+        min_expected = target * self.on_recall_margin
+        shortfall = torch.relu(min_expected - pred)
+        loss_on_recall = (shortfall * hard_on_mask).sum() / n_on
+
+        # ===== OFF penalty (weakened from GAEAECLoss) =====
+        off_margin = threshold * 2.0
+        off_excess = torch.relu(pred - off_margin)
+        loss_off_penalty = (off_excess * hard_off_mask).sum() / n_off
+
+        # ===== Gate classification with Focal Loss (from GAEAECLoss) =====
+        if gate is not None and self.lambda_gate_cls > 0:
+            gate_prob = torch.sigmoid(gate).clamp(eps, 1.0 - eps)
+            gate_target = hard_on_mask
+
+            # Class-balanced weights
+            on_ratio = hard_on_mask.mean().clamp(0.01, 0.99)
+            weight_on = ((1.0 - on_ratio) / on_ratio).clamp(1.0, 10.0)
+
+            # Binary cross entropy
+            bce_on = -torch.log(gate_prob) * gate_target * weight_on
+            bce_off = -torch.log(1.0 - gate_prob) * (1.0 - gate_target)
+
+            # Focal modulation
+            if self.gate_focal_gamma > 0:
+                pt = gate_prob * gate_target + (1.0 - gate_prob) * (1.0 - gate_target)
+                focal_weight = (1.0 - pt) ** self.gate_focal_gamma
+                loss_gate = (focal_weight * (bce_on + bce_off)).mean()
+            else:
+                loss_gate = (bce_on + bce_off).mean()
+        else:
+            loss_gate = pred.new_tensor(0.0)
+
+        # ===== Total loss =====
+        total = (
+            loss_main
+            + self.lambda_energy * loss_energy
+            + self.lambda_on_recall * loss_on_recall
+            + self.lambda_off * loss_off_penalty
+            + self.lambda_gate_cls * loss_gate
+        )
+
+        return total
+
+    def forward(self, pred, target, gate=None):
+        """Forward with optional center cropping and uncertainty weighting."""
+        pred = pred.float()
+        target = target.float()
+
+        # Ensure 3D: (B, C, L)
+        if pred.dim() < 3:
+            pred = pred.unsqueeze(1)
+        if target.dim() < 3:
+            target = target.unsqueeze(1)
+        if gate is not None and gate.dim() < 3:
+            gate = gate.unsqueeze(1)
+
+        # Center ratio cropping (from GAEAECLoss)
+        time_len = pred.size(-1)
+        if time_len > 1 and 0.0 < self.center_ratio < 1.0:
+            center_len = max(1, int(round(time_len * self.center_ratio)))
+            start = (time_len - center_len) // 2
+            end = start + center_len
+            pred = pred[..., start:end]
+            target = target[..., start:end]
+            if gate is not None:
+                gate = gate[..., start:end]
+
+        B, C, L = pred.shape
+        C = min(C, self.n_devices)
+
+        total_loss = pred.new_tensor(0.0)
+
+        for c in range(C):
+            p_c = pred[:, c:c+1, :]
+            t_c = target[:, c:c+1, :]
+            g_c = gate[:, c:c+1, :] if gate is not None else None
+
+            device_loss = self._compute_single_device_loss(p_c, t_c, c, g_c)
+
+            if self.use_uncertainty_weighting:
+                # Uncertainty weighting: L = (1/2σ²) * L_i + log(σ)
+                log_var = self.log_vars[c]
+                precision = torch.exp(-log_var)
+                weighted_loss = 0.5 * precision * device_loss + 0.5 * log_var
+            else:
+                weighted_loss = device_loss
+
+            total_loss = total_loss + weighted_loss
+
+        return total_loss / max(C, 1)
+
+    def get_device_weights(self):
+        """Return learned device weights for monitoring."""
+        with torch.no_grad():
+            return torch.exp(-self.log_vars).cpu().numpy()
+
+
+class SimplifiedMultiDeviceLoss(nn.Module):
+    """
+    Simplified multi-device loss with automatic uncertainty weighting.
+
+    Key features:
+    1. Automatic uncertainty weighting (Kendall et al.) - learns per-device weights
+    2. Strong anti-collapse mechanism - ensures non-zero outputs for ON states
+    3. Automatic initialization based on electrical priors (peak_power, duty_cycle)
+    4. Works with normalized data (0-1 range)
+
+    Reference: "Multi-Task Learning Using Uncertainty to Weigh Losses" (Kendall et al., 2018)
+    """
+
+    def __init__(
+        self,
+        n_devices: int,
+        device_stats: list = None,  # List of dicts with {peak_power, duty_cycle, mean_on}
+        base_threshold: float = 0.01,  # Threshold in normalized space (0-1)
+        use_uncertainty_weighting: bool = True,
+        anti_collapse_strength: float = 5.0,  # Strong anti-collapse
+    ):
+        super().__init__()
+        self.n_devices = max(n_devices, 1)
+        # Threshold should be small since data is normalized to [0, 1]
+        # If threshold > 1, assume it's in raw watts and convert
+        if base_threshold > 1.0:
+            self.base_threshold = 0.01  # Default for normalized data
+        else:
+            self.base_threshold = max(float(base_threshold), 0.001)
+        self.use_uncertainty_weighting = use_uncertainty_weighting
+        self.anti_collapse_strength = float(anti_collapse_strength)
+
+        # Learnable log-variance for uncertainty weighting (one per device)
+        init_log_vars = []
+        self.device_duty_cycles = []
+        self.device_alpha_on = []
+        self.device_alpha_off = []
+
+        for i in range(self.n_devices):
+            stats = device_stats[i] if device_stats and i < len(device_stats) else {}
+            duty = float(stats.get("duty_cycle", 0.1))
+            self.device_duty_cycles.append(duty)
+
+            # Initialize log_var based on duty cycle
+            if duty < 0.05:
+                init_log_var = 0.5
+            elif duty < 0.15:
+                init_log_var = 0.0
+            else:
+                init_log_var = -0.5
+            init_log_vars.append(init_log_var)
+
+            # Auto-compute alpha weights based on duty cycle
+            if duty < 0.1:
+                alpha_on, alpha_off = 5.0, 0.3  # Strong focus on ON for sparse devices
+            elif duty < 0.3:
+                alpha_on, alpha_off = 3.0, 0.8
+            else:
+                alpha_on, alpha_off = 1.5, 1.0
+            self.device_alpha_on.append(alpha_on)
+            self.device_alpha_off.append(alpha_off)
+
+        # Learnable uncertainty parameters
+        if use_uncertainty_weighting:
+            self.log_vars = nn.Parameter(torch.tensor(init_log_vars, dtype=torch.float32))
+        else:
+            self.register_buffer("log_vars", torch.zeros(self.n_devices))
+
+        # Minimum expected ratio of target during ON state
+        # This is key for anti-collapse: pred should be at least min_ratio * target
+        self.min_on_ratio = 0.3  # Predict at least 30% of target
+
+        self.base_loss = nn.SmoothL1Loss(reduction="none")
+
+    def _compute_device_loss(self, pred, target, device_idx, gate=None):
+        """Compute loss for a single device."""
+        eps = 1e-6
+        threshold = self.base_threshold
+        alpha_on = self.device_alpha_on[device_idx]
+        alpha_off = self.device_alpha_off[device_idx]
+        duty = self.device_duty_cycles[device_idx]
+
+        # Soft ON/OFF weights based on target
+        soft_temp = max(threshold * 2.0, 0.02)
+        p_on = torch.sigmoid((target - threshold) / soft_temp)
+        p_off = 1.0 - p_on
+
+        # Hard masks for penalties
+        hard_on_mask = (target > threshold).float()
+        hard_off_mask = 1.0 - hard_on_mask
+        n_on = hard_on_mask.sum() + eps
+        n_off = hard_off_mask.sum() + eps
+
+        # 1. Main regression loss (weighted by ON/OFF)
+        point_loss = self.base_loss(pred, target)
+        loss_on = (point_loss * p_on).sum() / (p_on.sum() + eps)
+        loss_off = (point_loss * p_off).sum() / (p_off.sum() + eps)
+        loss_main = alpha_on * loss_on + alpha_off * loss_off
+
+        # 2. Energy conservation loss
+        energy_pred = (pred * hard_on_mask).sum(dim=-1)
+        energy_target = (target * hard_on_mask).sum(dim=-1)
+        energy_denom = energy_target.abs() + eps
+        loss_energy = ((energy_pred - energy_target).abs() / energy_denom).mean()
+
+        # 3. STRONG Anti-collapse loss: pred should be at least min_ratio * target when ON
+        # This is critical for preventing all-zero outputs
+        min_expected = self.min_on_ratio * target
+        shortfall = torch.relu(min_expected - pred)  # Positive when pred < min_expected
+        anti_collapse_loss = (shortfall * hard_on_mask).sum() / n_on
+
+        # 4. Very light OFF penalty - only penalize if pred > 2x threshold in OFF region
+        off_margin = threshold * 2.0
+        off_excess = torch.relu(pred - off_margin)
+        off_penalty = (off_excess * hard_off_mask).sum() / n_off
+
+        # 5. Gate classification loss (if gate provided)
+        if gate is not None:
+            gate_prob = torch.sigmoid(gate)
+            gate_target = hard_on_mask
+            on_ratio = duty + eps
+            w_on = min((1.0 - on_ratio) / on_ratio, 10.0)
+            bce = F.binary_cross_entropy(gate_prob, gate_target, reduction="none")
+            weighted_bce = bce * (w_on * gate_target + (1.0 - gate_target))
+            gate_loss = weighted_bce.mean()
+        else:
+            gate_loss = pred.new_tensor(0.0)
+
+        # 6. Mean prediction loss - encourage non-zero mean when ON
+        # This provides additional anti-collapse signal
+        mean_on_pred = (pred * hard_on_mask).sum() / n_on
+        mean_on_target = (target * hard_on_mask).sum() / n_on
+        mean_loss = torch.relu(mean_on_target * 0.2 - mean_on_pred)  # pred mean should be >= 20% of target mean
+
+        # Combine losses with strong emphasis on anti-collapse
+        total = (
+            loss_main
+            + 0.1 * loss_energy
+            + self.anti_collapse_strength * anti_collapse_loss
+            + 0.5 * mean_loss
+            + 0.02 * off_penalty
+            + 0.1 * gate_loss
+        )
+
+        return total
+
+    def forward(self, pred, target, gate=None):
+        """Forward pass with automatic uncertainty weighting."""
+        if pred.dim() < 3:
+            pred = pred.unsqueeze(1)
+        if target.dim() < 3:
+            target = target.unsqueeze(1)
+        if gate is not None and gate.dim() < 3:
+            gate = gate.unsqueeze(1)
+
+        B, C, L = pred.shape
+        C = min(C, self.n_devices)
+
+        total_loss = pred.new_tensor(0.0)
+
+        for c in range(C):
+            p_c = pred[:, c:c+1, :]
+            t_c = target[:, c:c+1, :]
+            g_c = gate[:, c:c+1, :] if gate is not None else None
+
+            device_loss = self._compute_device_loss(p_c, t_c, c, g_c)
+
+            if self.use_uncertainty_weighting:
+                log_var = self.log_vars[c]
+                precision = torch.exp(-log_var)
+                weighted_loss = 0.5 * precision * device_loss + 0.5 * log_var
+            else:
+                weighted_loss = device_loss
+
+            total_loss = total_loss + weighted_loss
+
+        return total_loss / max(C, 1)
+
+    def get_device_weights(self):
+        """Return current device weights (inverse variance) for monitoring."""
+        with torch.no_grad():
+            weights = torch.exp(-self.log_vars)
+            return weights.cpu().numpy()
+
+
+class RobustMultiDeviceLoss(nn.Module):
+    """
+    Robust multi-device loss with warmup and collapse detection.
+
+    Wraps SimplifiedMultiDeviceLoss with additional training stability features:
+    1. Warmup period with reduced penalties
+    2. Automatic collapse detection and recovery
+    3. Progressive penalty increase
+    """
+
+    def __init__(
+        self,
+        n_devices: int,
+        device_stats: list = None,
+        base_threshold: float = 0.01,  # Normalized threshold
+        warmup_epochs: int = 3,
+    ):
+        super().__init__()
+        self.inner_loss = SimplifiedMultiDeviceLoss(
+            n_devices=n_devices,
+            device_stats=device_stats,
+            base_threshold=base_threshold,
+            use_uncertainty_weighting=True,
+            anti_collapse_strength=5.0,  # Strong anti-collapse from start
+        )
+        self.warmup_epochs = warmup_epochs
+        self.current_epoch = 0
+        self.collapse_detected = False
+        self.n_devices = n_devices
+        self.base_threshold = self.inner_loss.base_threshold
+
+    def set_epoch(self, epoch: int):
+        """Set current epoch for warmup scheduling."""
+        self.current_epoch = epoch
+
+        # During warmup: very strong anti-collapse
+        if epoch < self.warmup_epochs:
+            warmup_progress = (epoch + 1) / self.warmup_epochs
+            self.inner_loss.anti_collapse_strength = 10.0 - 5.0 * warmup_progress  # 10.0 -> 5.0
+            self.inner_loss.min_on_ratio = 0.5 - 0.2 * warmup_progress  # 0.5 -> 0.3
+        else:
+            self.inner_loss.anti_collapse_strength = 5.0
+            self.inner_loss.min_on_ratio = 0.3
+
+    def detect_collapse(self, pred, target):
+        """Detect if model has collapsed to all zeros."""
+        with torch.no_grad():
+            pred_max = pred.abs().max()
+            target_max = target.abs().max()
+            # More sensitive collapse detection for normalized data
+            if target_max > 0.001 and pred_max < 0.0001:
+                return True
+        return False
+
+    def forward(self, pred, target, gate=None):
+        # Check for collapse
+        if self.detect_collapse(pred, target):
+            self.collapse_detected = True
+            # During collapse: strong recovery loss
+            if target.dim() < 3:
+                target = target.unsqueeze(1)
+            if pred.dim() < 3:
+                pred = pred.unsqueeze(1)
+
+            eps = 1e-6
+            hard_on_mask = (target > self.base_threshold).float()
+            n_on = hard_on_mask.sum() + eps
+
+            # Strong penalty: pred should be at least 50% of target when ON
+            min_expected = 0.5 * target
+            shortfall = torch.relu(min_expected - pred)
+            recovery_loss = (shortfall * hard_on_mask).sum() / n_on
+
+            # Also add a term to encourage any non-zero output
+            mean_target_on = (target * hard_on_mask).sum() / n_on
+            mean_pred_on = (pred * hard_on_mask).sum() / n_on
+            mean_shortfall = torch.relu(mean_target_on * 0.3 - mean_pred_on)
+
+            return 20.0 * recovery_loss + 10.0 * mean_shortfall
+
+        return self.inner_loss(pred, target, gate)
+
+
 class SeqToSeqLightningModule(pl.LightningModule):
     def __init__(
         self,
@@ -549,6 +1065,8 @@ class SeqToSeqLightningModule(pl.LightningModule):
         train_num_crops=1,
         train_crop_event_bias=0.0,
         anti_collapse_weight=0.0,
+        scheduler_type="cosine_warmup",
+        total_epochs=25,
     ):
         super().__init__()
         self.model = model
@@ -589,6 +1107,8 @@ class SeqToSeqLightningModule(pl.LightningModule):
         self.train_num_crops = int(train_num_crops) if train_num_crops is not None else 1
         self.train_crop_event_bias = float(train_crop_event_bias) if train_crop_event_bias is not None else 0.0
         self.anti_collapse_weight = float(anti_collapse_weight)
+        self.scheduler_type = scheduler_type
+        self.total_epochs = int(total_epochs)
         self.best_val_loss = float("inf")
         self.best_epoch = -1
         self.best_model_state_dict = None
@@ -1048,10 +1568,94 @@ class SeqToSeqLightningModule(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
+        """
+        Configure optimizer and learning rate scheduler following best practices.
+
+        Best practices for Transformer training:
+        1. AdamW with weight_decay > 0 (default 0.01)
+        2. Warmup + Cosine Annealing (smoother than ReduceLROnPlateau)
+        3. Gradient clipping (handled by Trainer)
+
+        References:
+        - Vaswani et al. "Attention is All You Need" (original warmup)
+        - Loshchilov & Hutter "Decoupled Weight Decay Regularization" (AdamW)
+        - Recent LLM training: warmup + cosine decay is standard
+        """
+        # Ensure weight_decay is not zero for regularization
+        effective_wd = self.weight_decay if self.weight_decay > 0 else 0.01
+
         optimizer = optim.AdamW(
-            self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
+            self.model.parameters(),
+            lr=self.learning_rate,
+            weight_decay=effective_wd,
+            betas=(0.9, 0.999),  # Standard betas
+            eps=1e-8,
         )
+
+        # Determine scheduler type from config
+        scheduler_type = self.scheduler_type
+
+        if scheduler_type == "cosine_warmup":
+            # Best practice: Linear warmup + Cosine Annealing
+            # This provides smooth learning rate decay and better convergence
+            return self._configure_cosine_warmup_scheduler(optimizer)
+        elif scheduler_type == "plateau":
+            # Legacy: ReduceLROnPlateau (keep for backward compatibility)
+            return self._configure_plateau_scheduler(optimizer)
+        else:
+            # Default to cosine_warmup
+            return self._configure_cosine_warmup_scheduler(optimizer)
+
+    def _configure_cosine_warmup_scheduler(self, optimizer):
+        """
+        Configure Cosine Annealing with Linear Warmup scheduler.
+
+        This is the recommended scheduler for Transformer models:
+        - Warmup phase: lr increases linearly from 0 to max_lr
+        - Cosine phase: lr decreases following cosine curve to min_lr
+
+        Benefits:
+        - Smooth learning rate transitions
+        - No sudden drops like ReduceLROnPlateau
+        - Better for longer training runs
+        """
+        # Get total epochs from config
+        total_epochs = self.total_epochs
+        warmup_epochs = self.n_warmup_epochs if self.n_warmup_epochs > 0 else 3
+        min_lr = self.rlr_min_lr if self.rlr_min_lr > 0 else 1e-6
+
+        def cosine_warmup_lambda(epoch):
+            if epoch < warmup_epochs:
+                # Linear warmup
+                return float(epoch + 1) / float(warmup_epochs)
+            else:
+                # Cosine annealing
+                progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+                progress = min(1.0, progress)
+                # Cosine decay from 1.0 to min_lr_ratio
+                min_lr_ratio = min_lr / self.learning_rate
+                return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=cosine_warmup_lambda,
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            },
+        }
+
+    def _configure_plateau_scheduler(self, optimizer):
+        """
+        Configure ReduceLROnPlateau scheduler (legacy, kept for compatibility).
+        """
         schedulers = []
+
         if self.n_warmup_epochs and self.n_warmup_epochs > 0:
             def lr_lambda(epoch):
                 if epoch >= self.n_warmup_epochs:

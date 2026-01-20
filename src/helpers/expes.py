@@ -26,6 +26,9 @@ from src.helpers.trainer import (
     GAEAECLossAuto,
     PerDeviceGAEAECLossAuto,
     PerDeviceGAEAECLoss,
+    MultiDeviceNILMLoss,
+    SimplifiedMultiDeviceLoss,
+    RobustMultiDeviceLoss,
     SeqToSeqLightningModule,
     TserLightningModule,
     DiffNILMLightningModule,
@@ -718,6 +721,40 @@ class ValidationHTMLCallback(pl.Callback):
         _save_val_data(
             pl_module, self.valid_loader, self.scaler, self.expes_config, epoch_idx
         )
+
+
+class RobustLossEpochCallback(pl.Callback):
+    """
+    Callback to update epoch for RobustMultiDeviceLoss.
+
+    This enables warmup scheduling and collapse detection/recovery.
+    """
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        criterion = getattr(pl_module, "criterion", None)
+        if criterion is not None and hasattr(criterion, "set_epoch"):
+            epoch = trainer.current_epoch
+            criterion.set_epoch(epoch)
+            if epoch == 0:
+                logging.info("RobustMultiDeviceLoss: Starting warmup period")
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        criterion = getattr(pl_module, "criterion", None)
+        if criterion is not None and hasattr(criterion, "collapse_detected"):
+            if criterion.collapse_detected:
+                logging.warning(
+                    "RobustMultiDeviceLoss: Collapse detected at epoch %d, recovery mode active",
+                    trainer.current_epoch
+                )
+                # Reset collapse flag after logging
+                criterion.collapse_detected = False
+
+        # Log device weights if using uncertainty weighting
+        if criterion is not None and hasattr(criterion, "inner_loss"):
+            inner = criterion.inner_loss
+            if hasattr(inner, "get_device_weights"):
+                weights = inner.get_device_weights()
+                logging.info("Device weights at epoch %d: %s", trainer.current_epoch, weights)
 
 
 class ValidationNILMMetricCallback(pl.Callback):
@@ -1784,6 +1821,13 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     metric_callback = ValidationNILMMetricCallback(valid_loader, scaler, expes_config)
     html_callback = ValidationHTMLCallback(valid_loader, scaler, expes_config)
     callbacks = [metric_callback, html_callback]
+
+    # Add RobustLossEpochCallback for simplified/multi_nilm loss types
+    loss_type_for_callback = str(getattr(expes_config, "loss_type", "")).lower()
+    if loss_type_for_callback in ("simplified", "multi_nilm"):
+        callbacks.append(RobustLossEpochCallback())
+        logging.info("Added RobustLossEpochCallback for %s loss", loss_type_for_callback)
+
     if expes_config.p_es is not None:
         callbacks.append(
             pl.callbacks.EarlyStopping(
@@ -2004,6 +2048,77 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                     criterion = PerDeviceGAEAECLoss(per_device_params, base_params)
                 else:
                     criterion = GAEAECLoss(**base_params)
+        elif loss_type == "multi_nilm":
+            # Recommended: Fusion of GAEAECLoss best practices with uncertainty weighting
+            # Combines:
+            # - GAEAECLoss: soft ON/OFF weighting, energy loss, focal gate loss, center_ratio
+            # - Modern MTL: uncertainty weighting for device balancing
+            # - Strong anti-collapse: prevents all-zero outputs
+            n_app = 1
+            if scaler is not None:
+                try:
+                    n_app = int(getattr(scaler, "n_appliance", 1) or 1)
+                except Exception:
+                    n_app = 1
+            if n_app < 1:
+                n_app = 1
+
+            device_stats_cfg = getattr(expes_config, "device_stats_for_loss", None)
+            if device_stats_cfg is not None and isinstance(device_stats_cfg, (list, tuple)):
+                device_stats = list(device_stats_cfg)
+            else:
+                device_stats = [
+                    {"duty_cycle": 0.1, "peak_power": 1000.0, "mean_on": 500.0}
+                    for _ in range(n_app)
+                ]
+
+            criterion = MultiDeviceNILMLoss(
+                n_devices=n_app,
+                device_stats=device_stats,
+                lambda_energy=float(getattr(expes_config, "loss_lambda_energy", 0.3)),
+                lambda_gate_cls=float(getattr(expes_config, "loss_lambda_gate_cls", 0.2)),
+                gate_focal_gamma=float(getattr(expes_config, "loss_gate_focal_gamma", 2.0)),
+                lambda_on_recall=float(getattr(expes_config, "loss_lambda_on_recall", 2.0)),
+                on_recall_margin=float(getattr(expes_config, "loss_on_recall_margin", 0.3)),
+                lambda_off=float(getattr(expes_config, "loss_lambda_off", 0.05)),
+                use_uncertainty_weighting=True,
+                center_ratio=float(getattr(expes_config, "loss_center_ratio", 1.0)),
+            )
+            logging.info(
+                "Using MultiDeviceNILMLoss with n_devices=%d (GAEAECLoss + uncertainty weighting)",
+                n_app
+            )
+        elif loss_type == "simplified":
+            # Alternative: Simplified loss without GAEAECLoss components
+            n_app = 1
+            if scaler is not None:
+                try:
+                    n_app = int(getattr(scaler, "n_appliance", 1) or 1)
+                except Exception:
+                    n_app = 1
+            if n_app < 1:
+                n_app = 1
+
+            device_stats_cfg = getattr(expes_config, "device_stats_for_loss", None)
+            if device_stats_cfg is not None and isinstance(device_stats_cfg, (list, tuple)):
+                device_stats = list(device_stats_cfg)
+            else:
+                device_stats = [
+                    {"duty_cycle": 0.1, "peak_power": 1000.0, "mean_on": 500.0}
+                    for _ in range(n_app)
+                ]
+
+            warmup_epochs = int(getattr(expes_config, "n_warmup_epochs", 3))
+            criterion = RobustMultiDeviceLoss(
+                n_devices=n_app,
+                device_stats=device_stats,
+                base_threshold=threshold_loss,
+                warmup_epochs=warmup_epochs,
+            )
+            logging.info(
+                "Using SimplifiedMultiDeviceLoss with n_devices=%d, warmup=%d epochs",
+                n_app, warmup_epochs
+            )
         elif loss_type == "smoothl1":
             criterion = nn.SmoothL1Loss()
         elif loss_type == "mse":
@@ -2012,25 +2127,39 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             criterion = nn.L1Loss()
         else:
             raise ValueError(f"Unsupported loss_type: {loss_type}")
-        state_zero_penalty_weight = float(
-            getattr(expes_config, "state_zero_penalty_weight", 0.0)
-        )
-        zero_run_kernel = int(getattr(expes_config, "state_zero_kernel", 0))
-        zero_run_ratio = float(getattr(expes_config, "state_zero_ratio", 0.8))
-        off_high_agg_penalty_weight = float(
-            getattr(expes_config, "off_high_agg_penalty_weight", 0.0)
-        )
-        off_state_penalty_weight = float(
-            getattr(expes_config, "off_state_penalty_weight", 0.0)
-        )
-        off_state_margin = float(getattr(expes_config, "off_state_margin", 0.0))
-        off_state_long_penalty_weight = float(
-            getattr(expes_config, "off_state_long_penalty_weight", 0.0)
-        )
-        off_state_long_kernel = int(getattr(expes_config, "off_state_long_kernel", 0))
-        off_state_long_margin = float(
-            getattr(expes_config, "off_state_long_margin", off_state_margin)
-        )
+
+        # For simplified/multi_nilm loss, disable all auxiliary penalties (handled internally)
+        if loss_type in ("simplified", "multi_nilm"):
+            state_zero_penalty_weight = 0.0
+            zero_run_kernel = 0
+            zero_run_ratio = 0.0
+            off_high_agg_penalty_weight = 0.0
+            off_state_penalty_weight = 0.0
+            off_state_margin = 0.0
+            off_state_long_penalty_weight = 0.0
+            off_state_long_kernel = 0
+            off_state_long_margin = 0.0
+            logging.info("Simplified loss: disabled all auxiliary trainer penalties")
+        else:
+            state_zero_penalty_weight = float(
+                getattr(expes_config, "state_zero_penalty_weight", 0.0)
+            )
+            zero_run_kernel = int(getattr(expes_config, "state_zero_kernel", 0))
+            zero_run_ratio = float(getattr(expes_config, "state_zero_ratio", 0.8))
+            off_high_agg_penalty_weight = float(
+                getattr(expes_config, "off_high_agg_penalty_weight", 0.0)
+            )
+            off_state_penalty_weight = float(
+                getattr(expes_config, "off_state_penalty_weight", 0.0)
+            )
+            off_state_margin = float(getattr(expes_config, "off_state_margin", 0.0))
+            off_state_long_penalty_weight = float(
+                getattr(expes_config, "off_state_long_penalty_weight", 0.0)
+            )
+            off_state_long_kernel = int(getattr(expes_config, "off_state_long_kernel", 0))
+            off_state_long_margin = float(
+                getattr(expes_config, "off_state_long_margin", off_state_margin)
+            )
         lightning_module = SeqToSeqLightningModule(
             inst_model,
             learning_rate=float(expes_config.model_training_param.lr),
@@ -2077,6 +2206,8 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                 getattr(expes_config, "train_crop_event_bias", 0.0) or 0.0
             ),
             anti_collapse_weight=float(getattr(expes_config, "anti_collapse_weight", 0.0)),
+            scheduler_type=str(getattr(expes_config, "scheduler_type", "cosine_warmup")),
+            total_epochs=int(expes_config.epochs),
         )
     accelerator = "cpu"
     devices = 1

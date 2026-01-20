@@ -141,6 +141,9 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
         n_ch = int(data.shape[1] - 1)
     except Exception:
         n_ch = 1
+    # Collect device stats for simplified loss (used by SimplifiedMultiDeviceLoss)
+    device_stats_for_loss = []
+
     if n_ch > 1:
         try:
             names = []
@@ -162,6 +165,13 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                 s_bin_i = (s_i > 0.5).astype(np.int8)
                 flat_i = p_i.reshape(-1)
                 if flat_i.size == 0:
+                    # Add default stats for empty device
+                    device_stats_for_loss.append({
+                        "duty_cycle": 0.1,
+                        "peak_power": 1000.0,
+                        "mean_on": 500.0,
+                        "name": names[i] if i < len(names) else str(i),
+                    })
                     continue
                 on_i = s_bin_i.reshape(-1) > 0
                 duty_i = float(on_i.mean())
@@ -170,6 +180,17 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                 mean_on_i = float(on_vals.mean()) if on_vals.size else 0.0
                 std_on_i = float(on_vals.std()) if on_vals.size > 1 else 0.0
                 cv_i = float(std_on_i / (mean_on_i + 1e-6))
+
+                # Save stats for simplified loss
+                device_stats_for_loss.append({
+                    "duty_cycle": duty_i,
+                    "peak_power": peak_i,
+                    "mean_on": mean_on_i,
+                    "std_on": std_on_i,
+                    "cv_on": cv_i,
+                    "name": names[i] if i < len(names) else str(i),
+                })
+
                 try:
                     if s_bin_i.ndim == 2 and s_bin_i.shape[0] > 0 and s_bin_i.shape[1] > 1:
                         diff_2d = np.diff(s_bin_i, axis=1)
@@ -195,8 +216,17 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                 expes_config["device_type_per_device"] = per_device
             if per_device_params:
                 expes_config["loss_params_per_device"] = per_device_params
-        except Exception:
-            pass
+
+            # Save device stats for simplified loss
+            if device_stats_for_loss:
+                expes_config["device_stats_for_loss"] = device_stats_for_loss
+                logging.info("Computed device stats for simplified loss: %d devices", len(device_stats_for_loss))
+                for ds in device_stats_for_loss:
+                    logging.info("  %s: duty=%.3f, peak=%.0f, mean_on=%.0f",
+                                ds.get("name", "?"), ds.get("duty_cycle", 0),
+                                ds.get("peak_power", 0), ds.get("mean_on", 0))
+        except Exception as e:
+            logging.debug("_configure_nilm_loss_hyperparams: multi-device stats failed: %s", e)
 
     # ============== Basic statistics ==============
     on_values = flat[on_mask] if on_mask.any() else flat
@@ -860,8 +890,16 @@ def main(
     expes_config["name_model"] = model_key
     expes_config["resume"] = bool(resume)
     expes_config["skip_final_eval"] = bool(no_final_eval)
+
+    # Auto-select loss type for multi-device training
+    is_multi_device = len(selected_keys) > 1 or appliance_lower == "multi"
     if loss_type is not None:
         expes_config["loss_type"] = str(loss_type)
+    elif is_multi_device and model_key.lower() == "nilmformer":
+        # Use multi_nilm loss for multi-device training by default
+        # This combines GAEAECLoss best practices with uncertainty weighting
+        expes_config["loss_type"] = "multi_nilm"
+        logging.info("Auto-selected 'multi_nilm' loss type for multi-device training")
     if overlap is not None:
         expes_config["overlap"] = float(overlap)
     if epochs is not None:
@@ -964,7 +1002,9 @@ if __name__ == "__main__":
         default=None,
         help=(
             "Loss type for NILM baselines. Choices: "
-            "'eaec', 'smoothl1', 'mse', 'mae'."
+            "'eaec', 'ga_eaec', 'ga_eaec_auto', 'multi_nilm', 'simplified', 'smoothl1', 'mse', 'mae'. "
+            "'multi_nilm' (recommended) combines GAEAECLoss with uncertainty weighting. "
+            "Auto-selected for multi-device training if not specified."
         ),
     )
     parser.add_argument(

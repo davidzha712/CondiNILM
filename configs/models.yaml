@@ -176,8 +176,8 @@ NILMFormer:
     norm_eps: 1e-5
   model_training_param:
     lr: 1e-4
-    wd: 0
+    wd: 0.01
     training_in_model: false
   model_training_param_eaec:
     lr: 5e-5
-    wd: 0
+    wd: 0.01

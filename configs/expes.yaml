@@ -17,7 +17,9 @@ batch_size:  128
 epochs:  25
 p_es:  null
 p_rlr:  3
-n_warmup_epochs:  0
+n_warmup_epochs:  3
+scheduler_type:  cosine_warmup   # cosine_warmup (recommended) / plateau
+rlr_min_lr:  1e-6
 
 device:  auto          # auto / cuda / mps / cpu
 accumulate_grad_batches: 1
