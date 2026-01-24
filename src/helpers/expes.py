@@ -21,14 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.helpers.trainer import (
-    EAECLoss,
-    GAEAECLoss,
-    GAEAECLossAuto,
-    PerDeviceGAEAECLossAuto,
-    PerDeviceGAEAECLoss,
-    MultiDeviceNILMLoss,
-    SimplifiedMultiDeviceLoss,
-    RobustMultiDeviceLoss,
+    AdaptiveDeviceLoss,
     SeqToSeqLightningModule,
     TserLightningModule,
     DiffNILMLightningModule,
@@ -41,8 +34,54 @@ from src.helpers.loss_tuning import AdaptiveLossTuner
 
 def _append_jsonl(path, record):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    epoch_new = record.get("epoch", None)
+    model_new = record.get("model", None)
+    appliance_new = record.get("appliance", None)
+
+    def _norm_epoch(val):
+        try:
+            return int(val)
+        except Exception:
+            return None
+
+    epoch_new_norm = _norm_epoch(epoch_new)
+    existing_lines = []
+
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line_stripped = line.strip()
+                    if not line_stripped:
+                        continue
+                    try:
+                        obj = json.loads(line_stripped)
+                    except Exception:
+                        existing_lines.append(line_stripped)
+                        continue
+                    epoch_old_norm = _norm_epoch(obj.get("epoch", None))
+                    model_old = obj.get("model", None)
+                    appliance_old = obj.get("appliance", None)
+                    if (
+                        epoch_new_norm is not None
+                        and epoch_old_norm is not None
+                        and epoch_old_norm == epoch_new_norm
+                        and model_old == model_new
+                        and appliance_old == appliance_new
+                    ):
+                        continue
+                    existing_lines.append(json.dumps(obj, ensure_ascii=False))
+        except Exception:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            return
+
+    existing_lines.append(json.dumps(record, ensure_ascii=False))
+
+    with open(path, "w", encoding="utf-8") as f:
+        for line in existing_lines:
+            f.write(line + "\n")
 
 
 def _sanitize_tb_tag(value):
@@ -52,18 +91,57 @@ def _sanitize_tb_tag(value):
 
 
 def _coerce_appliance_names(expes_config, n_app, fallback_name=None):
+    """
+    Get appliance names from config, with fallback to numeric indices.
+
+    FIXED: Now handles partial matches - if config has fewer names than n_app,
+    use available names and fill remaining with numeric indices.
+    """
+    app_names = None
     group_members = None
     if expes_config is not None:
+        app_names = getattr(expes_config, "app", None)
         group_members = getattr(expes_config, "appliance_group_members", None)
-    if group_members is not None and not isinstance(group_members, str):
+
+    n_app = int(n_app)
+    result = []
+
+    # Try to use app_names first
+    if app_names is not None and not isinstance(app_names, str):
         try:
-            if isinstance(group_members, Sequence) and len(group_members) == int(n_app):
-                return [str(x) for x in list(group_members)]
+            if isinstance(app_names, Sequence):
+                app_list = [str(x) for x in list(app_names)]
+                if len(app_list) == n_app:
+                    return app_list
+                # Partial match: use available names
+                result = app_list[:n_app]
         except Exception:
             pass
-    if isinstance(fallback_name, str) and fallback_name and int(n_app) == 1:
+
+    # Try group_members if app_names didn't work
+    if not result and group_members is not None and not isinstance(group_members, str):
+        try:
+            if isinstance(group_members, Sequence):
+                group_list = [str(x) for x in list(group_members)]
+                if len(group_list) == n_app:
+                    return group_list
+                # Partial match: use available names
+                result = group_list[:n_app]
+        except Exception:
+            pass
+
+    # Single device fallback
+    if not result and isinstance(fallback_name, str) and fallback_name and n_app == 1:
         return [str(fallback_name)]
-    return [str(j) for j in range(int(n_app))]
+
+    # Fill remaining slots with numeric indices
+    if result:
+        for j in range(len(result), n_app):
+            result.append(str(j))
+        return result
+
+    # Complete fallback to numeric indices
+    return [str(j) for j in range(n_app)]
 
 
 # ==== SotA NILM baselines ==== #
@@ -113,19 +191,25 @@ def get_device():
 
 
 def _get_num_workers(num_workers):
+    if platform.system() == "Windows":
+        return 0
     try:
         cpu_count = os.cpu_count()
     except Exception:
         cpu_count = None
     if cpu_count is None or cpu_count < 1:
         cpu_count = 1
-    if isinstance(num_workers, int) and num_workers > 0:
+    if isinstance(num_workers, int):
+        if num_workers <= 0:
+            return 0
         if num_workers > cpu_count:
             return cpu_count
         return num_workers
-    
+
+    if platform.system() == "Windows":
+        return 0
+
     base = max(1, cpu_count - 1)
-    
     if base > 16:
         base = 16
     return base
@@ -155,6 +239,152 @@ def _set_default_thread_env():
 
 def _dataloader_worker_init(worker_id):
     _set_default_thread_env()
+
+
+def _crop_center_tensor(x, ratio):
+    """
+    Crop tensor to center region for seq2subseq inference.
+
+    Args:
+        x: Tensor of shape (..., L) where L is sequence length
+        ratio: Ratio of center region to keep (0-1). E.g., 0.5 keeps middle 50%.
+
+    Returns:
+        Cropped tensor of shape (..., L*ratio)
+    """
+    if ratio >= 1.0:
+        return x
+    L = x.shape[-1]
+    crop_len = int(L * ratio)
+    crop_len = max(1, crop_len)
+    start = (L - crop_len) // 2
+    end = start + crop_len
+    return x[..., start:end]
+
+
+def create_sliding_windows(sequence, window_size, output_ratio):
+    """
+    Create overlapping sliding windows for seq2subseq inference.
+
+    The stride is set to center_size (window_size * output_ratio) so that
+    consecutive center regions are adjacent, enabling 1:1 resolution output.
+
+    Args:
+        sequence: Tensor of shape (C, T) where T is total sequence length
+        window_size: Size of each window (e.g., 128)
+        output_ratio: Ratio of center region (e.g., 0.5)
+
+    Returns:
+        windows: Tensor of shape (N, C, window_size) - N windows
+        padding_info: Dict with padding information for stitching
+    """
+    C, T = sequence.shape
+    center_size = int(window_size * output_ratio)
+    stride = center_size  # Stride = center_size for adjacent centers
+    margin = (window_size - center_size) // 2  # Edge margin
+
+    # Pad sequence so every point gets a center prediction
+    # Need margin padding on both ends
+    pad_left = margin
+    pad_right = margin + (stride - (T % stride)) % stride  # Align to stride
+    padded = torch.nn.functional.pad(sequence, (pad_left, pad_right), mode='replicate')
+    T_padded = padded.shape[-1]
+
+    # Extract windows
+    windows = []
+    for start in range(0, T_padded - window_size + 1, stride):
+        window = padded[:, start:start + window_size]
+        windows.append(window)
+
+    if not windows:
+        # Sequence too short, use single padded window
+        if T_padded < window_size:
+            extra_pad = window_size - T_padded
+            padded = torch.nn.functional.pad(padded, (0, extra_pad), mode='replicate')
+        windows.append(padded[:, :window_size])
+
+    windows = torch.stack(windows, dim=0)  # (N, C, window_size)
+
+    padding_info = {
+        'original_length': T,
+        'pad_left': pad_left,
+        'pad_right': pad_right,
+        'center_size': center_size,
+        'margin': margin,
+        'n_windows': len(windows),
+    }
+    return windows, padding_info
+
+
+def stitch_center_predictions(predictions, padding_info):
+    """
+    Stitch center predictions from sliding windows to form full sequence.
+
+    Args:
+        predictions: Tensor of shape (N, C, window_size) - predictions for each window
+        padding_info: Dict from create_sliding_windows
+
+    Returns:
+        stitched: Tensor of shape (C, T) - full sequence prediction with 1:1 resolution
+    """
+    center_size = padding_info['center_size']
+    margin = padding_info['margin']
+    original_length = padding_info['original_length']
+
+    # Extract center from each window
+    centers = []
+    for i in range(predictions.shape[0]):
+        window_pred = predictions[i]  # (C, window_size)
+        center = window_pred[:, margin:margin + center_size]  # (C, center_size)
+        centers.append(center)
+
+    # Concatenate centers
+    stitched_padded = torch.cat(centers, dim=-1)  # (C, N * center_size)
+
+    # Remove padding to get original length
+    stitched = stitched_padded[:, :original_length]
+
+    return stitched
+
+
+def inference_seq2subseq(model, sequence, window_size, output_ratio, device, batch_size=32):
+    """
+    Full sequence inference with seq2subseq sliding window approach.
+
+    Achieves 1:1 resolution output while avoiding boundary effects.
+
+    Args:
+        model: The trained model
+        sequence: Input tensor of shape (C_in, T) - full sequence
+        window_size: Size of each window (e.g., 128)
+        output_ratio: Ratio of center region (e.g., 0.5)
+        device: Device to run inference on
+        batch_size: Batch size for inference
+
+    Returns:
+        prediction: Tensor of shape (C_out, T) - 1:1 resolution prediction
+    """
+    model.eval()
+    sequence = sequence.to(device)
+
+    # Create sliding windows
+    windows, padding_info = create_sliding_windows(sequence, window_size, output_ratio)
+    n_windows = windows.shape[0]
+
+    # Batch inference
+    all_predictions = []
+    with torch.no_grad():
+        for i in range(0, n_windows, batch_size):
+            batch = windows[i:i + batch_size].to(device)  # (B, C_in, window_size)
+            pred = model(batch)  # (B, C_out, window_size)
+            all_predictions.append(pred.cpu())
+
+    predictions = torch.cat(all_predictions, dim=0)  # (N, C_out, window_size)
+
+    # Stitch center predictions
+    stitched = stitch_center_predictions(predictions, padding_info)
+
+    return stitched.to(device)
 
 
 def get_model_instance(name_model, c_in, window_size, **kwargs):
@@ -235,6 +465,32 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
     )
     sample_idx = 0
     timestamps_set = set()
+    result_root = os.path.dirname(
+        os.path.dirname(os.path.dirname(expes_config.result_path))
+    )
+    group_dir = os.path.join(
+        result_root,
+        "{}_{}".format(expes_config.dataset, expes_config.sampling_rate),
+        str(expes_config.window_size),
+    )
+    appliance_name = getattr(expes_config, "appliance", None)
+    if appliance_name is not None:
+        group_dir = os.path.join(group_dir, str(appliance_name))
+    os.makedirs(group_dir, exist_ok=True)
+    html_path = os.path.join(group_dir, "val_compare.html")
+    payload = {}
+    existing_agg = payload.get("agg")
+    existing_target = payload.get("target")
+    existing_timestamps = payload.get("timestamps")
+    existing_appliance_names = payload.get("appliance_names")
+    can_reuse_static = (
+        isinstance(existing_agg, list)
+        and isinstance(existing_target, list)
+        and (not has_time or isinstance(existing_timestamps, list))
+    )
+    reuse_static = False
+    timestamp_to_index = None
+    global_idx = 0
     with torch.no_grad():
         for batch in valid_loader:
             if isinstance(batch, (list, tuple)):
@@ -248,6 +504,8 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
             ts_agg_t = ts_agg.float().to(device)
             appl_t = appl.float().to(device)
             pred_t = model(ts_agg_t)
+            # seq2subseq: crop OUTPUTS to center region (model still sees full context)
+            output_ratio = float(getattr(expes_config, "output_ratio", 1.0))
             threshold_small_values = float(getattr(expes_config, "threshold", 0.0))
             threshold_postprocess = float(
                 getattr(expes_config, "postprocess_threshold", threshold_small_values)
@@ -256,14 +514,22 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
             gate_logits = None
             if hasattr(model, "model") and hasattr(model.model, "forward_with_gate"):
                 try:
-                    _power_raw, gate_logits, _cls_logits = model.model.forward_with_gate(ts_agg_t)
+                    _power_raw, gate_logits = model.model.forward_with_gate(ts_agg_t)
                 except Exception:
                     gate_logits = None
             elif hasattr(model, "forward_with_gate"):
                 try:
-                    _power_raw, gate_logits, _cls_logits = model.forward_with_gate(ts_agg_t)
+                    _power_raw, gate_logits = model.forward_with_gate(ts_agg_t)
                 except Exception:
                     gate_logits = None
+
+            # seq2subseq: crop outputs to center region (model sees full context, we only evaluate center)
+            if output_ratio < 1.0:
+                pred_t = _crop_center_tensor(pred_t, output_ratio)
+                appl_t = _crop_center_tensor(appl_t, output_ratio)
+                ts_agg_t = _crop_center_tensor(ts_agg_t, output_ratio)
+                if gate_logits is not None:
+                    gate_logits = _crop_center_tensor(gate_logits, output_ratio)
 
             agg_t = scaler.inverse_transform_agg_power(ts_agg_t[:, 0:1, :])
             target_t = scaler.inverse_transform_appliance(appl_t)
@@ -275,11 +541,51 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
             )
             pred_inv_raw = torch.clamp(pred_inv_raw, min=0.0)
             pred_inv = pred_inv_raw.clone()
-            pred_inv[pred_inv < threshold_postprocess] = 0.0
-            if min_on_steps > 1:
-                pred_inv = suppress_short_activations(
-                    pred_inv, threshold_postprocess, min_on_steps
-                )
+            if pred_inv.dim() == 3:
+                try:
+                    per_device_cfg = getattr(expes_config, "postprocess_per_device", None)
+                except Exception:
+                    per_device_cfg = None
+                if isinstance(per_device_cfg, dict) and per_device_cfg:
+                    n_app = int(pred_inv.size(1))
+                    device_names = _coerce_appliance_names(
+                        expes_config, n_app, appliance_name
+                    )
+                    for j in range(n_app):
+                        name_j = (
+                            device_names[j] if j < len(device_names) else str(j)
+                        )
+                        cfg_j = per_device_cfg.get(str(name_j))
+                        thr_j = float(threshold_postprocess)
+                        min_on_j = int(min_on_steps)
+                        if isinstance(cfg_j, dict):
+                            thr_j = float(
+                                cfg_j.get("postprocess_threshold", thr_j)
+                            )
+                            min_on_j = int(
+                                cfg_j.get(
+                                    "postprocess_min_on_steps", min_on_j
+                                )
+                            )
+                        ch = pred_inv[:, j : j + 1, :]
+                        ch[ch < thr_j] = 0.0
+                        if min_on_j > 1:
+                            ch = suppress_short_activations(
+                                ch, thr_j, min_on_j
+                            )
+                        pred_inv[:, j : j + 1, :] = ch
+                else:
+                    pred_inv[pred_inv < threshold_postprocess] = 0.0
+                    if min_on_steps > 1:
+                        pred_inv = suppress_short_activations(
+                            pred_inv, threshold_postprocess, min_on_steps
+                        )
+            else:
+                pred_inv[pred_inv < threshold_postprocess] = 0.0
+                if min_on_steps > 1:
+                    pred_inv = suppress_short_activations(
+                        pred_inv, threshold_postprocess, min_on_steps
+                    )
             if gate_logits is not None and bool(
                 getattr(expes_config, "postprocess_use_gate", True)
             ):
@@ -318,12 +624,58 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
             target_np = target_t.detach().cpu().numpy()
             pred_np = pred_inv.detach().cpu().numpy()
             batch_size = agg_np.shape[0]
-            if target_concat is None:
+            if target_concat is None and pred_concat is None:
                 n_app = target_np.shape[1]
-                target_concat = [[] for _ in range(n_app)]
-                pred_concat = [[] for _ in range(n_app)]
+                if can_reuse_static and isinstance(existing_appliance_names, list):
+                    if isinstance(existing_target, list) and len(existing_target) == n_app:
+                        reuse_static = True
+                if reuse_static:
+                    if isinstance(existing_agg, list):
+                        agg_concat = existing_agg
+                    if isinstance(existing_target, list):
+                        target_concat = existing_target
+                    if has_time and isinstance(existing_timestamps, list):
+                        timestamps_concat = existing_timestamps
+                        timestamp_to_index = {
+                            ts: i for i, ts in enumerate(existing_timestamps)
+                        }
+                    total_len = len(agg_concat)
+                    pred_concat = [[0.0] * total_len for _ in range(n_app)]
+                else:
+                    target_concat = [[] for _ in range(n_app)]
+                    pred_concat = [[] for _ in range(n_app)]
+            if reuse_static:
+                if has_time and timestamp_to_index is not None and dataset is not None:
+                    for b in range(batch_size):
+                        idx_sample = sample_idx + b
+                        start = dataset.st_date[idx_sample]
+                        tmp = pd.date_range(
+                            start=start,
+                            periods=pred_np.shape[2],
+                            freq=dataset.freq,
+                        )
+                        ts_list = tmp.strftime("%Y-%m-%d %H:%M:%S").tolist()
+                        for t, ts_str in enumerate(ts_list):
+                            if ts_str in timestamps_set:
+                                continue
+                            timestamps_set.add(ts_str)
+                            pos = timestamp_to_index.get(ts_str)
+                            if pos is None or pos >= len(pred_concat[0]):
+                                continue
+                            for j in range(pred_np.shape[1]):
+                                pred_concat[j][pos] = float(pred_np[b, j, t])
+                else:
+                    for b in range(batch_size):
+                        for t in range(pred_np.shape[2]):
+                            if global_idx >= len(pred_concat[0]):
+                                break
+                            for j in range(pred_np.shape[1]):
+                                pred_concat[j][global_idx] = float(pred_np[b, j, t])
+                            global_idx += 1
+                sample_idx += batch_size
+                continue
             for b in range(batch_size):
-                if has_time:
+                if has_time and dataset is not None:
                     idx = sample_idx + b
                     start = dataset.st_date[idx]
                     tmp = pd.date_range(
@@ -350,36 +702,8 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
             sample_idx += batch_size
     if target_concat is None:
         return
-    appliance_name = getattr(expes_config, "appliance", None)
     n_app = len(target_concat)
-    result_root = os.path.dirname(
-        os.path.dirname(os.path.dirname(expes_config.result_path))
-    )
-    group_dir = os.path.join(
-        result_root,
-        "{}_{}".format(expes_config.dataset, expes_config.sampling_rate),
-        str(expes_config.window_size),
-    )
-    if appliance_name is not None:
-        group_dir = os.path.join(group_dir, str(appliance_name))
-    os.makedirs(group_dir, exist_ok=True)
-    html_path = os.path.join(group_dir, "val_compare.html")
     model_name = expes_config.name_model
-    payload = {}
-    if os.path.isfile(html_path):
-        try:
-            with open(html_path, "r", encoding="utf-8") as f:
-                html_text = f.read()
-            marker = "const payload = "
-            idx = html_text.find(marker)
-            if idx != -1:
-                idx += len(marker)
-                end_idx = html_text.find(";", idx)
-                if end_idx != -1:
-                    payload_str = html_text[idx:end_idx].strip()
-                    payload = json.loads(payload_str)
-        except Exception:
-            payload = {}
     if not isinstance(payload, dict):
         payload = {}
     payload["agg"] = agg_concat
@@ -750,10 +1074,14 @@ class RobustLossEpochCallback(pl.Callback):
                 criterion.collapse_detected = False
 
         # Log device weights if using uncertainty weighting
-        if criterion is not None and hasattr(criterion, "inner_loss"):
-            inner = criterion.inner_loss
-            if hasattr(inner, "get_device_weights"):
-                weights = inner.get_device_weights()
+        if criterion is not None:
+            if hasattr(criterion, "inner_loss"):
+                inner = criterion.inner_loss
+                if hasattr(inner, "get_device_weights"):
+                    weights = inner.get_device_weights()
+                    logging.info("Device weights at epoch %d: %s", trainer.current_epoch, weights)
+            elif hasattr(criterion, "get_device_weights"):
+                weights = criterion.get_device_weights()
                 logging.info("Device weights at epoch %d: %s", trainer.current_epoch, weights)
 
 
@@ -826,6 +1154,8 @@ class ValidationNILMMetricCallback(pl.Callback):
             "off_long_run_pred_max": 0.0,
             "off_long_run_total_len": 0,
         }
+        # Use FP32 for validation to match training precision (force_fp32=True)
+        # bfloat16 autocast removed to prevent numerical instability
         with torch.no_grad():
             for batch in self.valid_loader:
                 if isinstance(batch, (list, tuple)):
@@ -868,14 +1198,58 @@ class ValidationNILMMetricCallback(pl.Callback):
                 )
                 pred_inv_raw = torch.clamp(pred_inv_raw, min=0.0)
                 pred_inv = pred_inv_raw.clone()
-                pred_inv[pred_inv < threshold_postprocess] = 0
-                if min_on_steps > 1:
-                    pred_inv = suppress_short_activations(
-                        pred_inv, threshold_postprocess, min_on_steps
-                    )
+                if pred_inv.dim() == 3:
+                    try:
+                        per_device_cfg = getattr(
+                            self.expes_config, "postprocess_per_device", None
+                        )
+                    except Exception:
+                        per_device_cfg = None
+                    if isinstance(per_device_cfg, dict) and per_device_cfg:
+                        n_app = int(pred_inv.size(1))
+                        device_names = _coerce_appliance_names(
+                            self.expes_config,
+                            n_app,
+                            getattr(self.expes_config, "appliance", None),
+                        )
+                        for j in range(n_app):
+                            name_j = (
+                                device_names[j] if j < len(device_names) else str(j)
+                            )
+                            cfg_j = per_device_cfg.get(str(name_j))
+                            thr_j = float(threshold_postprocess)
+                            min_on_j = int(min_on_steps)
+                            if isinstance(cfg_j, dict):
+                                thr_j = float(
+                                    cfg_j.get("postprocess_threshold", thr_j)
+                                )
+                                min_on_j = int(
+                                    cfg_j.get(
+                                        "postprocess_min_on_steps", min_on_j
+                                    )
+                                )
+                            ch = pred_inv[:, j : j + 1, :]
+                            ch[ch < thr_j] = 0
+                            if min_on_j > 1:
+                                ch = suppress_short_activations(
+                                    ch, thr_j, min_on_j
+                                )
+                            pred_inv[:, j : j + 1, :] = ch
+                    else:
+                        pred_inv[pred_inv < threshold_postprocess] = 0
+                        if min_on_steps > 1:
+                            pred_inv = suppress_short_activations(
+                                pred_inv, threshold_postprocess, min_on_steps
+                            )
+                else:
+                    pred_inv[pred_inv < threshold_postprocess] = 0
+                    if min_on_steps > 1:
+                        pred_inv = suppress_short_activations(
+                            pred_inv, threshold_postprocess, min_on_steps
+                        )
                 if hasattr(pl_module, "model") and hasattr(pl_module.model, "forward_with_gate"):
                     try:
-                        _power_raw, gate_logits, _cls_logits = pl_module.model.forward_with_gate(ts_agg_t)
+                        _power_raw, gate_logits = pl_module.model.forward_with_gate(ts_agg_t)
                         soft_scale = float(getattr(pl_module, "gate_soft_scale", 1.0))
                         post_scale = float(
                             getattr(
@@ -1440,6 +1814,10 @@ def evaluate_nilm_split(
         post_gate_soft_scale = getattr(expes_config, "postprocess_gate_soft_scale", None)
         gate_floor = float(getattr(expes_config, "gate_floor", gate_floor))
         gate_soft_scale = float(getattr(expes_config, "gate_soft_scale", gate_soft_scale))
+    # seq2subseq: ratio of center region to evaluate (model sees full context)
+    output_ratio = 1.0
+    if expes_config is not None:
+        output_ratio = float(getattr(expes_config, "output_ratio", 1.0))
     with torch.no_grad():
         iterator = data_loader
         try:
@@ -1464,7 +1842,7 @@ def evaluate_nilm_split(
             gate_logits = None
             if hasattr(model, "forward_with_gate"):
                 try:
-                    power_raw, gate_logits, _cls_logits = model.forward_with_gate(ts_agg_t)
+                    power_raw, gate_logits = model.forward_with_gate(ts_agg_t)
                     gate_logits = torch.nan_to_num(
                         gate_logits.float(), nan=0.0, posinf=0.0, neginf=0.0
                     )
@@ -1484,6 +1862,14 @@ def evaluate_nilm_split(
                     gate_logits = None
             if pred is None:
                 pred = model(ts_agg_t)
+            # seq2subseq: crop outputs to center region (model sees full context, we only evaluate center)
+            if output_ratio < 1.0:
+                pred = _crop_center_tensor(pred, output_ratio)
+                target = _crop_center_tensor(target, output_ratio)
+                if gate_logits is not None:
+                    gate_logits = _crop_center_tensor(gate_logits, output_ratio)
+                if state is not None:
+                    state = _crop_center_tensor(state.float(), output_ratio)
             target_inv = scaler.inverse_transform_appliance(target)
             pred_inv = scaler.inverse_transform_appliance(pred)
             pred_inv = torch.clamp(pred_inv, min=0.0)
@@ -1584,6 +1970,17 @@ def evaluate_nilm_split(
                         )
     if not y.size:
         return {}, {}
+    # Safety: ensure y_state matches y_hat length (can differ with output_ratio cropping)
+    if y_state.size and y_state.size != y_hat.size:
+        # Crop y_state to match y_hat if needed (center crop like output_ratio)
+        if y_state.size > y_hat.size:
+            ratio = y_hat.size / y_state.size
+            crop_len = y_hat.size
+            start = (y_state.size - crop_len) // 2
+            y_state = y_state[start:start + crop_len]
+        else:
+            # y_state shorter than y_hat - this shouldn't happen, but handle gracefully
+            y_state = np.array([])
     y_hat_state = (
         (y_hat > threshold_postprocess).astype(int) if y_state.size else None
     )
@@ -1606,6 +2003,14 @@ def evaluate_nilm_split(
             y_hat_j = per_device_data["y_hat"][j]
             if y_j.size and y_hat_j.size:
                 y_state_j = per_device_data["y_state"][j]
+                # Safety: ensure y_state_j matches y_hat_j length
+                if y_state_j.size and y_state_j.size != y_hat_j.size:
+                    if y_state_j.size > y_hat_j.size:
+                        crop_len = y_hat_j.size
+                        start = (y_state_j.size - crop_len) // 2
+                        y_state_j = y_state_j[start:start + crop_len]
+                    else:
+                        y_state_j = np.array([])
                 y_hat_state_j = (
                     (y_hat_j > threshold_postprocess).astype(int) if y_state_j.size else None
                 )
@@ -1687,44 +2092,8 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             freq=expes_config.sampling_rate,
         )
 
-    default_loss_type = "ga_eaec" if expes_config.name_model == "NILMFormer" else "eaec"
+    default_loss_type = "multi_nilm"  # Use AdaptiveDeviceLoss by default
     loss_type = str(getattr(expes_config, "loss_type", default_loss_type))
-    if loss_type in ["eaec", "ga_eaec", "ga_eaec_auto"] and expes_config.name_model == "NILMFormer":
-        p_es_eaec = getattr(expes_config, "p_es_eaec", None)
-        if p_es_eaec is not None:
-            expes_config.p_es = p_es_eaec
-        p_rlr_eaec = getattr(expes_config, "p_rlr_eaec", None)
-        if p_rlr_eaec is not None:
-            expes_config.p_rlr = p_rlr_eaec
-        n_warmup_eaec = getattr(expes_config, "n_warmup_epochs_eaec", None)
-        if n_warmup_eaec is not None:
-            expes_config.n_warmup_epochs = n_warmup_eaec
-        training_param_eaec = getattr(expes_config, "model_training_param_eaec", None)
-        if training_param_eaec is not None:
-            expes_config.model_training_param = training_param_eaec
-        warmup_type_eaec = getattr(expes_config, "warmup_type_eaec", None)
-        if warmup_type_eaec is not None:
-            expes_config.warmup_type = warmup_type_eaec
-        neg_penalty_weight_eaec = getattr(expes_config, "neg_penalty_weight_eaec", None)
-        if neg_penalty_weight_eaec is not None:
-            expes_config.neg_penalty_weight = neg_penalty_weight_eaec
-        rlr_factor_eaec = getattr(expes_config, "rlr_factor_eaec", None)
-        if rlr_factor_eaec is not None:
-            expes_config.rlr_factor = rlr_factor_eaec
-        rlr_min_lr_eaec = getattr(expes_config, "rlr_min_lr_eaec", None)
-        if rlr_min_lr_eaec is not None:
-            expes_config.rlr_min_lr = rlr_min_lr_eaec
-        gate_cls_weight_eaec = getattr(expes_config, "gate_cls_weight_eaec", None)
-        if gate_cls_weight_eaec is not None:
-            expes_config.gate_cls_weight = gate_cls_weight_eaec
-        gate_window_weight_eaec = getattr(
-            expes_config, "gate_window_weight_eaec", None
-        )
-        if gate_window_weight_eaec is not None:
-            expes_config.gate_window_weight = gate_window_weight_eaec
-        gate_focal_gamma_eaec = getattr(expes_config, "gate_focal_gamma_eaec", None)
-        if gate_focal_gamma_eaec is not None:
-            expes_config.gate_focal_gamma = gate_focal_gamma_eaec
 
     train_sampler = None
     try:
@@ -1736,7 +2105,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     if (
         balance_window_sampling
         and str(getattr(expes_config, "name_model", "")).lower() == "nilmformer"
-        and loss_type in ["eaec", "ga_eaec", "ga_eaec_auto"]
+        and loss_type == "multi_nilm"
     ):
         try:
             train_states = tuple_data[0][:, 1, 1, :]
@@ -1822,11 +2191,11 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     html_callback = ValidationHTMLCallback(valid_loader, scaler, expes_config)
     callbacks = [metric_callback, html_callback]
 
-    # Add RobustLossEpochCallback for simplified/multi_nilm loss types
+    # Add RobustLossEpochCallback for losses that need epoch updates (warmup scheduling)
     loss_type_for_callback = str(getattr(expes_config, "loss_type", "")).lower()
-    if loss_type_for_callback in ("simplified", "multi_nilm"):
+    if loss_type_for_callback == "multi_nilm":
         callbacks.append(RobustLossEpochCallback())
-        logging.info("Added RobustLossEpochCallback for %s loss", loss_type_for_callback)
+        logging.info("Added epoch callback for %s loss (warmup scheduling)", loss_type_for_callback)
 
     if expes_config.p_es is not None:
         callbacks.append(
@@ -1864,7 +2233,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             warmup_type=getattr(expes_config, "warmup_type", "linear"),
         )
     else:
-        default_loss_type = "ga_eaec" if expes_config.name_model == "NILMFormer" else "eaec"
+        default_loss_type = "multi_nilm"  # Use AdaptiveDeviceLoss by default
         loss_type = str(getattr(expes_config, "loss_type", default_loss_type))
         threshold_loss_raw = float(
             getattr(expes_config, "loss_threshold", expes_config.threshold)
@@ -1902,158 +2271,12 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                 threshold_loss = threshold_loss_raw / cutoff
         except Exception:
             threshold_loss = threshold_loss_raw
-        if loss_type in ["eaec", "ga_eaec", "ga_eaec_auto"]:
-            alpha_on = float(getattr(expes_config, "loss_alpha_on", 3.0))
-            alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
-            lambda_grad = float(getattr(expes_config, "loss_lambda_grad", 0.5))
-            lambda_energy = float(getattr(expes_config, "loss_lambda_energy", 0.5))
-            soft_temp_raw = float(getattr(expes_config, "loss_soft_temp", 10.0))
-            edge_eps_raw = float(getattr(expes_config, "loss_edge_eps", 5.0))
-            if loss_scale_denom is not None:
-                soft_temp = soft_temp_raw / loss_scale_denom if soft_temp_raw > 1.5 else soft_temp_raw
-                edge_eps = edge_eps_raw / loss_scale_denom if edge_eps_raw > 1.5 else edge_eps_raw
-            else:
-                soft_temp = soft_temp_raw
-                edge_eps = edge_eps_raw
-            lambda_sparse = float(getattr(expes_config, "loss_lambda_sparse", 0.0))
-            lambda_zero = float(getattr(expes_config, "loss_lambda_zero", 0.0))
-            center_ratio = float(getattr(expes_config, "loss_center_ratio", 1.0))
-            logging.info("Using loss_center_ratio=%.3f", center_ratio)
-            energy_floor_default = threshold_loss * float(expes_config.window_size) * 0.1
-            if hasattr(expes_config, "loss_energy_floor"):
-                energy_floor = float(expes_config.loss_energy_floor)
-            elif hasattr(expes_config, "loss_energy_floor_raw") and getattr(
-                expes_config, "cutoff", None
-            ):
-                energy_floor = float(expes_config.loss_energy_floor_raw) / float(
-                    expes_config.cutoff
-                )
-                if loss_scale_denom is not None and float(expes_config.loss_energy_floor_raw) > 1.5:
-                    energy_floor = float(expes_config.loss_energy_floor_raw) / loss_scale_denom
-            else:
-                energy_floor = energy_floor_default
-            if loss_type == "eaec":
-                criterion = EAECLoss(
-                    threshold=threshold_loss,
-                    alpha_on=alpha_on,
-                    alpha_off=alpha_off,
-                    lambda_grad=lambda_grad,
-                    lambda_energy=lambda_energy,
-                    soft_temp=soft_temp,
-                    edge_eps=edge_eps,
-                    energy_floor=energy_floor,
-                    lambda_sparse=lambda_sparse,
-                    lambda_zero=lambda_zero,
-                    center_ratio=center_ratio,
-                )
-            elif loss_type == "ga_eaec_auto":
-                lambda_off_hard = float(getattr(expes_config, "loss_lambda_off_hard", 0.1))
-                off_margin = float(getattr(expes_config, "loss_off_margin", 0.02))
-                lambda_on_recall = float(getattr(expes_config, "loss_lambda_on_recall", 0.3))
-                on_recall_margin = float(getattr(expes_config, "loss_on_recall_margin", 0.5))
-                lambda_gate_cls = float(getattr(expes_config, "loss_lambda_gate_cls", 0.1))
-                gate_focal_gamma = float(getattr(expes_config, "loss_gate_focal_gamma", 2.0))
-                base_params = {
-                    "threshold": threshold_loss,
-                    "alpha_on": alpha_on,
-                    "alpha_off": alpha_off,
-                    "soft_temp": soft_temp,
-                    "edge_eps": edge_eps,
-                    "energy_floor": energy_floor,
-                    "center_ratio": center_ratio,
-                    "off_margin": off_margin,
-                    "gate_focal_gamma": gate_focal_gamma,
-                    "lambda_off_hard": lambda_off_hard,
-                    "lambda_on_recall": lambda_on_recall,
-                    "on_recall_margin": on_recall_margin,
-                    "lambda_gate_cls": lambda_gate_cls,
-                }
-                per_device_params = None
-                n_app = 1
-                if scaler is not None:
-                    try:
-                        n_app = int(getattr(scaler, "n_appliance", 1) or 1)
-                    except Exception:
-                        n_app = 1
-                if n_app < 1:
-                    n_app = 1
-                cfg_per_device = getattr(expes_config, "loss_params_per_device", None)
-                if isinstance(cfg_per_device, dict) and n_app > 1:
-                    device_names = _coerce_appliance_names(
-                        expes_config,
-                        n_app,
-                        getattr(expes_config, "appliance", None)
-                        if expes_config is not None
-                        else None,
-                    )
-                    per_device_list = []
-                    for j in range(n_app):
-                        name_j = str(device_names[j]) if j < len(device_names) else str(j)
-                        params_j = cfg_per_device.get(name_j)
-                        per_device_list.append(params_j if isinstance(params_j, dict) else None)
-                    per_device_params = per_device_list
-                if per_device_params is not None:
-                    criterion = PerDeviceGAEAECLossAuto(per_device_params, base_params)
-                else:
-                    criterion = GAEAECLossAuto(**base_params)
-            else:
-                lambda_off_hard = float(getattr(expes_config, "loss_lambda_off_hard", 0.1))
-                off_margin = float(getattr(expes_config, "loss_off_margin", 0.02))
-                lambda_on_recall = float(getattr(expes_config, "loss_lambda_on_recall", 0.3))
-                on_recall_margin = float(getattr(expes_config, "loss_on_recall_margin", 0.5))
-                lambda_gate_cls = float(getattr(expes_config, "loss_lambda_gate_cls", 0.1))
-                gate_focal_gamma = float(getattr(expes_config, "loss_gate_focal_gamma", 2.0))
-                base_params = {
-                    "threshold": threshold_loss,
-                    "alpha_on": alpha_on,
-                    "alpha_off": alpha_off,
-                    "lambda_grad": lambda_grad,
-                    "lambda_energy": lambda_energy,
-                    "soft_temp": soft_temp,
-                    "edge_eps": edge_eps,
-                    "energy_floor": energy_floor,
-                    "lambda_sparse": lambda_sparse,
-                    "lambda_zero": lambda_zero,
-                    "center_ratio": center_ratio,
-                    "lambda_off_hard": lambda_off_hard,
-                    "off_margin": off_margin,
-                    "lambda_on_recall": lambda_on_recall,
-                    "on_recall_margin": on_recall_margin,
-                    "lambda_gate_cls": lambda_gate_cls,
-                    "gate_focal_gamma": gate_focal_gamma,
-                }
-                per_device_params = None
-                n_app = 1
-                if scaler is not None:
-                    try:
-                        n_app = int(getattr(scaler, "n_appliance", 1) or 1)
-                    except Exception:
-                        n_app = 1
-                if n_app < 1:
-                    n_app = 1
-                cfg_per_device = getattr(expes_config, "loss_params_per_device", None)
-                if isinstance(cfg_per_device, dict) and n_app > 1:
-                    device_names = _coerce_appliance_names(
-                        expes_config,
-                        n_app,
-                        getattr(expes_config, "appliance", None) if expes_config is not None else None,
-                    )
-                    per_device_list = []
-                    for j in range(n_app):
-                        name_j = str(device_names[j]) if j < len(device_names) else str(j)
-                        params_j = cfg_per_device.get(name_j)
-                        per_device_list.append(params_j if isinstance(params_j, dict) else None)
-                    per_device_params = per_device_list
-                if per_device_params is not None:
-                    criterion = PerDeviceGAEAECLoss(per_device_params, base_params)
-                else:
-                    criterion = GAEAECLoss(**base_params)
-        elif loss_type == "multi_nilm":
-            # Recommended: Fusion of GAEAECLoss best practices with uncertainty weighting
-            # Combines:
-            # - GAEAECLoss: soft ON/OFF weighting, energy loss, focal gate loss, center_ratio
-            # - Modern MTL: uncertainty weighting for device balancing
-            # - Strong anti-collapse: prevents all-zero outputs
+        if loss_type == "multi_nilm":
+            # AdaptiveDeviceLoss: Automatically adapts to each device's characteristics
+            # - Device type auto-classification (sparse, cycling, long_cycle, always_on)
+            # - Parameters derived from statistics, not manually tuned
+            # - Kendall uncertainty weighting for automatic device balancing
+            # - Device-specific loss strategies
             n_app = 1
             if scaler is not None:
                 try:
@@ -2063,62 +2286,59 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             if n_app < 1:
                 n_app = 1
 
-            device_stats_cfg = getattr(expes_config, "device_stats_for_loss", None)
-            if device_stats_cfg is not None and isinstance(device_stats_cfg, (list, tuple)):
-                device_stats = list(device_stats_cfg)
+            # Get device stats (support dict, DictConfig, and object access)
+            device_stats_cfg = None
+            try:
+                # Try dict-like access first (works for dict and OmegaConf DictConfig)
+                if hasattr(expes_config, "get"):
+                    device_stats_cfg = expes_config.get("device_stats_for_loss")
+                # Fallback to attribute access
+                if device_stats_cfg is None:
+                    device_stats_cfg = getattr(expes_config, "device_stats_for_loss", None)
+                # Try direct indexing for DictConfig
+                if device_stats_cfg is None and hasattr(expes_config, "__getitem__"):
+                    try:
+                        device_stats_cfg = expes_config["device_stats_for_loss"]
+                    except (KeyError, TypeError):
+                        pass
+            except Exception as e:
+                logging.warning("Error getting device_stats_for_loss: %s", e)
+            if device_stats_cfg is not None and hasattr(device_stats_cfg, "__iter__"):
+                device_stats = [dict(d) if hasattr(d, "items") else d for d in device_stats_cfg]
+                logging.info("Using computed device stats: %d devices", len(device_stats))
+                for i, ds in enumerate(device_stats):
+                    logging.info("  Device %d: duty=%.3f, peak=%.0f, mean_dur=%.1f",
+                                i, ds.get("duty_cycle", 0), ds.get("peak_power", 0),
+                                ds.get("mean_event_duration", 0))
             else:
+                # Default stats if not provided - will be auto-classified
                 device_stats = [
                     {"duty_cycle": 0.1, "peak_power": 1000.0, "mean_on": 500.0}
                     for _ in range(n_app)
                 ]
+                logging.info("Using DEFAULT device stats (config type: %s)", type(expes_config).__name__)
 
-            criterion = MultiDeviceNILMLoss(
+            warmup_epochs = int(getattr(expes_config, "n_warmup_epochs", 2))
+            output_ratio = float(getattr(expes_config, "output_ratio", 1.0))
+            criterion = AdaptiveDeviceLoss(
                 n_devices=n_app,
                 device_stats=device_stats,
-                lambda_energy=float(getattr(expes_config, "loss_lambda_energy", 0.3)),
-                lambda_gate_cls=float(getattr(expes_config, "loss_lambda_gate_cls", 0.2)),
-                gate_focal_gamma=float(getattr(expes_config, "loss_gate_focal_gamma", 2.0)),
-                lambda_on_recall=float(getattr(expes_config, "loss_lambda_on_recall", 2.0)),
-                on_recall_margin=float(getattr(expes_config, "loss_on_recall_margin", 0.3)),
-                lambda_off=float(getattr(expes_config, "loss_lambda_off", 0.05)),
-                use_uncertainty_weighting=True,
-                center_ratio=float(getattr(expes_config, "loss_center_ratio", 1.0)),
-            )
-            logging.info(
-                "Using MultiDeviceNILMLoss with n_devices=%d (GAEAECLoss + uncertainty weighting)",
-                n_app
-            )
-        elif loss_type == "simplified":
-            # Alternative: Simplified loss without GAEAECLoss components
-            n_app = 1
-            if scaler is not None:
-                try:
-                    n_app = int(getattr(scaler, "n_appliance", 1) or 1)
-                except Exception:
-                    n_app = 1
-            if n_app < 1:
-                n_app = 1
-
-            device_stats_cfg = getattr(expes_config, "device_stats_for_loss", None)
-            if device_stats_cfg is not None and isinstance(device_stats_cfg, (list, tuple)):
-                device_stats = list(device_stats_cfg)
-            else:
-                device_stats = [
-                    {"duty_cycle": 0.1, "peak_power": 1000.0, "mean_on": 500.0}
-                    for _ in range(n_app)
-                ]
-
-            warmup_epochs = int(getattr(expes_config, "n_warmup_epochs", 3))
-            criterion = RobustMultiDeviceLoss(
-                n_devices=n_app,
-                device_stats=device_stats,
-                base_threshold=threshold_loss,
                 warmup_epochs=warmup_epochs,
+                output_ratio=output_ratio,
             )
+            # Log device classifications with full stats
+            device_info = criterion.get_device_info()
             logging.info(
-                "Using SimplifiedMultiDeviceLoss with n_devices=%d, warmup=%d epochs",
-                n_app, warmup_epochs
+                "Using AdaptiveDeviceLoss with n_devices=%d, warmup=%d epochs, output_ratio=%.2f (seq2subseq)",
+                n_app, warmup_epochs, output_ratio
             )
+            for i, dtype in enumerate(device_info["device_types"]):
+                ds = device_stats[i] if i < len(device_stats) else {}
+                logging.info("  Device %d: type=%s (duty=%.3f, mean_dur=%.1f, cv=%.2f)",
+                            i, dtype,
+                            ds.get("duty_cycle", 0),
+                            ds.get("mean_event_duration", 0),
+                            ds.get("cv_on", 0))
         elif loss_type == "smoothl1":
             criterion = nn.SmoothL1Loss()
         elif loss_type == "mse":
@@ -2128,8 +2348,8 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         else:
             raise ValueError(f"Unsupported loss_type: {loss_type}")
 
-        # For simplified/multi_nilm loss, disable all auxiliary penalties (handled internally)
-        if loss_type in ("simplified", "multi_nilm"):
+        # For multi_nilm (AdaptiveDeviceLoss), disable all auxiliary penalties (handled internally)
+        if loss_type == "multi_nilm":
             state_zero_penalty_weight = 0.0
             zero_run_kernel = 0
             zero_run_ratio = 0.0
@@ -2139,7 +2359,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             off_state_long_penalty_weight = 0.0
             off_state_long_kernel = 0
             off_state_long_margin = 0.0
-            logging.info("Simplified loss: disabled all auxiliary trainer penalties")
+            logging.info("%s loss: disabled all auxiliary trainer penalties", loss_type)
         else:
             state_zero_penalty_weight = float(
                 getattr(expes_config, "state_zero_penalty_weight", 0.0)
@@ -2197,7 +2417,9 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             ),
             gate_focal_gamma=float(getattr(expes_config, "gate_focal_gamma", 2.0)),
             gate_soft_scale=float(getattr(expes_config, "gate_soft_scale", 1.0)),
-            gate_floor=float(getattr(expes_config, "gate_floor", 0.1)),
+            # FIXED: Reduced gate_floor from 0.2 to 0.02 to prevent floor noise in OFF state
+            # High gate_floor caused significant floor noise (tens of watts) when devices should be OFF
+            gate_floor=float(getattr(expes_config, "gate_floor", 0.02)),
             gate_duty_weight=float(getattr(expes_config, "gate_duty_weight", 0.0)),
             train_crop_len=int(getattr(expes_config, "train_crop_len", 0) or 0),
             train_crop_ratio=float(getattr(expes_config, "train_crop_ratio", 0.0) or 0.0),
@@ -2248,18 +2470,9 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             appliance_name = str(getattr(expes_config, "appliance", "") or "")
         except Exception:
             appliance_name = ""
-        try:
-            loss_type_for_prec = str(getattr(expes_config, "loss_type", "") or "")
-        except Exception:
-            loss_type_for_prec = ""
-        force_fp32 = bool(
-            str(getattr(expes_config, "name_model", "")).lower() == "nilmformer"
-            and loss_type_for_prec in ("eaec", "ga_eaec")
-            and (
-                device_type in ("frequent_switching", "cycling_low_power")
-                or appliance_name.lower() in ("fridge",)
-            )
-        )
+        # Use FP32 precision to prevent numerical instability with mixed precision
+        # (bfloat16/float16 can cause NaN in model weights during training)
+        force_fp32 = True
         if force_fp32:
             precision = "32"
         else:
@@ -2297,10 +2510,8 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                 "Resume flag is set but no last checkpoint found at %s, train from scratch.",
                 ckpt_last_candidates[0],
             )
-    loss_type = str(getattr(expes_config, "loss_type", "eaec"))
-    gradient_clip_val = 0.0
-    if loss_type in ["eaec", "ga_eaec", "ga_eaec_auto"]:
-        gradient_clip_val = float(getattr(expes_config, "gradient_clip_val_eaec", 1.0))
+    # Enable gradient clipping to prevent gradient explosion with mixed precision
+    gradient_clip_val = 1.0
     accumulate_grad_batches = int(
         getattr(expes_config, "accumulate_grad_batches", 1)
     )

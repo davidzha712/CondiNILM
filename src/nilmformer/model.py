@@ -54,11 +54,10 @@ class NILMFormer(nn.Module):
         self.ProjStats2 = nn.Linear(d_model, 2)
 
         # ============ Encoder ============#
-        layers = []
-        for _ in range(n_encoder_layers):
-            layers.append(EncoderLayer(NFConfig))
-        layers.append(nn.LayerNorm(d_model))
-        self.EncoderBlock = nn.Sequential(*layers)
+        self.encoder_layers = nn.ModuleList(
+            [EncoderLayer(NFConfig) for _ in range(n_encoder_layers)]
+        )
+        self.final_norm = nn.LayerNorm(d_model)
 
         self.SharedHead = nn.Conv1d(
             in_channels=d_model,
@@ -68,19 +67,52 @@ class NILMFormer(nn.Module):
             padding_mode="replicate",
         )
 
-        self.PowerHead = nn.Conv1d(
-            in_channels=d_model,
-            out_channels=c_out,
-            kernel_size=1,
-        )
+        type_ids = getattr(NFConfig, "type_ids_per_channel", None)
+        self.type_ids = None
+        self.type_group_indices = None
+        self.type_group_to_module = None
+        self.type_power_heads = None
+        self.type_gate_heads = None
 
-        self.GateHead = nn.Conv1d(
-            in_channels=d_model,
-            out_channels=c_out,
-            kernel_size=1,
-        )
+        if type_ids is not None and isinstance(type_ids, (list, tuple)) and c_out > 1:
+            ids = [int(x) for x in list(type_ids)]
+            if len(ids) == c_out:
+                self.type_ids = ids
+                max_gid = max(ids) if ids else -1
+                if max_gid >= 0:
+                    group_indices = []
+                    for gid in range(max_gid + 1):
+                        idxs = [i for i, t in enumerate(ids) if t == gid]
+                        group_indices.append(idxs)
+                    self.type_group_indices = group_indices
+                    self.type_power_heads = nn.ModuleList()
+                    self.type_gate_heads = nn.ModuleList()
+                    group_to_module = []
+                    for gid, idxs in enumerate(group_indices):
+                        if not idxs:
+                            group_to_module.append(-1)
+                            continue
+                        group_to_module.append(len(self.type_power_heads))
+                        self.type_power_heads.append(
+                            nn.Conv1d(in_channels=d_model, out_channels=len(idxs), kernel_size=1)
+                        )
+                        self.type_gate_heads.append(
+                            nn.Conv1d(in_channels=d_model, out_channels=len(idxs), kernel_size=1)
+                        )
+                    self.type_group_to_module = group_to_module
 
-        self.WindowClsHead = nn.Linear(d_model, c_out)
+        if self.type_ids is None:
+            self.PowerHead = nn.Conv1d(
+                in_channels=d_model,
+                out_channels=c_out,
+                kernel_size=1,
+            )
+
+            self.GateHead = nn.Conv1d(
+                in_channels=d_model,
+                out_channels=c_out,
+                kernel_size=1,
+            )
 
         self.output_stats_alpha = 0.0
         self.output_stats_mean_max = 0.0
@@ -100,9 +132,33 @@ class NILMFormer(nn.Module):
             self.device_embed = nn.Embedding(c_out, film_hidden_dim)
             self.film_fc1 = nn.Linear(d_feat + film_hidden_dim, film_hidden_dim)
             self.film_fc2 = nn.Linear(film_hidden_dim, 2)
+            # Device-specific encoder FiLM: each device gets independent encoder modulation
+            self.encoder_device_embed = nn.Embedding(c_out, film_hidden_dim)
+            self.encoder_film_fc1 = nn.Linear(d_feat + film_hidden_dim, film_hidden_dim)
+            self.encoder_film_fc2 = nn.Linear(
+                film_hidden_dim, n_encoder_layers * 2 * d_model
+            )
+
+        # Device-specific adapter layers to reduce gradient conflict
+        # Each device gets a small adapter after SharedHead
+        self.device_adapters = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv1d(d_model, d_model // 2, kernel_size=1),
+                nn.ReLU(),
+                nn.Conv1d(d_model // 2, d_model, kernel_size=1),
+            )
+            for _ in range(c_out)
+        ])
 
         # ============ Initialize Weights ============#
         self.initialize_weights()
+        if hasattr(self, "PowerHead"):
+            if self.PowerHead.bias is not None:
+                nn.init.constant_(self.PowerHead.bias, -1.0)
+        if self.type_power_heads is not None:
+            for head in self.type_power_heads:
+                if head.bias is not None:
+                    nn.init.constant_(head.bias, -1.0)
 
     def _compute_condition_features(self, x_main):
         x_main = x_main.float()
@@ -166,6 +222,49 @@ class NILMFormer(nn.Module):
         beta = 0.1 * torch.tanh(raw_beta)
         return gamma, beta
 
+    def _compute_encoder_film_params(self, x_main):
+        """
+        Compute device-specific encoder FiLM parameters.
+
+        CRITICAL FIX: Now computes independent FiLM parameters for each device,
+        preventing the "robbing Peter to pay Paul" problem where optimizing
+        one device hurts another.
+
+        Returns:
+            gamma: (B, n_devices, n_layers, d_model) - per-device, per-layer gamma
+            beta: (B, n_devices, n_layers, d_model) - per-device, per-layer beta
+        """
+        if not self.use_film:
+            return None, None
+        cond = self._compute_condition_features(x_main)
+        B = cond.size(0)
+        n_layers = self.NFConfig.n_encoder_layers
+        d_model = self.NFConfig.d_model
+        C_out = self.NFConfig.c_out
+
+        # Get device embeddings for ALL devices
+        device_ids = torch.arange(C_out, device=x_main.device)
+        dev_emb = self.encoder_device_embed(device_ids)  # (C_out, film_hidden_dim)
+        dev_emb = dev_emb.unsqueeze(0).expand(B, -1, -1)  # (B, C_out, film_hidden_dim)
+
+        # Expand condition features for each device
+        cond_exp = cond.unsqueeze(1).expand(-1, C_out, -1)  # (B, C_out, d_feat)
+
+        # Concatenate condition with device embedding
+        inp = torch.cat([cond_exp, dev_emb], dim=-1)  # (B, C_out, d_feat + film_hidden_dim)
+
+        # Compute per-device encoder FiLM parameters
+        h = torch.relu(self.encoder_film_fc1(inp))  # (B, C_out, film_hidden_dim)
+        gb = self.encoder_film_fc2(h)  # (B, C_out, n_layers * 2 * d_model)
+        gb = gb.view(B, C_out, n_layers, 2, d_model)
+
+        raw_gamma = gb[:, :, :, 0, :]  # (B, C_out, n_layers, d_model)
+        raw_beta = gb[:, :, :, 1, :]   # (B, C_out, n_layers, d_model)
+
+        gamma = 0.1 * torch.tanh(raw_gamma)
+        beta = 0.1 * torch.tanh(raw_beta)
+        return gamma, beta
+
     def set_output_stats(self, alpha=None, mean_max=None, std_max=None):
         if alpha is not None:
             self.output_stats_alpha = float(alpha)
@@ -180,6 +279,11 @@ class NILMFormer(nn.Module):
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
+            torch.nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.Conv1d):
+            # Initialize Conv1d layers properly
             torch.nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
@@ -207,7 +311,8 @@ class NILMFormer(nn.Module):
         #   x[:, :1, :] => load curve
         #   x[:, 1:, :] => exogenous input(s)
         encoding = x[:, 1:, :]
-        x = x[:, :1, :]
+        x_main_original = x[:, :1, :]  # Save original for FiLM computation
+        x = x_main_original
 
         # === Instance Normalization === #
         inst_mean = torch.mean(x, dim=-1, keepdim=True).detach()
@@ -229,17 +334,64 @@ class NILMFormer(nn.Module):
         x = torch.cat([x, stats_token], dim=1)
 
         # === Transformer Encoder === #
-        x_full = self.EncoderBlock(x)
+        # Get device-specific encoder FiLM parameters
+        encoder_gamma, encoder_beta = self._compute_encoder_film_params(
+            x_main_original
+        )
+        for idx, layer in enumerate(self.encoder_layers):
+            if encoder_gamma is not None and encoder_beta is not None:
+                # Use mean across devices for shared encoder (balanced approach)
+                # Shape: encoder_gamma is (B, C_out, n_layers, d_model)
+                gamma_l = encoder_gamma[:, :, idx, :].mean(dim=1).unsqueeze(1)  # (B, 1, d_model)
+                beta_l = encoder_beta[:, :, idx, :].mean(dim=1).unsqueeze(1)    # (B, 1, d_model)
+                x = layer(x, gamma=gamma_l, beta=beta_l)
+            else:
+                x = layer(x)
+        x_full = self.final_norm(x)
         stats_feat = x_full[:, -1:, :]
-        x = x_full[:, :-1, :]  # (B, L, d_model)
-
+        x = x_full[:, :-1, :]
         x = x.permute(0, 2, 1)
         shared_feat = self.SharedHead(x)
-        gamma, beta = self._compute_film_params(x_main=x)
-        power_raw = self.PowerHead(shared_feat)
+
+        # Apply device-specific adapters BEFORE the prediction heads
+        # This reduces gradient conflict between devices
+        B, D, L = shared_feat.shape
+        c_out = self.NFConfig.c_out
+        adapted_feats = []
+        for dev_idx in range(c_out):
+            # Each device gets its own adapted feature
+            adapted = self.device_adapters[dev_idx](shared_feat)  # (B, D, L)
+            # Residual connection for stability
+            adapted = shared_feat + 0.1 * adapted
+            adapted_feats.append(adapted)
+
+        gamma, beta = self._compute_film_params(x_main=x_main_original)
+
+        if self.type_ids is None or self.type_power_heads is None:
+            # Use mean of adapted features for single head mode
+            mean_adapted = torch.stack(adapted_feats, dim=0).mean(dim=0)  # (B, D, L)
+            power_raw = self.PowerHead(mean_adapted)
+        else:
+            power_raw = shared_feat.new_zeros(B, c_out, L)
+            for gid, idxs in enumerate(self.type_group_indices):
+                if not idxs:
+                    continue
+                mid = self.type_group_to_module[gid]
+                if mid < 0:
+                    continue
+                head = self.type_power_heads[mid]
+                # Use device-specific adapted features for each group
+                for local_idx, global_idx in enumerate(idxs):
+                    dev_adapted = adapted_feats[global_idx]  # (B, D, L)
+                    out_single = head(dev_adapted)[:, local_idx:local_idx+1, :]  # (B, 1, L)
+                    power_raw[:, global_idx:global_idx+1, :] = out_single
+
         if gamma is not None and beta is not None:
             power_raw = (1.0 + gamma) * power_raw + beta
         power_raw = torch.clamp(power_raw, min=-10.0)
+        # Use softplus for smooth non-negative output
+        # REMOVED: fixed +0.01 bias that caused floor noise in OFF state
+        # The model should learn to output near-zero for OFF state through training
         power = F.softplus(power_raw)
 
         alpha = float(getattr(self, "output_stats_alpha", 0.0))
@@ -277,19 +429,65 @@ class NILMFormer(nn.Module):
             torch.cat([inst_mean, inst_std], dim=1).permute(0, 2, 1)
         )
         x_enc = torch.cat([x_cat, stats_token], dim=1)
-        x_enc = self.EncoderBlock(x_enc)
+        # Get device-specific encoder FiLM parameters
+        encoder_gamma, encoder_beta = self._compute_encoder_film_params(
+            x[:, :1, :]
+        )
+        for idx, layer in enumerate(self.encoder_layers):
+            if encoder_gamma is not None and encoder_beta is not None:
+                # Use mean across devices for shared encoder
+                gamma_l = encoder_gamma[:, :, idx, :].mean(dim=1).unsqueeze(1)
+                beta_l = encoder_beta[:, :, idx, :].mean(dim=1).unsqueeze(1)
+                x_enc = layer(x_enc, gamma=gamma_l, beta=beta_l)
+            else:
+                x_enc = layer(x_enc)
+        x_enc = self.final_norm(x_enc)
         stats_feat = x_enc[:, -1:, :]
         x_feat = x_enc[:, :-1, :].permute(0, 2, 1)
         shared_feat = self.SharedHead(x_feat)
+
+        # Apply device-specific adapters
+        B, D, L = shared_feat.shape
+        c_out = self.NFConfig.c_out
+        adapted_feats = []
+        for dev_idx in range(c_out):
+            adapted = self.device_adapters[dev_idx](shared_feat)
+            adapted = shared_feat + 0.1 * adapted  # Residual connection
+            adapted_feats.append(adapted)
+
         gamma, beta = self._compute_film_params(x_main=x[:, :1, :])
-        power_raw = self.PowerHead(shared_feat)
-        gate = self.GateHead(shared_feat)
+
+        if self.type_ids is None or self.type_power_heads is None:
+            mean_adapted = torch.stack(adapted_feats, dim=0).mean(dim=0)
+            power_raw = self.PowerHead(mean_adapted)
+            gate = self.GateHead(mean_adapted)
+        else:
+            power_raw = shared_feat.new_zeros(B, c_out, L)
+            gate = shared_feat.new_zeros(B, c_out, L)
+            for gid, idxs in enumerate(self.type_group_indices):
+                if not idxs:
+                    continue
+                mid = self.type_group_to_module[gid]
+                if mid < 0:
+                    continue
+                p_head = self.type_power_heads[mid]
+                g_head = self.type_gate_heads[mid]
+                # Use device-specific adapted features
+                for local_idx, global_idx in enumerate(idxs):
+                    dev_adapted = adapted_feats[global_idx]
+                    out_p = p_head(dev_adapted)[:, local_idx:local_idx+1, :]
+                    out_g = g_head(dev_adapted)[:, local_idx:local_idx+1, :]
+                    power_raw[:, global_idx:global_idx+1, :] = out_p
+                    gate[:, global_idx:global_idx+1, :] = out_g
+
         if gamma is not None and beta is not None:
             power_raw = (1.0 + gamma) * power_raw + beta
         alpha = float(getattr(self, "output_stats_alpha", 0.0))
         mean_max = float(getattr(self, "output_stats_mean_max", 0.0))
         std_max = float(getattr(self, "output_stats_std_max", 0.0))
         power_raw = torch.clamp(power_raw, min=-10.0)
+        # Use softplus for smooth non-negative output
+        # REMOVED: fixed +0.01 bias that caused floor noise in OFF state
         power = F.softplus(power_raw)
         if alpha > 0.0 and (mean_max > 0.0 or std_max > 0.0):
             stats_out = self.ProjStats2(stats_feat).float()
@@ -299,8 +497,7 @@ class NILMFormer(nn.Module):
             std = 1.0 + (alpha * std_max) * torch.sigmoid(raw_std)
             std = torch.clamp(std, min=1e-3)
             power = power * std + mean
-        cls_logits = self.WindowClsHead(stats_feat.squeeze(1))
-        return power, gate, cls_logits
+        return power, gate
 
     def forward_gated(self, x, gate_mode="soft", gate_threshold=0.5, soft_scale=1.0):
         """

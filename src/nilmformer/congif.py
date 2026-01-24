@@ -33,6 +33,9 @@ class NILMFormerConfig:
     use_film: bool = True
     film_hidden_dim: int = 32
 
+    kettle_channel_idx: int | None = None
+    type_ids_per_channel: List[int] | None = None
+
     def __post_init__(self):
         self.c_in = int(self.c_in)
         self.c_embedding = int(self.c_embedding)
@@ -55,3 +58,7 @@ class NILMFormerConfig:
         self.use_elec_features = bool(self.use_elec_features)
         self.use_film = bool(self.use_film)
         self.film_hidden_dim = int(self.film_hidden_dim)
+        if self.type_ids_per_channel is not None:
+            self.type_ids_per_channel = [int(x) for x in list(self.type_ids_per_channel)]
+        if self.kettle_channel_idx is not None:
+            self.kettle_channel_idx = int(self.kettle_channel_idx)

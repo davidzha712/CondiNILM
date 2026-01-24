@@ -44,8 +44,10 @@ gate_cls_weight_eaec: 1.0
 gate_window_weight_eaec: 0.5
 gate_focal_gamma_eaec: 2.0
 
-# seq2subseq Center Supervision Ratio
-loss_center_ratio: 0.8
+# seq2subseq: Only supervise center region of output to reduce boundary effects
+# 0.5 means supervise middle 50% (e.g., input 128 -> supervise middle 64 points)
+# Inference will also only use center predictions, discarding edges
+output_ratio: 0.5
 
 # Zero-run penalty for target=0 segments
 state_zero_penalty_weight: 0.1
@@ -66,8 +68,8 @@ off_high_agg_penalty_weight: 0.3
 #   - always_on:            always-on appliances
 #   - sparse_medium_power:  sparse medium-power appliances
 #
-# 使用自动权重版 GA-EAEC Loss，减少手工调节的权重超参数
-loss_type: ga_eaec_auto
+# 使用 AdaptiveDeviceLoss (multi_nilm) - 自动根据设备类型调整参数
+loss_type: multi_nilm
 
 # ===== OFF false-positive penalty (mild, prevents learning all-zero output) =====
 # lambda_off_hard: OFF-state hard constraint weight (lower!)
@@ -89,3 +91,14 @@ loss_lambda_gate_cls: 0.1
 
 # gate_focal_gamma: Focal Loss gamma parameter
 loss_gate_focal_gamma: 2.0
+
+postprocess_gate_avg_threshold: 0.25
+postprocess_gate_max_threshold: 0.5
+
+postprocess_per_device:
+  Microwave:
+    postprocess_threshold: 15
+    postprocess_min_on_steps: 1
+  Fridge:
+    postprocess_threshold: 15
+    postprocess_min_on_steps: 2

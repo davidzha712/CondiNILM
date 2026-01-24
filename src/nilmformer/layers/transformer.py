@@ -127,13 +127,15 @@ class EncoderLayer(nn.Module):
             dp_rate=NFconfig.dp_rate,
         )
 
-    def forward(self, x) -> torch.Tensor:
+    def forward(self, x, gamma=None, beta=None) -> torch.Tensor:
         x = self.norm1(x)
         new_x = self.attention_layer(x)
         x = torch.add(x, new_x)
 
         x = self.norm2(x)
         new_x = self.pffn(x)
+        if gamma is not None and beta is not None:
+            new_x = (1.0 + gamma) * new_x + beta
         new_x = torch.nan_to_num(new_x, nan=0.0, posinf=1e4, neginf=-1e4)
         x = torch.add(x, self.dropout(new_x))
 

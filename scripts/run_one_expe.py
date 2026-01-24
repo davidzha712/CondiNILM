@@ -141,21 +141,24 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
         n_ch = int(data.shape[1] - 1)
     except Exception:
         n_ch = 1
-    # Collect device stats for simplified loss (used by SimplifiedMultiDeviceLoss)
     device_stats_for_loss = []
 
     if n_ch > 1:
         try:
             names = []
-            members = getattr(expes_config, "appliance_group_members", None)
-            if isinstance(members, Sequence) and not isinstance(members, (str, bytes)):
-                names = [str(x) for x in list(members)]
             apps = getattr(expes_config, "app", None)
-            if not names and isinstance(apps, Sequence) and not isinstance(apps, (str, bytes)):
+            if isinstance(apps, Sequence) and not isinstance(apps, (str, bytes)):
                 names = [str(x) for x in list(apps)]
             if not names:
+                members = getattr(expes_config, "appliance_group_members", None)
+                if isinstance(members, Sequence) and not isinstance(members, (str, bytes)):
+                    names = [str(x) for x in list(members)]
+            if not names:
                 names = [str(i) for i in range(n_ch)]
-            names = names[:n_ch] + [str(i) for i in range(len(names), n_ch)]
+            if len(names) < n_ch:
+                names = names + [str(i) for i in range(len(names), n_ch)]
+            else:
+                names = names[:n_ch]
             per_device = {}
             per_device_params = {}
             for i in range(n_ch):
@@ -165,7 +168,6 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                 s_bin_i = (s_i > 0.5).astype(np.int8)
                 flat_i = p_i.reshape(-1)
                 if flat_i.size == 0:
-                    # Add default stats for empty device
                     device_stats_for_loss.append({
                         "duty_cycle": 0.1,
                         "peak_power": 1000.0,
@@ -180,16 +182,6 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                 mean_on_i = float(on_vals.mean()) if on_vals.size else 0.0
                 std_on_i = float(on_vals.std()) if on_vals.size > 1 else 0.0
                 cv_i = float(std_on_i / (mean_on_i + 1e-6))
-
-                # Save stats for simplified loss
-                device_stats_for_loss.append({
-                    "duty_cycle": duty_i,
-                    "peak_power": peak_i,
-                    "mean_on": mean_on_i,
-                    "std_on": std_on_i,
-                    "cv_on": cv_i,
-                    "name": names[i] if i < len(names) else str(i),
-                })
 
                 try:
                     if s_bin_i.ndim == 2 and s_bin_i.shape[0] > 0 and s_bin_i.shape[1] > 1:
@@ -212,19 +204,156 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                 )
                 per_device[names[i]] = dev_type_i
                 per_device_params[names[i]] = get_device_loss_params(dev_type_i, duty_i)
+
+                device_stats_for_loss.append({
+                    "duty_cycle": duty_i,
+                    "peak_power": peak_i,
+                    "mean_on": mean_on_i,
+                    "std_on": std_on_i,
+                    "cv_on": cv_i,
+                    "mean_event_duration": mean_dur_i,
+                    "n_events": int(n_events_i),
+                    "name": names[i] if i < len(names) else str(i),
+                    "device_type": dev_type_i,
+                })
             if per_device:
                 expes_config["device_type_per_device"] = per_device
             if per_device_params:
                 expes_config["loss_params_per_device"] = per_device_params
 
-            # Save device stats for simplified loss
             if device_stats_for_loss:
                 expes_config["device_stats_for_loss"] = device_stats_for_loss
-                logging.info("Computed device stats for simplified loss: %d devices", len(device_stats_for_loss))
+                logging.info(
+                    "Computed device stats for simplified loss: %d devices",
+                    len(device_stats_for_loss),
+                )
                 for ds in device_stats_for_loss:
-                    logging.info("  %s: duty=%.3f, peak=%.0f, mean_on=%.0f",
-                                ds.get("name", "?"), ds.get("duty_cycle", 0),
-                                ds.get("peak_power", 0), ds.get("mean_on", 0))
+                    logging.info(
+                        "  %s: duty=%.3f, peak=%.0f, mean_on=%.0f",
+                        ds.get("name", "?"),
+                        ds.get("duty_cycle", 0),
+                        ds.get("peak_power", 0),
+                        ds.get("mean_on", 0),
+                    )
+
+                try:
+                    base_per_device = getattr(expes_config, "postprocess_per_device", None)
+                    if isinstance(base_per_device, dict):
+                        per_device_post = dict(base_per_device)
+                    else:
+                        per_device_post = {}
+                    thr_cfg = float(threshold)
+                except Exception:
+                    base_per_device = getattr(expes_config, "postprocess_per_device", None)
+                    if isinstance(base_per_device, dict):
+                        per_device_post = dict(base_per_device)
+                    else:
+                        per_device_post = {}
+                    thr_cfg = float(getattr(expes_config, "threshold", 0.0) or 0.0)
+                if per_device_post is not None:
+                    for ds in device_stats_for_loss:
+                        name = str(ds.get("name", ""))
+                        if not name:
+                            continue
+                        dev_type = per_device.get(name)
+                        if dev_type is None:
+                            continue
+                        duty_i = float(ds.get("duty_cycle", 0.0) or 0.0)
+                        mean_on_i = float(ds.get("mean_on", 0.0) or 0.0)
+                        mean_dur_i = float(ds.get("mean_event_duration", 0.0) or 0.0)
+                        tmp_cfg = {}
+                        try:
+                            apply_device_type_config_defaults(
+                                tmp_cfg,
+                                dev_type,
+                                duty_i,
+                                mean_on_i,
+                                thr_cfg,
+                                mean_dur_i,
+                                0.0,
+                                float(
+                                    getattr(
+                                        expes_config,
+                                        "loss_off_margin",
+                                        getattr(expes_config, "loss_off_margin_raw", 0.02),
+                                    )
+                                    or 0.02
+                                ),
+                            )
+                        except Exception:
+                            continue
+                        user_cfg = per_device_post.get(name, {})
+                        if isinstance(user_cfg, dict):
+                            post_thr = float(
+                                user_cfg.get(
+                                    "postprocess_threshold",
+                                    tmp_cfg.get("postprocess_threshold", thr_cfg),
+                                )
+                            )
+                            post_min_on = int(
+                                user_cfg.get(
+                                    "postprocess_min_on_steps",
+                                    tmp_cfg.get(
+                                        "postprocess_min_on_steps",
+                                        getattr(expes_config, "postprocess_min_on_steps", 3),
+                                    ),
+                                )
+                            )
+                        else:
+                            post_thr = float(tmp_cfg.get("postprocess_threshold", thr_cfg))
+                            post_min_on = int(
+                                tmp_cfg.get(
+                                    "postprocess_min_on_steps",
+                                    getattr(expes_config, "postprocess_min_on_steps", 3),
+                                )
+                            )
+                        per_device_post[name] = {
+                            "postprocess_threshold": post_thr,
+                            "postprocess_min_on_steps": post_min_on,
+                        }
+                    if per_device_post:
+                        expes_config["postprocess_per_device"] = per_device_post
+
+                try:
+                    model_name = str(getattr(expes_config, "name_model", "")).lower()
+                except Exception:
+                    model_name = ""
+                if model_name == "nilmformer":
+                    try:
+                        n_devices = len(device_stats_for_loss)
+                        type_ids = list(range(n_devices))
+                        kettle_idx = -1
+                        try:
+                            for i, nm in enumerate(names):
+                                nm_l = str(nm).strip().lower()
+                                if nm_l == "kettle":
+                                    kettle_idx = i
+                                    break
+                        except Exception:
+                            kettle_idx = -1
+                        if type_ids:
+                            try:
+                                mk = getattr(expes_config, "model_kwargs", None)
+                            except Exception:
+                                mk = None
+                            if mk is None:
+                                cfg = {"type_ids_per_channel": type_ids}
+                                if kettle_idx >= 0:
+                                    cfg["kettle_channel_idx"] = kettle_idx
+                                expes_config["model_kwargs"] = cfg
+                            else:
+                                try:
+                                    mk["type_ids_per_channel"] = type_ids
+                                    if kettle_idx >= 0:
+                                        mk["kettle_channel_idx"] = kettle_idx
+                                except TypeError:
+                                    tmp_kwargs = dict(mk)
+                                    tmp_kwargs["type_ids_per_channel"] = type_ids
+                                    if kettle_idx >= 0:
+                                        tmp_kwargs["kettle_channel_idx"] = kettle_idx
+                                    expes_config["model_kwargs"] = tmp_kwargs
+                    except Exception:
+                        pass
         except Exception as e:
             logging.debug("_configure_nilm_loss_hyperparams: multi-device stats failed: %s", e)
 
@@ -339,17 +468,20 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                 if len(app_val) > 1:
                     is_multi = True
         if is_multi:
+            # For multi-device training, ensure strong anti-collapse penalties
             lam_off = float(device_params.get("lambda_off_hard", 0.0))
             lam_on = float(device_params.get("lambda_on_recall", 0.0))
             lam_gate = float(device_params.get("lambda_gate_cls", 0.0))
-            device_params["lambda_off_hard"] = max(0.02, lam_off * 0.4)
-            device_params["lambda_on_recall"] = min(3.0, lam_on * 1.5)
-            device_params["lambda_gate_cls"] = min(0.3, lam_gate * 1.2)
+            # Keep OFF penalty moderate
+            device_params["lambda_off_hard"] = max(0.05, lam_off * 0.8)
+            # Ensure ON recall is strong enough to prevent collapse (min 1.5)
+            device_params["lambda_on_recall"] = max(1.5, min(2.5, lam_on * 1.2))
+            device_params["lambda_gate_cls"] = min(0.25, lam_gate * 1.1)
             try:
                 cur_anti = float(getattr(expes_config, "anti_collapse_weight", 0.0) or 0.0)
             except Exception:
                 cur_anti = 0.0
-            expes_config["anti_collapse_weight"] = max(cur_anti, 0.5)
+            expes_config["anti_collapse_weight"] = max(cur_anti, 1.0)
             expes_config["state_zero_penalty_weight"] = 0.0
             expes_config["off_high_agg_penalty_weight"] = 0.0
             expes_config["off_state_penalty_weight"] = 0.0
@@ -530,12 +662,27 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
 
 
 def get_cache_path(expes_config: OmegaConf):
+    """
+    Generate cache path that uniquely identifies the data configuration.
+
+    FIXED: Now includes specific device list (app) in the cache key to prevent
+    loading wrong cached data when different device combinations are used.
+    """
     overlap = getattr(expes_config, "overlap", 0.0)
     overlap_str = "ov{}".format(str(overlap).replace(".", "p"))
+
+    # Get device list for unique cache key
+    app_list = getattr(expes_config, "app", None)
+    if app_list is not None and not isinstance(app_list, str):
+        # Sort to ensure consistent ordering
+        app_str = "-".join(sorted(str(x) for x in app_list))
+    else:
+        app_str = str(getattr(expes_config, "appliance", "unknown"))
+
     if getattr(expes_config, "name_model", None) == "DiffNILM":
         key_elements = [
             expes_config.dataset,
-            expes_config.appliance,
+            app_str,  # Use specific device list instead of generic "Multi"
             expes_config.sampling_rate,
             str(expes_config.window_size),
             str(expes_config.seed),
@@ -547,7 +694,7 @@ def get_cache_path(expes_config: OmegaConf):
     else:
         key_elements = [
             expes_config.dataset,
-            expes_config.appliance,
+            app_str,  # Use specific device list instead of generic "Multi"
             expes_config.sampling_rate,
             str(expes_config.window_size),
             str(expes_config.seed),
@@ -573,6 +720,13 @@ def launch_one_experiment(expes_config: OmegaConf):
         scaler = cache["scaler"]
         expes_config.cutoff = cache["cutoff"]
         expes_config.threshold = cache["threshold"]
+
+        # Restore app list from cache for proper device name handling
+        cached_app_list = cache.get("app_list")
+        if cached_app_list is not None:
+            expes_config["app"] = cached_app_list
+            logging.info("Restored device names from cache: %s", cached_app_list)
+
         _apply_cutoff_to_loss_params(expes_config)
         try:
             if isinstance(tuple_data, tuple) and len(tuple_data) >= 4:
@@ -729,11 +883,19 @@ def launch_one_experiment(expes_config: OmegaConf):
             st_date,
         )
 
+    # Save app list to cache for proper device name recovery
+    app_list = getattr(expes_config, "app", None)
+    if app_list is not None and not isinstance(app_list, str):
+        app_list_serializable = list(app_list)
+    else:
+        app_list_serializable = None
+
     cache = {
         "tuple_data": tuple_data,
         "scaler": scaler,
         "cutoff": expes_config.cutoff,
         "threshold": expes_config.threshold,
+        "app_list": app_list_serializable,  # Save device names for visualization
     }
     torch.save(cache, cache_path)
 
@@ -775,10 +937,10 @@ def main(
             window_size,
         )
 
-    with open("configs/expes.yaml", "r") as f:
+    with open("configs/expes.yaml", "r", encoding="utf-8") as f:
         expes_config = yaml.safe_load(f)
 
-    with open("configs/datasets.yaml", "r") as f:
+    with open("configs/datasets.yaml", "r", encoding="utf-8") as f:
         datasets_all = yaml.safe_load(f)
         dataset_key_map = {k.lower(): k for k in datasets_all.keys()}
         dataset_key = dataset_key_map.get(str(dataset).strip().lower())
@@ -791,7 +953,7 @@ def main(
             )
         datasets_config = datasets_all[dataset_key]
 
-    with open("configs/models.yaml", "r") as f:
+    with open("configs/models.yaml", "r", encoding="utf-8") as f:
         baselines_config = yaml.safe_load(f)
 
         model_key_map = {k.lower(): k for k in baselines_config.keys()}
@@ -927,9 +1089,9 @@ def main(
 
 
 if __name__ == "__main__":
-    with open("configs/datasets.yaml", "r") as f:
+    with open("configs/datasets.yaml", "r", encoding="utf-8") as f:
         _datasets_all = yaml.safe_load(f)
-    with open("configs/models.yaml", "r") as f:
+    with open("configs/models.yaml", "r", encoding="utf-8") as f:
         _models_all = yaml.safe_load(f)
     _dataset_choices = ", ".join(sorted(_datasets_all.keys()))
     _model_choices = ", ".join(sorted(_models_all.keys()))
@@ -1002,8 +1164,8 @@ if __name__ == "__main__":
         default=None,
         help=(
             "Loss type for NILM baselines. Choices: "
-            "'eaec', 'ga_eaec', 'ga_eaec_auto', 'multi_nilm', 'simplified', 'smoothl1', 'mse', 'mae'. "
-            "'multi_nilm' (recommended) combines GAEAECLoss with uncertainty weighting. "
+            "'multi_nilm' (recommended, AdaptiveDeviceLoss), 'smoothl1', 'mse', 'mae'. "
+            "'multi_nilm' uses device-adaptive parameters with seq2subseq supervision. "
             "Auto-selected for multi-device training if not specified."
         ),
     )

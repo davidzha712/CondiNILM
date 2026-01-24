@@ -114,15 +114,17 @@ LONG_CYCLE_LOW_DUTY_PARAMS = {
 }
 
 # Device type specific config defaults (using dict lookup instead of nested ternary)
+# FIXED: Reduced gate_floor values to prevent floor noise in OFF state
+# Previous high values (e.g., 0.4 for sparse_high_power) caused significant floor noise
 DEVICE_TYPE_GATE_CONFIG = {
-    "sparse_high_power": {"gate_soft_scale": 0.5, "gate_floor": 0.4, "gate_duty_weight": 0.0},
+    "sparse_high_power": {"gate_soft_scale": 0.5, "gate_floor": 0.01, "gate_duty_weight": 0.0},  # Was 0.4
     "frequent_switching": {"gate_soft_scale": 2.0, "gate_floor": 0.005, "gate_duty_weight": 0.05},
     "cycling_infrequent": {"gate_soft_scale": 2.0, "gate_floor": 0.01, "gate_duty_weight": 0.01},
-    "cycling_low_power": {"gate_soft_scale": 2.0, "gate_floor": 0.02, "gate_duty_weight": 0.02},
-    "long_cycle": {"gate_soft_scale": 1.0, "gate_floor": 0.1, "gate_duty_weight": 0.0},
-    "always_on": {"gate_soft_scale": 1.0, "gate_floor": 0.1, "gate_duty_weight": 0.0},
-    "sparse_medium_power": {"gate_soft_scale": 1.0, "gate_floor": 0.1, "gate_duty_weight": 0.0},
-    "unknown": {"gate_soft_scale": 1.0, "gate_floor": 0.1, "gate_duty_weight": 0.0},
+    "cycling_low_power": {"gate_soft_scale": 2.0, "gate_floor": 0.01, "gate_duty_weight": 0.02},  # Was 0.02
+    "long_cycle": {"gate_soft_scale": 1.0, "gate_floor": 0.02, "gate_duty_weight": 0.0},  # Was 0.1
+    "always_on": {"gate_soft_scale": 1.0, "gate_floor": 0.05, "gate_duty_weight": 0.0},  # Was 0.1
+    "sparse_medium_power": {"gate_soft_scale": 1.0, "gate_floor": 0.02, "gate_duty_weight": 0.0},  # Was 0.1
+    "unknown": {"gate_soft_scale": 1.0, "gate_floor": 0.02, "gate_duty_weight": 0.0},  # Was 0.1
 }
 
 DEVICE_TYPE_POSTPROCESS_CONFIG = {
