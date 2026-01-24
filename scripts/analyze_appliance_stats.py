@@ -106,15 +106,15 @@ def compute_appliance_stats_from_array(power: np.ndarray, status: np.ndarray) ->
         n_on_events = 0
 
     # 4. Power stability (coefficient of variation during ON state)
-        cv_on = std_on / (mean_on + 1e-6) if mean_on > 0 else 0.0
+    cv_on = std_on / (mean_on + 1e-6) if mean_on > 0 else 0.0
 
     # 5. Sparsity metric (for sparse but high-power devices)
     # Ratio of time-averaged power to ON-state mean power
-        sparsity_ratio = mean_all / (mean_on + 1e-6) if mean_on > 0 else 0.0
+    sparsity_ratio = mean_all / (mean_on + 1e-6) if mean_on > 0 else 0.0
 
     # 6. Instantaneous power density (feature of short, high-power devices)
     # peak power × duty_cycle
-        power_density = peak * duty
+    power_density = peak * duty
 
     # ============== Device type classification ==============
     device_type = classify_device_type(
@@ -292,11 +292,11 @@ def get_recommended_loss_params(device_type: str, stats: Dict[str, Any]) -> Dict
 
 def analyze_ukdale_appliance(dataset_root: str, appliance: str, sampling_rate: str, window_size: int, seed: int = 42):
     base_expes = {}
-    with open("configs/datasets.yaml", "r") as f:
+    with open("configs/datasets.yaml", "r", encoding="utf-8") as f:
         datasets_all = yaml.safe_load(f)
         if "UKDALE" in datasets_all and appliance in datasets_all["UKDALE"]:
             base_expes.update(datasets_all["UKDALE"][appliance])
-    with open("configs/expes.yaml", "r") as f:
+    with open("configs/expes.yaml", "r", encoding="utf-8") as f:
         expes_yaml = yaml.safe_load(f)
         base_expes.update(expes_yaml)
     base_expes["dataset"] = "UKDALE"
@@ -365,7 +365,7 @@ def main():
 
     logging.basicConfig(level=logging.INFO)
 
-    with open("configs/datasets.yaml", "r") as f:
+    with open("configs/datasets.yaml", "r", encoding="utf-8") as f:
         datasets_all = yaml.safe_load(f)
     if "UKDALE" not in datasets_all:
         raise ValueError("UKDALE dataset configuration not found in configs/datasets.yaml")
