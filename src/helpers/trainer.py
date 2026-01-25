@@ -78,13 +78,28 @@ class AdaptiveDeviceLoss(nn.Module):
         # Analyze each device and derive parameters
         self.device_types = []
         self.device_params = []
+        self.device_names = []  # Store device names for per-device gate tuning
         init_weights = []
+
+        # Per-device gate parameters
+        gate_soft_scales = []
+        gate_floors = []
+        gate_biases = []
 
         for i in range(self.n_devices):
             stats = device_stats[i] if device_stats and i < len(device_stats) else {}
             device_type, params = self._classify_and_derive_params(stats)
             self.device_types.append(device_type)
             self.device_params.append(params)
+
+            # Store device name
+            device_name = str(stats.get("name", f"device_{i}"))
+            self.device_names.append(device_name)
+
+            # Extract per-device gate parameters
+            gate_soft_scales.append(float(params.get("gate_soft_scale", 3.0)))
+            gate_floors.append(float(params.get("gate_floor", 0.005)))
+            gate_biases.append(float(params.get("gate_bias", 0.0)))
 
             # Dynamic device weights based on device type and characteristics
             # This prevents "robbing Peter to pay Paul" by giving appropriate
@@ -100,6 +115,11 @@ class AdaptiveDeviceLoss(nn.Module):
 
         # Register as buffer (not learnable, but dynamically computed)
         self.register_buffer("device_weights", torch.tensor(init_weights, dtype=torch.float32))
+
+        # Register per-device gate parameters as buffers
+        self.register_buffer("gate_soft_scales", torch.tensor(gate_soft_scales, dtype=torch.float32))
+        self.register_buffer("gate_floors", torch.tensor(gate_floors, dtype=torch.float32))
+        self.register_buffer("gate_biases", torch.tensor(gate_biases, dtype=torch.float32))
 
         # Base loss function
         self.base_loss = nn.SmoothL1Loss(reduction="none")
@@ -149,17 +169,108 @@ class AdaptiveDeviceLoss(nn.Module):
         params = self._derive_params_from_stats(
             device_type, duty_cycle, peak_power, mean_on, cv_on, mean_event_dur
         )
-        if lname in ("washingmachine", "washing_machine", "washer"):
-            params = dict(params)
-            params["w_recall"] = max(float(params.get("w_recall", 0.2)), 0.4)
-            params["w_main"] = min(float(params.get("w_main", 0.7)), 0.6)
-            params["alpha_off"] = min(float(params.get("alpha_off", 0.6)), 0.5)
+
+        # ============================================================
+        # Device-specific parameter overrides based on observed metrics
+        # CRITICAL: Each device is tuned INDEPENDENTLY to prevent interference
+        #
+        # Latest metrics (Epoch 11, Run 4):
+        # - Fridge: P=0.636, R=0.921, F1=0.752 ✅ GOOD - keep stable
+        # - Kettle: P=0.237, R=0.401, F1=0.298 → Need better balance
+        # - Microwave: P=0.119, R=0.505, F1=0.192 → CRITICAL: Precision too low!
+        # - WashingMachine: P=0.520, R=0.359, F1=0.425 → Recall dropped too much
+        # - Dishwasher: P=0.463, R=0.868, F1=0.604 ✅ GOOD
+        # ============================================================
+
         if lname in ("fridge", "refrigerator", "fridge_freezer"):
+            # Fridge: BENCHMARK DEVICE - F1=0.806, gate_prob=0.407
+            # Previous settings worked well, just add mild bias correction
             params = dict(params)
-            params["w_recall"] = max(float(params.get("w_recall", 0.3)), 0.4)
-            params["w_main"] = min(float(params.get("w_main", 0.8)), 0.7)
-            params["alpha_on"] = max(float(params.get("alpha_on", 1.7)), 2.0)
-            params["alpha_off"] = min(float(params.get("alpha_off", 1.0)), 0.9)
+            params["w_recall"] = 0.10    # Slightly increased for recall ~0.8
+            params["w_main"] = 0.45
+            params["w_off_fp"] = 0.32
+            params["w_global"] = 0.04
+            params["w_on_power"] = 0.09
+            params["alpha_on"] = 1.8
+            params["alpha_off"] = 2.0
+            params["off_margin"] = 0.015
+            # Gate parameters - keep stable with mild correction
+            # Raw logits mean≈1.8, scale=3 → scaled≈5.4, bias=-5 → adjusted≈0.4 → sigmoid≈0.6
+            params["gate_soft_scale"] = 3.0
+            params["gate_floor"] = 0.005
+            params["gate_bias"] = -5.0  # Mild negative bias for balanced gate
+
+        elif lname in ("dishwasher",):
+            # Dishwasher: Previously had gate saturation, now with proper bias
+            # Raw logits mean≈1.8, scale=3 → scaled≈5.4, bias=-6 → adjusted≈-0.6 → sigmoid≈0.35
+            params = dict(params)
+            params["w_recall"] = 0.08
+            params["w_main"] = 0.42
+            params["w_off_fp"] = 0.38
+            params["w_global"] = 0.03
+            params["w_on_power"] = 0.09
+            params["alpha_on"] = 1.6
+            params["alpha_off"] = 2.5     # Increased to help suppress false positives
+            params["off_margin"] = 0.008
+            # Gate parameters - moderate suppression
+            params["gate_soft_scale"] = 3.0   # Moderate scale
+            params["gate_floor"] = 0.005      # Low floor
+            params["gate_bias"] = -6.0        # Moderate negative bias
+
+        elif lname in ("washingmachine", "washing_machine", "washer"):
+            # WashingMachine: Previous gate saturation fixed, now tuning for balance
+            # Raw logits: mean≈1.8, so scaled_mean≈3.6 with scale=2
+            # For sigmoid≈0.4, need bias≈-4
+            params = dict(params)
+            params["w_recall"] = 0.08    # Moderate recall - not too low
+            params["w_main"] = 0.38
+            params["w_off_fp"] = 0.40
+            params["w_global"] = 0.03
+            params["w_on_power"] = 0.11
+            params["alpha_on"] = 1.5     # Lower alpha_on to reduce ON confidence
+            params["alpha_off"] = 3.5    # VERY HIGH alpha_off to penalize false ON
+            params["off_margin"] = 0.005
+            # Gate parameters - moderate suppression
+            # Formula: sigmoid(logits * scale + bias)
+            # With raw logits mean≈1.8, scale=2 → scaled≈3.6, bias=-4 → adjusted≈-0.4 → sigmoid≈0.4
+            params["gate_soft_scale"] = 2.0   # Moderate scale
+            params["gate_floor"] = 0.005      # Low floor
+            params["gate_bias"] = -4.0        # Moderate negative bias
+
+        elif lname == "kettle":
+            # Kettle: Was over-suppressing (gate_prob=0.038), need to boost gate
+            # Raw logits mean≈1.8, scale=2 → scaled≈3.6, bias=-2 → adjusted≈1.6 → sigmoid≈0.83
+            params = dict(params)
+            params["w_recall"] = 0.12    # INCREASED - need more recall
+            params["w_main"] = 0.38
+            params["w_off_fp"] = 0.38    # Balanced
+            params["w_global"] = 0.03
+            params["w_on_power"] = 0.09
+            params["alpha_on"] = 2.2     # HIGHER alpha_on to boost ON detection
+            params["alpha_off"] = 2.0    # REDUCED alpha_off
+            params["off_margin"] = 0.005
+            # Gate parameters - LESS aggressive to allow more detections
+            # Want higher gate_prob (~0.5-0.6), so need positive adjusted values
+            params["gate_soft_scale"] = 2.0   # Softer decision
+            params["gate_floor"] = 0.05       # HIGHER floor to prevent over-suppression
+            params["gate_bias"] = -2.0        # Less negative bias - allows more ON
+
+        elif lname == "microwave":
+            # Microwave: gate_prob=0.385 was reasonable, keep similar
+            # Raw logits mean≈1.8, scale=3 → scaled≈5.4, bias=-5 → adjusted≈0.4 → sigmoid≈0.6
+            params = dict(params)
+            params["w_recall"] = 0.08
+            params["w_main"] = 0.35
+            params["w_off_fp"] = 0.45
+            params["w_global"] = 0.03
+            params["w_on_power"] = 0.09
+            params["alpha_on"] = 1.5
+            params["alpha_off"] = 2.8
+            params["off_margin"] = 0.003
+            # Gate parameters - moderate settings
+            params["gate_soft_scale"] = 3.0  # Moderate sharpness
+            params["gate_floor"] = 0.005
+            params["gate_bias"] = -5.0  # Moderate negative bias
 
         return device_type, params
 
@@ -232,6 +343,7 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_global"] = 0.05
             params["w_recall"] = 0.25  # Reduced to balance with OFF penalty
             params["w_off_fp"] = 0.2   # Strong OFF false positive penalty
+            params["w_energy"] = 0.05  # Energy matching for NDE/TECA
             params["off_margin"] = 0.005  # Tight margin for sparse devices
         elif device_type == self.LONG_CYCLE:
             # Long cycle devices like WashingMachine: need balanced approach
@@ -241,6 +353,7 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_global"] = 0.1
             params["w_recall"] = 0.15
             params["w_off_fp"] = 0.15  # Moderate OFF penalty
+            params["w_energy"] = 0.05  # Energy matching
             params["off_margin"] = 0.01
         elif device_type == self.CYCLING:
             # Cycling devices like Fridge: standard approach
@@ -250,6 +363,7 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_global"] = 0.1
             params["w_recall"] = 0.1
             params["w_off_fp"] = 0.1   # Mild OFF penalty
+            params["w_energy"] = 0.05  # Energy matching
             params["off_margin"] = 0.015
         else:
             # Default/always-on devices
@@ -259,6 +373,7 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_global"] = 0.1
             params["w_recall"] = 0.1
             params["w_off_fp"] = 0.1
+            params["w_energy"] = 0.05  # Energy matching
             params["off_margin"] = 0.02
 
         return params
@@ -312,58 +427,76 @@ class AdaptiveDeviceLoss(nn.Module):
 
     def _compute_cycling_loss(self, pred, target, params):
         """
-        Enhanced loss for all devices with balanced ON recall and OFF precision.
+        Per-device loss with independent optimization.
 
-        Key improvements:
-        1. Strong OFF-state penalty to reduce false positives (critical for sparse devices)
-        2. Balanced ON recall to prevent collapse
-        3. Device-type aware weighting
+        CRITICAL PRINCIPLE: Each device's loss is computed with its OWN parameters.
+        The loss function structure is the same, but parameters are device-specific.
+        This prevents "robbing Peter to pay Paul".
+
+        Components:
+        1. Main regression loss (alpha_on/alpha_off weighted) - for MAE/NDE
+        2. Global stability loss
+        3. ON recall loss (prevents collapse to zero)
+        4. OFF false positive loss (prevents over-prediction) - for TECA/precision
+        5. ON power accuracy loss (relative error) - for NDE improvement
         """
         eps = 1e-6
         threshold = params["threshold"]
         alpha_on = params["alpha_on"]
         alpha_off = params["alpha_off"]
 
-        # Soft weights for smooth gradients (key to stability)
+        # Soft weights for smooth gradients
         soft_temp = max(threshold * 2.0, 0.02)
         p_on = torch.sigmoid((target - threshold) / soft_temp)
         p_off = 1.0 - p_on
 
-        # Main regression loss (soft-weighted) - this is the core
+        # === Component 1: Main regression loss ===
         point_loss = self.base_loss(pred, target)
         loss_on = (point_loss * p_on).sum() / (p_on.sum() + eps)
         loss_off = (point_loss * p_off).sum() / (p_off.sum() + eps)
         loss_main = alpha_on * loss_on + alpha_off * loss_off
 
-        # Simple global loss to prevent total collapse
+        # === Component 2: Global stability loss ===
         loss_global = point_loss.mean()
 
-        # ON recall penalty: penalize under-prediction on ON samples
-        on_deficit = torch.relu(0.2 * target - pred) * p_on
+        # === Component 3: ON recall loss ===
+        # REDUCED: Target Recall~0.7, current recall is too high (0.911)
+        # Lower coefficient to reduce recall pressure
+        w_recall = float(params.get("w_recall", 0.1))
+        recall_coef = 0.10 + 0.10 * w_recall  # REDUCED: 0.10-0.20 (was 0.15-0.30)
+        on_deficit = torch.relu(recall_coef * target - pred) * p_on
         on_recall_loss = on_deficit.sum() / (p_on.sum() + eps)
 
-        # === NEW: Strong OFF-state false positive penalty ===
-        # Critical for sparse devices like Microwave, Kettle
-        # Penalize any non-zero prediction when target is clearly OFF
+        # === Component 4: OFF false positive loss ===
+        # RESTORED: Linear penalty is more stable
         off_margin = float(params.get("off_margin", 0.01))
         off_false_positive = torch.relu(pred - off_margin) * p_off
         off_fp_loss = off_false_positive.sum() / (p_off.sum() + eps)
 
-        # === NEW: Precision-focused penalty for sparse devices ===
-        # When p_off is high (mostly OFF), penalize more strongly
-        off_ratio = p_off.sum() / (p_on.sum() + p_off.sum() + eps)
-        # Sparse devices (high off_ratio) get stronger OFF penalty
-        sparse_factor = 1.0 + 2.0 * torch.clamp(off_ratio - 0.9, min=0.0)
+        # === Component 5: ON power accuracy (relative error for NDE) ===
+        # Penalize relative error on ON samples - directly improves NDE
+        # Only apply where target > threshold to avoid division issues
+        on_mask = (target > threshold).float()
+        if on_mask.sum() > 0:
+            # Relative error: |pred - target| / target
+            rel_error = torch.abs(pred - target) / (target + eps) * on_mask
+            on_power_loss = rel_error.sum() / (on_mask.sum() + eps)
+            # Clamp to prevent extreme values
+            on_power_loss = torch.clamp(on_power_loss, 0.0, 2.0)
+        else:
+            on_power_loss = pred.new_tensor(0.0)
 
+        # Get weights from params
         w_main = float(params.get("w_main", 0.7))
         w_global = float(params.get("w_global", 0.1))
-        w_recall = float(params.get("w_recall", 0.1))
-        w_off_fp = float(params.get("w_off_fp", 0.1))  # New weight for OFF false positive
+        w_off_fp = float(params.get("w_off_fp", 0.1))
+        w_on_power = float(params.get("w_on_power", 0.03))  # ON power accuracy weight
 
         total = (w_main * loss_main +
                  w_global * loss_global +
                  w_recall * on_recall_loss +
-                 w_off_fp * sparse_factor * off_fp_loss)
+                 w_off_fp * off_fp_loss +
+                 w_on_power * on_power_loss)
 
         return total
 
@@ -638,52 +771,143 @@ class SeqToSeqLightningModule(pl.LightningModule):
 
     def _gate_focal_bce(self, logits, targets):
         """
-        Focal BCE loss for gate classification.
+        Per-device Focal BCE loss for gate classification.
 
-        IMPROVED: More balanced alpha weights to reduce false positives.
-        Previous alpha_pos=5, alpha_neg=1 caused over-prediction for sparse devices.
+        CRITICAL: Each device gets its OWN alpha parameters from device_params
+        based on observed training behavior, not just duty cycle.
+
+        Latest tuning based on actual results:
+        - Fridge (gate_prob=0.407): Balanced - keep alpha_on/alpha_off moderate
+        - WashingMachine (gate_prob=0.9998): VERY HIGH alpha_off to suppress gate
+        - Kettle (gate_prob=0.038): HIGH alpha_on to boost gate (over-suppressed)
+        - Dishwasher (gate_prob=0.093): Moderate alpha_off
+        - Microwave (gate_prob=0.385): Balanced, slight alpha_off increase
         """
         if self.gate_cls_weight <= 0.0:
             return logits.new_tensor(0.0)
+
         logits = logits.float()
         targets = targets.float()
-        probs = torch.sigmoid(logits)
         eps = 1e-6
-        probs = torch.clamp(probs, eps, 1.0 - eps)
-        pt = probs * targets + (1.0 - probs) * (1.0 - targets)
 
-        # REVISED: More balanced alpha to reduce false positives
-        # alpha_pos: weight for ON samples (we still want good recall)
-        # alpha_neg: weight for OFF samples (INCREASED to reduce false positives)
-        alpha_pos = 3.0  # Reduced from 5.0
-        alpha_neg = 2.0  # Increased from 1.0 - stronger OFF learning
+        # Ensure 3D: (B, C, L)
+        if logits.dim() == 2:
+            logits = logits.unsqueeze(1)
+        if targets.dim() == 2:
+            targets = targets.unsqueeze(1)
 
-        # For sparse data (high class imbalance), further boost OFF weight
-        off_ratio = 1.0 - targets.mean()
-        if off_ratio > 0.95:  # Very sparse (e.g., Microwave, Kettle)
-            alpha_neg = 3.0  # Even stronger OFF learning for sparse devices
+        B, C, L = logits.shape
+        total_loss = logits.new_tensor(0.0)
 
-        alpha = alpha_pos * targets + alpha_neg * (1.0 - targets)
-        gamma = max(self.gate_focal_gamma, 0.0)
-        loss = -alpha * ((1.0 - pt) ** gamma) * torch.log(pt)
-        return loss.mean()
+        # Check if we have per-device parameters from criterion
+        use_per_device_params = (
+            hasattr(self, "criterion")
+            and isinstance(self.criterion, AdaptiveDeviceLoss)
+            and hasattr(self.criterion, "device_params")
+            and len(self.criterion.device_params) == C
+        )
+
+        # Per-device gate loss - each device optimized independently
+        for c in range(C):
+            logits_c = logits[:, c, :]
+            targets_c = targets[:, c, :]
+
+            probs_c = torch.sigmoid(logits_c)
+            probs_c = torch.clamp(probs_c, eps, 1.0 - eps)
+            pt_c = probs_c * targets_c + (1.0 - probs_c) * (1.0 - targets_c)
+
+            # Get alpha from device_params if available
+            if use_per_device_params:
+                params = self.criterion.device_params[c]
+                alpha_on = float(params.get("alpha_on", 1.5))
+                alpha_off = float(params.get("alpha_off", 2.5))
+            else:
+                # Fallback to duty-cycle based alpha
+                on_ratio_c = targets_c.mean()
+                if on_ratio_c > 0.3:
+                    alpha_on, alpha_off = 1.8, 2.5
+                elif on_ratio_c > 0.15:
+                    alpha_on, alpha_off = 1.6, 2.8
+                elif on_ratio_c > 0.08:
+                    alpha_on, alpha_off = 1.5, 3.0
+                elif on_ratio_c > 0.02:
+                    alpha_on, alpha_off = 1.5, 3.5
+                else:
+                    alpha_on, alpha_off = 1.3, 4.0
+
+            alpha_c = alpha_on * targets_c + alpha_off * (1.0 - targets_c)
+            gamma = max(self.gate_focal_gamma, 0.0)
+            loss_c = -alpha_c * ((1.0 - pt_c) ** gamma) * torch.log(pt_c)
+            total_loss = total_loss + loss_c.mean()
+
+        return total_loss / max(C, 1)
 
     def _apply_soft_gate(self, power, gate_logits):
         """
-        Apply soft gating to power output.
+        Apply soft gating to power output with PER-DEVICE parameters.
 
-        Modified to reduce floor noise: gate_floor now acts as a minimum
-        probability, but when gate_prob is very low, output approaches zero.
+        Each device gets its own gate_soft_scale, gate_floor, and gate_bias
+        based on its electrical characteristics and observed training behavior.
+
+        Key per-device tuning (based on latest results):
+        - Fridge: Balanced settings (benchmark)
+        - WashingMachine: Aggressive suppression (gate was saturated at 0.9998)
+        - Kettle: Less aggressive (gate was over-suppressing at 0.038)
+        - Dishwasher/Microwave: Moderate settings
         """
-        gate_floor = min(max(self.gate_floor, 0.0), 1.0)
-        # Reduce minimum floor to allow near-zero output when gate is closed
-        gate_floor = max(gate_floor, 1e-4)  # Changed from 1e-3 to 1e-4
-        soft_scale = max(self.gate_soft_scale, 0.0)
-        gate_prob = torch.sigmoid(gate_logits.float() * soft_scale)
-        # Apply floor only when gate_prob > threshold, otherwise allow near-zero
-        # This reduces floor noise in OFF state
-        effective_prob = gate_floor + (1.0 - gate_floor) * gate_prob
-        return power * effective_prob, gate_prob
+        # Check if criterion has per-device gate parameters
+        use_per_device = (
+            hasattr(self, "criterion")
+            and isinstance(self.criterion, AdaptiveDeviceLoss)
+            and hasattr(self.criterion, "gate_soft_scales")
+            and hasattr(self.criterion, "gate_floors")
+            and hasattr(self.criterion, "gate_biases")
+        )
+
+        if use_per_device and gate_logits.dim() == 3:
+            # Per-device soft gating
+            B, C, L = gate_logits.shape
+            device = gate_logits.device
+
+            # Get per-device parameters (shape: [C])
+            soft_scales = self.criterion.gate_soft_scales.to(device)
+            floors = self.criterion.gate_floors.to(device)
+            biases = self.criterion.gate_biases.to(device)
+
+            # Ensure correct number of devices
+            if soft_scales.shape[0] != C:
+                # Fallback to global parameters
+                soft_scales = torch.full((C,), self.gate_soft_scale, device=device)
+                floors = torch.full((C,), self.gate_floor, device=device)
+                biases = torch.zeros(C, device=device)
+
+            # Reshape for broadcasting: [1, C, 1]
+            soft_scales = soft_scales.view(1, C, 1)
+            floors = floors.view(1, C, 1)
+            biases = biases.view(1, C, 1)
+
+            # Apply per-device scale and bias to gate logits
+            # Formula: sigmoid(logits * scale + bias)
+            # - scale controls sharpness of decision boundary
+            # - bias shifts decision boundary (negative = harder to trigger ON)
+            # Applying bias AFTER scale makes it a direct offset in sigmoid input space
+            gate_logits_scaled = gate_logits.float() * soft_scales
+            gate_logits_adj = gate_logits_scaled + biases
+            gate_prob = torch.sigmoid(gate_logits_adj)
+
+            # Apply per-device floor
+            floors = torch.clamp(floors, min=1e-4, max=1.0)
+            effective_prob = floors + (1.0 - floors) * gate_prob
+
+            return power * effective_prob, gate_prob
+        else:
+            # Global soft gating (fallback)
+            gate_floor = min(max(self.gate_floor, 0.0), 1.0)
+            gate_floor = max(gate_floor, 1e-4)
+            soft_scale = max(self.gate_soft_scale, 0.0)
+            gate_prob = torch.sigmoid(gate_logits.float() * soft_scale)
+            effective_prob = gate_floor + (1.0 - gate_floor) * gate_prob
+            return power * effective_prob, gate_prob
 
     def _gate_window_bce(self, logits, state):
         if self.gate_window_weight <= 0.0:
@@ -865,15 +1089,15 @@ class SeqToSeqLightningModule(pl.LightningModule):
             min_top = topk[..., -1:].detach()
             on_mask = (target >= min_top).float()
 
-        # Part 1: Energy ratio penalty (original, but stronger)
+        # Part 1: Energy ratio penalty
         energy_pred = (pred * on_mask).sum(dim=-1)
         energy_target = (target * on_mask).sum(dim=-1)
         valid = (energy_target > 0.0).float()
         if valid.sum() <= 0:
             return pred.new_tensor(0.0)
         ratio = energy_pred / (energy_target + eps)
-        # Increased r_min from 0.05 to 0.3 for stronger anti-collapse
-        r_min = 0.3
+        # Strong minimum energy ratio requirement
+        r_min = 0.4  # Increased from 0.3
         deficit = torch.relu(r_min - ratio) * valid
         energy_penalty = deficit.sum() / (valid.sum() + eps)
 
@@ -884,14 +1108,38 @@ class SeqToSeqLightningModule(pl.LightningModule):
             # Penalize when pred is below a fraction of target on ON samples
             pred_on = pred * on_mask
             target_on = target * on_mask
-            # Use relative error: penalize if pred < 0.1 * target
-            rel_deficit = torch.relu(0.1 * target_on - pred_on)
+            # Use relative error: penalize if pred < 0.15 * target (increased from 0.1)
+            rel_deficit = torch.relu(0.15 * target_on - pred_on)
             on_recall_penalty = rel_deficit.sum() / (target_on.sum() + eps)
+
+            # Part 3: Detect per-channel collapse
+            # If any channel has very low prediction ratio, penalize heavily
+            if pred.dim() >= 3 and pred.size(1) > 1:
+                B, C, L = pred.shape
+                channel_penalties = []
+                for c in range(C):
+                    pred_c = pred[:, c:c+1, :]
+                    target_c = target[:, c:c+1, :]
+                    on_mask_c = on_mask[:, c:c+1, :]
+                    energy_pred_c = (pred_c * on_mask_c).sum()
+                    energy_target_c = (target_c * on_mask_c).sum()
+                    if energy_target_c > eps:
+                        ratio_c = energy_pred_c / (energy_target_c + eps)
+                        # Strong penalty if any channel collapses
+                        if ratio_c < 0.2:
+                            channel_penalties.append(torch.relu(0.2 - ratio_c) * 5.0)
+                if channel_penalties:
+                    per_channel_penalty = sum(channel_penalties) / len(channel_penalties)
+                else:
+                    per_channel_penalty = pred.new_tensor(0.0)
+            else:
+                per_channel_penalty = pred.new_tensor(0.0)
         else:
             on_recall_penalty = pred.new_tensor(0.0)
+            per_channel_penalty = pred.new_tensor(0.0)
 
         # Combined penalty
-        return energy_penalty + 2.0 * on_recall_penalty
+        return energy_penalty + 2.0 * on_recall_penalty + per_channel_penalty
 
     def _compute_all_penalties(self, pred, target, state, ts_agg):
         """Compute all auxiliary penalties and return them as a dict."""

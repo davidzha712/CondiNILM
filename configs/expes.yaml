@@ -15,7 +15,7 @@ appliance_scaling_type:  MaxScaling
 
 batch_size:  128
 epochs:  25
-p_es:  null
+p_es:  5                         # Early stopping patience (epochs without improvement)
 p_rlr:  3
 n_warmup_epochs:  3
 scheduler_type:  cosine_warmup   # cosine_warmup (recommended) / plateau
@@ -58,6 +58,10 @@ postprocess_min_on_steps: 3
 
 off_high_agg_penalty_weight: 0.3
 
+# Anti-collapse penalty to prevent model from outputting all zeros
+# Reduced from 1.5 to 0.8 - too high causes over-prediction
+anti_collapse_weight: 0.8
+
 # ============== Loss function hyperparameters (auto-adjusted by appliance type) ==============
 # These are default values and will be overridden by _configure_nilm_loss_hyperparams based on appliance type
 #
@@ -86,19 +90,40 @@ loss_lambda_on_recall: 0.3
 loss_on_recall_margin: 0.5
 
 # ===== Gate classification (mild setting) =====
-# lambda_gate_cls: gate classification loss weight (lower!)
-loss_lambda_gate_cls: 0.1
+# lambda_gate_cls: gate classification loss weight
+# Increased from 0.1 to 0.5 to prevent gate saturation
+loss_lambda_gate_cls: 0.5
 
 # gate_focal_gamma: Focal Loss gamma parameter
 loss_gate_focal_gamma: 2.0
+
+# ===== Soft Gating Parameters (control OFF energy leakage) =====
+# gate_soft_scale: Sigmoid sharpness (higher = more binary gate decisions)
+# Increased from 1.0 to 3.0 to make OFF decisions more decisive
+gate_soft_scale: 3.0
+
+# gate_floor: Minimum gate probability (0 = allow complete shutdown when OFF)
+# Reduced from 0.02 to 0.005 to minimize OFF energy leakage
+gate_floor: 0.005
 
 postprocess_gate_avg_threshold: 0.25
 postprocess_gate_max_threshold: 0.5
 
 postprocess_per_device:
+  # Per-device postprocess tuned for F1 optimization
+  # Goal: Balance precision/recall for best F1 per device
   Microwave:
-    postprocess_threshold: 15
-    postprocess_min_on_steps: 1
+    postprocess_threshold: 40    # Higher - reduce false positives for F1
+    postprocess_min_on_steps: 3  # Filter short spikes
+  Kettle:
+    postprocess_threshold: 20    # Moderate - balance for F1
+    postprocess_min_on_steps: 2  # Short bursts allowed
   Fridge:
-    postprocess_threshold: 15
-    postprocess_min_on_steps: 2
+    postprocess_threshold: 18    # Slightly higher - improve precision for F1
+    postprocess_min_on_steps: 3  # Keep stable
+  WashingMachine:
+    postprocess_threshold: 20    # Moderate for F1 balance
+    postprocess_min_on_steps: 5  # Moderate filtering
+  Dishwasher:
+    postprocess_threshold: 20    # Keep stable - good F1
+    postprocess_min_on_steps: 6  # Keep stable

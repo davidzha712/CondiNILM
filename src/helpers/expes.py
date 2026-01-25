@@ -2411,7 +2411,10 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             off_state_long_penalty_weight=off_state_long_penalty_weight,
             off_state_long_kernel=off_state_long_kernel,
             off_state_long_margin=off_state_long_margin,
-            gate_cls_weight=float(getattr(expes_config, "gate_cls_weight", 0.0)),
+            gate_cls_weight=float(
+                getattr(expes_config, "gate_cls_weight", None)
+                or getattr(expes_config, "loss_lambda_gate_cls", 0.1)
+            ),
             gate_window_weight=float(
                 getattr(expes_config, "gate_window_weight", 0.0)
             ),

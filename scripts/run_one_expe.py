@@ -617,6 +617,28 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
         off_margin,
     )
 
+    # ============== Ensure device_stats_for_loss is set for single device training ==============
+    # This is critical for per-device gate tuning in AdaptiveDeviceLoss
+    if n_ch == 1 and not device_stats_for_loss:
+        app_name = str(getattr(expes_config, "appliance", "") or "")
+        if app_name:
+            device_stats_for_loss = [{
+                "duty_cycle": duty_cycle,
+                "peak_power": peak_power,
+                "mean_on": mean_on,
+                "std_on": std_on,
+                "cv_on": cv_on,
+                "mean_event_duration": mean_event_duration,
+                "n_events": n_events_adj,
+                "name": app_name,
+                "device_type": device_type,
+            }]
+            expes_config["device_stats_for_loss"] = device_stats_for_loss
+            logging.info(
+                "Single device stats for loss: %s (duty=%.3f, peak=%.0f, type=%s)",
+                app_name, duty_cycle, peak_power, device_type
+            )
+
     try:
         tuned_keys = [
             "device_type",
