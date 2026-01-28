@@ -52,6 +52,7 @@ class AdaptiveDeviceLoss(nn.Module):
         device_stats: list = None,
         warmup_epochs: int = 2,
         output_ratio: float = 1.0,
+        config_overrides: dict = None,
     ):
         """
         Initialize adaptive device loss.
@@ -68,12 +69,20 @@ class AdaptiveDeviceLoss(nn.Module):
             output_ratio: Ratio of center region to supervise (0-1).
                           E.g., 0.5 means only supervise middle 50% of sequence.
                           This enables seq2subseq training to reduce boundary effects.
+            config_overrides: Optional dict with external config overrides:
+                - energy_weight_scale: Multiplier for w_energy (default 1.0)
+                - alpha_on_scale: Multiplier for alpha_on (default 1.0)
+                - alpha_off_scale: Multiplier for alpha_off (default 1.0)
+                - recall_weight_scale: Multiplier for w_recall (default 1.0)
         """
         super().__init__()
         self.n_devices = max(n_devices, 1)
         self.warmup_epochs = int(warmup_epochs)
         self.current_epoch = 0
         self.output_ratio = float(output_ratio)
+
+        # Store config overrides for parameter scaling
+        self.config_overrides = config_overrides or {}
 
         # Analyze each device and derive parameters
         self.device_types = []
@@ -183,94 +192,94 @@ class AdaptiveDeviceLoss(nn.Module):
         # ============================================================
 
         if lname in ("fridge", "refrigerator", "fridge_freezer"):
-            # Fridge: BENCHMARK DEVICE - F1=0.806, gate_prob=0.407
-            # Previous settings worked well, just add mild bias correction
-            params = dict(params)
-            params["w_recall"] = 0.10    # Slightly increased for recall ~0.8
-            params["w_main"] = 0.45
-            params["w_off_fp"] = 0.32
-            params["w_global"] = 0.04
-            params["w_on_power"] = 0.09
-            params["alpha_on"] = 1.8
-            params["alpha_off"] = 2.0
-            params["off_margin"] = 0.015
-            # Gate parameters - keep stable with mild correction
-            # Raw logits mean≈1.8, scale=3 → scaled≈5.4, bias=-5 → adjusted≈0.4 → sigmoid≈0.6
-            params["gate_soft_scale"] = 3.0
-            params["gate_floor"] = 0.005
-            params["gate_bias"] = -5.0  # Mild negative bias for balanced gate
-
-        elif lname in ("dishwasher",):
-            # Dishwasher: Previously had gate saturation, now with proper bias
-            # Raw logits mean≈1.8, scale=3 → scaled≈5.4, bias=-6 → adjusted≈-0.6 → sigmoid≈0.35
+            # Fridge: Cycling device - F1=0.832 good, NDE=0.402 needs improvement
+            # Need better power regression while maintaining classification
             params = dict(params)
             params["w_recall"] = 0.08
-            params["w_main"] = 0.42
-            params["w_off_fp"] = 0.38
+            params["w_main"] = 0.32      # REDUCED to make room for energy
+            params["w_off_fp"] = 0.20    # REDUCED
+            params["w_global"] = 0.04
+            params["w_on_power"] = 0.12  # INCREASED for better power accuracy
+            params["w_energy"] = 0.24    # INCREASED for energy regression
+            params["alpha_on"] = 2.0     # INCREASED slightly
+            params["alpha_off"] = 1.5    # REDUCED for better balance
+            params["off_margin"] = 0.015
+            # Gate parameters - slightly less suppressive
+            params["gate_soft_scale"] = 2.5
+            params["gate_floor"] = 0.01
+            params["gate_bias"] = -4.0
+
+        elif lname in ("dishwasher",):
+            # Dishwasher: Long-cycle device with variable power patterns
+            # Problem: Previous config had alpha_off=2.5 too high, gate_bias=-6 too suppressive
+            # Result: Poor power regression despite good F1
+            params = dict(params)
+            params["w_recall"] = 0.10    # Moderate recall
+            params["w_main"] = 0.28      # REDUCED to make room for energy
+            params["w_off_fp"] = 0.20    # REDUCED - less aggressive
             params["w_global"] = 0.03
-            params["w_on_power"] = 0.09
-            params["alpha_on"] = 1.6
-            params["alpha_off"] = 2.5     # Increased to help suppress false positives
+            params["w_on_power"] = 0.14  # INCREASED - better power accuracy
+            params["w_energy"] = 0.25    # INCREASED - stronger energy regression
+            params["alpha_on"] = 2.2     # INCREASED - emphasize ON state learning
+            params["alpha_off"] = 1.5    # REDUCED - more balanced
             params["off_margin"] = 0.008
-            # Gate parameters - moderate suppression
-            params["gate_soft_scale"] = 3.0   # Moderate scale
-            params["gate_floor"] = 0.005      # Low floor
-            params["gate_bias"] = -6.0        # Moderate negative bias
+            # Gate parameters - less suppressive
+            params["gate_soft_scale"] = 2.5
+            params["gate_floor"] = 0.01   # INCREASED floor
+            params["gate_bias"] = -4.0    # LESS negative
 
         elif lname in ("washingmachine", "washing_machine", "washer"):
             # WashingMachine: Previous gate saturation fixed, now tuning for balance
-            # Raw logits: mean≈1.8, so scaled_mean≈3.6 with scale=2
-            # For sigmoid≈0.4, need bias≈-4
             params = dict(params)
-            params["w_recall"] = 0.08    # Moderate recall - not too low
-            params["w_main"] = 0.38
-            params["w_off_fp"] = 0.40
+            params["w_recall"] = 0.07
+            params["w_main"] = 0.32
+            params["w_off_fp"] = 0.32
             params["w_global"] = 0.03
-            params["w_on_power"] = 0.11
-            params["alpha_on"] = 1.5     # Lower alpha_on to reduce ON confidence
-            params["alpha_off"] = 3.5    # VERY HIGH alpha_off to penalize false ON
+            params["w_on_power"] = 0.08
+            params["w_energy"] = 0.18    # Strong energy weight for power regression
+            params["alpha_on"] = 1.5
+            params["alpha_off"] = 3.5
             params["off_margin"] = 0.005
             # Gate parameters - moderate suppression
-            # Formula: sigmoid(logits * scale + bias)
-            # With raw logits mean≈1.8, scale=2 → scaled≈3.6, bias=-4 → adjusted≈-0.4 → sigmoid≈0.4
-            params["gate_soft_scale"] = 2.0   # Moderate scale
-            params["gate_floor"] = 0.005      # Low floor
-            params["gate_bias"] = -4.0        # Moderate negative bias
+            params["gate_soft_scale"] = 2.0
+            params["gate_floor"] = 0.005
+            params["gate_bias"] = -4.0
 
         elif lname == "kettle":
-            # Kettle: Was over-suppressing (gate_prob=0.038), need to boost gate
-            # Raw logits mean≈1.8, scale=2 → scaled≈3.6, bias=-2 → adjusted≈1.6 → sigmoid≈0.83
+            # Kettle: Was over-suppressing, need to boost gate
             params = dict(params)
-            params["w_recall"] = 0.12    # INCREASED - need more recall
-            params["w_main"] = 0.38
-            params["w_off_fp"] = 0.38    # Balanced
+            params["w_recall"] = 0.10
+            params["w_main"] = 0.32
+            params["w_off_fp"] = 0.30
             params["w_global"] = 0.03
-            params["w_on_power"] = 0.09
-            params["alpha_on"] = 2.2     # HIGHER alpha_on to boost ON detection
-            params["alpha_off"] = 2.0    # REDUCED alpha_off
+            params["w_on_power"] = 0.08
+            params["w_energy"] = 0.17    # Strong energy weight for power regression
+            params["alpha_on"] = 2.2
+            params["alpha_off"] = 2.0
             params["off_margin"] = 0.005
             # Gate parameters - LESS aggressive to allow more detections
-            # Want higher gate_prob (~0.5-0.6), so need positive adjusted values
-            params["gate_soft_scale"] = 2.0   # Softer decision
-            params["gate_floor"] = 0.05       # HIGHER floor to prevent over-suppression
-            params["gate_bias"] = -2.0        # Less negative bias - allows more ON
+            params["gate_soft_scale"] = 2.0
+            params["gate_floor"] = 0.05
+            params["gate_bias"] = -2.0
 
         elif lname == "microwave":
-            # Microwave: gate_prob=0.385 was reasonable, keep similar
-            # Raw logits mean≈1.8, scale=3 → scaled≈5.4, bias=-5 → adjusted≈0.4 → sigmoid≈0.6
+            # Microwave: Sparse high power device - SHORT bursts, need aggressive ON detection
+            # Problem: Previous config was too conservative (gate_bias=-5.0, alpha_on=1.5)
+            # Result: F1=0.388, precision=0.348, recall=0.439 (both low!)
             params = dict(params)
-            params["w_recall"] = 0.08
-            params["w_main"] = 0.35
-            params["w_off_fp"] = 0.45
+            params["w_recall"] = 0.15    # INCREASED - need more recall for sparse events
+            params["w_main"] = 0.28
+            params["w_off_fp"] = 0.25    # REDUCED - was too aggressive on false positives
             params["w_global"] = 0.03
-            params["w_on_power"] = 0.09
-            params["alpha_on"] = 1.5
-            params["alpha_off"] = 2.8
-            params["off_margin"] = 0.003
-            # Gate parameters - moderate settings
-            params["gate_soft_scale"] = 3.0  # Moderate sharpness
-            params["gate_floor"] = 0.005
-            params["gate_bias"] = -5.0  # Moderate negative bias
+            params["w_on_power"] = 0.12  # INCREASED - better power accuracy for peaks
+            params["w_energy"] = 0.17
+            params["alpha_on"] = 3.0     # INCREASED - strongly emphasize ON state learning
+            params["alpha_off"] = 1.5    # REDUCED - less penalty for OFF false positives
+            params["off_margin"] = 0.005
+            # Gate parameters - LESS conservative to detect short peaks
+            params["gate_soft_scale"] = 2.0   # Softer decision boundary
+            params["gate_floor"] = 0.03       # HIGHER floor - don't over-suppress
+            params["gate_bias"] = -2.0        # LESS negative - allow more ON predictions
 
         return device_type, params
 
@@ -335,45 +344,51 @@ class AdaptiveDeviceLoss(nn.Module):
         imbalance = max(1.0, (1.0 - duty_cycle) / max(duty_cycle, 0.01))
         imbalance = min(imbalance, 10.0)
 
+        # Get config overrides for scaling
+        energy_scale = float(self.config_overrides.get("energy_weight_scale", 1.0))
+        alpha_on_scale = float(self.config_overrides.get("alpha_on_scale", 1.0))
+        alpha_off_scale = float(self.config_overrides.get("alpha_off_scale", 1.0))
+        recall_scale = float(self.config_overrides.get("recall_weight_scale", 1.0))
+
         if device_type == self.SPARSE_HIGH_POWER:
             # Sparse devices like Kettle, Microwave: need strong OFF penalty
-            params["alpha_on"] = min(2.6, 1.6 + 0.05 * imbalance)
-            params["alpha_off"] = 1.5  # Increased from 1.1 for better OFF learning
-            params["w_main"] = 0.5
+            params["alpha_on"] = min(2.6, 1.6 + 0.05 * imbalance) * alpha_on_scale
+            params["alpha_off"] = 1.5 * alpha_off_scale
+            params["w_main"] = 0.45
             params["w_global"] = 0.05
-            params["w_recall"] = 0.25  # Reduced to balance with OFF penalty
-            params["w_off_fp"] = 0.2   # Strong OFF false positive penalty
-            params["w_energy"] = 0.05  # Energy matching for NDE/TECA
-            params["off_margin"] = 0.005  # Tight margin for sparse devices
+            params["w_recall"] = 0.20 * recall_scale
+            params["w_off_fp"] = 0.15
+            params["w_energy"] = 0.15 * energy_scale  # INCREASED for power regression
+            params["off_margin"] = 0.005
         elif device_type == self.LONG_CYCLE:
             # Long cycle devices like WashingMachine: need balanced approach
-            params["alpha_on"] = min(2.7, 1.6 + 0.07 * imbalance)
-            params["alpha_off"] = 0.8  # Slightly increased
-            params["w_main"] = 0.6
-            params["w_global"] = 0.1
-            params["w_recall"] = 0.15
-            params["w_off_fp"] = 0.15  # Moderate OFF penalty
-            params["w_energy"] = 0.05  # Energy matching
+            params["alpha_on"] = min(2.7, 1.6 + 0.07 * imbalance) * alpha_on_scale
+            params["alpha_off"] = 0.8 * alpha_off_scale
+            params["w_main"] = 0.50
+            params["w_global"] = 0.08
+            params["w_recall"] = 0.12 * recall_scale
+            params["w_off_fp"] = 0.12
+            params["w_energy"] = 0.18 * energy_scale  # INCREASED for power regression
             params["off_margin"] = 0.01
         elif device_type == self.CYCLING:
             # Cycling devices like Fridge: standard approach
-            params["alpha_on"] = 1.5
-            params["alpha_off"] = 1.0
-            params["w_main"] = 0.7
-            params["w_global"] = 0.1
-            params["w_recall"] = 0.1
-            params["w_off_fp"] = 0.1   # Mild OFF penalty
-            params["w_energy"] = 0.05  # Energy matching
+            params["alpha_on"] = 1.5 * alpha_on_scale
+            params["alpha_off"] = 1.0 * alpha_off_scale
+            params["w_main"] = 0.55
+            params["w_global"] = 0.08
+            params["w_recall"] = 0.08 * recall_scale
+            params["w_off_fp"] = 0.09
+            params["w_energy"] = 0.20 * energy_scale  # INCREASED for power regression
             params["off_margin"] = 0.015
         else:
             # Default/always-on devices
-            params["alpha_on"] = 1.0
-            params["alpha_off"] = 1.1
-            params["w_main"] = 0.7
-            params["w_global"] = 0.1
-            params["w_recall"] = 0.1
-            params["w_off_fp"] = 0.1
-            params["w_energy"] = 0.05  # Energy matching
+            params["alpha_on"] = 1.0 * alpha_on_scale
+            params["alpha_off"] = 1.1 * alpha_off_scale
+            params["w_main"] = 0.55
+            params["w_global"] = 0.08
+            params["w_recall"] = 0.08 * recall_scale
+            params["w_off_fp"] = 0.09
+            params["w_energy"] = 0.20 * energy_scale  # INCREASED for power regression
             params["off_margin"] = 0.02
 
         return params
@@ -460,10 +475,11 @@ class AdaptiveDeviceLoss(nn.Module):
         loss_global = point_loss.mean()
 
         # === Component 3: ON recall loss ===
-        # REDUCED: Target Recall~0.7, current recall is too high (0.911)
-        # Lower coefficient to reduce recall pressure
+        # For sparse devices (high w_recall), use stronger recall pressure
+        # This helps detect short peaks that are easily missed
         w_recall = float(params.get("w_recall", 0.1))
-        recall_coef = 0.10 + 0.10 * w_recall  # REDUCED: 0.10-0.20 (was 0.15-0.30)
+        # recall_coef scales from 0.15 (w_recall=0) to 0.50 (w_recall=0.2)
+        recall_coef = 0.15 + 1.5 * w_recall  # Range: 0.15-0.45 for w_recall 0-0.2
         on_deficit = torch.relu(recall_coef * target - pred) * p_on
         on_recall_loss = on_deficit.sum() / (p_on.sum() + eps)
 
@@ -486,17 +502,30 @@ class AdaptiveDeviceLoss(nn.Module):
         else:
             on_power_loss = pred.new_tensor(0.0)
 
+        # === Component 6: Energy regression loss (total power over window) ===
+        # CRITICAL: This component directly optimizes energy_ratio metric
+        # Compute total energy (sum of power values) for pred and target
+        pred_energy = pred.sum(dim=-1)  # Sum over time dimension
+        target_energy = target.sum(dim=-1)
+        # Energy ratio error: penalize when predicted total energy differs from actual
+        energy_error = torch.abs(pred_energy - target_energy) / (target_energy.abs() + eps)
+        energy_loss = energy_error.mean()
+        # Clamp to prevent extreme values
+        energy_loss = torch.clamp(energy_loss, 0.0, 2.0)
+
         # Get weights from params
         w_main = float(params.get("w_main", 0.7))
         w_global = float(params.get("w_global", 0.1))
         w_off_fp = float(params.get("w_off_fp", 0.1))
         w_on_power = float(params.get("w_on_power", 0.03))  # ON power accuracy weight
+        w_energy = float(params.get("w_energy", 0.1))  # Energy regression weight
 
         total = (w_main * loss_main +
                  w_global * loss_global +
                  w_recall * on_recall_loss +
                  w_off_fp * off_fp_loss +
-                 w_on_power * on_power_loss)
+                 w_on_power * on_power_loss +
+                 w_energy * energy_loss)
 
         return total
 

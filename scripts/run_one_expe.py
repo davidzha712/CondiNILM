@@ -27,6 +27,7 @@ from src.helpers.utils import create_dir
 from src.helpers.preprocessing import (
     UKDALE_DataBuilder,
     REFIT_DataBuilder,
+    REDD_DataBuilder,
     split_train_test_nilmdataset,
     split_train_test_pdl_nilmdataset,
     nilmdataset_to_tser,
@@ -40,6 +41,11 @@ from src.helpers.device_config import (
     get_device_loss_params,
     estimate_mean_run_length,
     apply_device_type_config_defaults,
+)
+from src.helpers.dataset_params import (
+    DatasetParamsManager,
+    get_dynamic_output_channels,
+    validate_appliances_for_dataset,
 )
 
 
@@ -468,7 +474,7 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                 if len(app_val) > 1:
                     is_multi = True
         if is_multi:
-            # For multi-device training, ensure strong anti-collapse penalties
+            # For multi-device training, adjust loss params but RESPECT YAML config values
             lam_off = float(device_params.get("lambda_off_hard", 0.0))
             lam_on = float(device_params.get("lambda_on_recall", 0.0))
             lam_gate = float(device_params.get("lambda_gate_cls", 0.0))
@@ -477,15 +483,28 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
             # Ensure ON recall is strong enough to prevent collapse (min 1.5)
             device_params["lambda_on_recall"] = max(1.5, min(2.5, lam_on * 1.2))
             device_params["lambda_gate_cls"] = min(0.25, lam_gate * 1.1)
+
+            # Only set anti_collapse_weight if not already configured from YAML (has positive value)
             try:
                 cur_anti = float(getattr(expes_config, "anti_collapse_weight", 0.0) or 0.0)
             except Exception:
                 cur_anti = 0.0
-            expes_config["anti_collapse_weight"] = max(cur_anti, 1.0)
-            expes_config["state_zero_penalty_weight"] = 0.0
-            expes_config["off_high_agg_penalty_weight"] = 0.0
-            expes_config["off_state_penalty_weight"] = 0.0
-            expes_config["off_state_long_penalty_weight"] = 0.0
+            if cur_anti <= 0:  # Only force default if not configured
+                expes_config["anti_collapse_weight"] = 1.0
+            # Note: YAML anti_collapse_weight=0.3 will be respected, not overwritten to 1.0
+
+            # Only set penalty weights if not already configured from YAML (have positive value)
+            cur_szp = float(getattr(expes_config, "state_zero_penalty_weight", -1.0) or -1.0)
+            cur_ohap = float(getattr(expes_config, "off_high_agg_penalty_weight", -1.0) or -1.0)
+            if cur_szp < 0:  # Not configured from YAML
+                expes_config["state_zero_penalty_weight"] = 0.0
+            if cur_ohap < 0:  # Not configured from YAML
+                expes_config["off_high_agg_penalty_weight"] = 0.0
+            # These are typically not in YAML, set to 0
+            if "off_state_penalty_weight" not in expes_config:
+                expes_config["off_state_penalty_weight"] = 0.0
+            if "off_state_long_penalty_weight" not in expes_config:
+                expes_config["off_state_long_penalty_weight"] = 0.0
     except Exception:
         pass
     alpha_on = device_params["alpha_on"]
@@ -687,8 +706,8 @@ def get_cache_path(expes_config: OmegaConf):
     """
     Generate cache path that uniquely identifies the data configuration.
 
-    FIXED: Now includes specific device list (app) in the cache key to prevent
-    loading wrong cached data when different device combinations are used.
+    FIXED: Now includes specific device list (app) AND house numbers in the cache key
+    to prevent loading wrong cached data when different configurations are used.
     """
     overlap = getattr(expes_config, "overlap", 0.0)
     overlap_str = "ov{}".format(str(overlap).replace(".", "p"))
@@ -701,10 +720,30 @@ def get_cache_path(expes_config: OmegaConf):
     else:
         app_str = str(getattr(expes_config, "appliance", "unknown"))
 
+    # Get house numbers for unique cache key
+    train_houses = getattr(expes_config, "ind_house_train_val", None)
+    test_houses = getattr(expes_config, "ind_house_test", None)
+    if train_houses is not None:
+        if isinstance(train_houses, (list, tuple)):
+            train_str = "".join(str(h) for h in sorted(train_houses))
+        else:
+            train_str = str(train_houses)
+    else:
+        train_str = "all"
+    if test_houses is not None:
+        if isinstance(test_houses, (list, tuple)):
+            test_str = "".join(str(h) for h in sorted(test_houses))
+        else:
+            test_str = str(test_houses)
+    else:
+        test_str = "all"
+    houses_str = f"tr{train_str}_te{test_str}"
+
     if getattr(expes_config, "name_model", None) == "DiffNILM":
         key_elements = [
             expes_config.dataset,
-            app_str,  # Use specific device list instead of generic "Multi"
+            app_str,
+            houses_str,  # Include house numbers
             expes_config.sampling_rate,
             str(expes_config.window_size),
             str(expes_config.seed),
@@ -716,7 +755,8 @@ def get_cache_path(expes_config: OmegaConf):
     else:
         key_elements = [
             expes_config.dataset,
-            app_str,  # Use specific device list instead of generic "Multi"
+            app_str,
+            houses_str,  # Include house numbers
             expes_config.sampling_rate,
             str(expes_config.window_size),
             str(expes_config.seed),
@@ -734,6 +774,43 @@ def get_cache_path(expes_config: OmegaConf):
 def launch_one_experiment(expes_config: OmegaConf):
     np.random.seed(seed=expes_config.seed)
 
+    # Load dataset-specific parameters
+    params_manager = DatasetParamsManager()
+    dataset_name = getattr(expes_config, "dataset", "UKDALE")
+
+    # Apply dataset-specific configuration
+    ds_training = params_manager.get_training_config(dataset_name)
+    ds_loss = params_manager.get_loss_config(dataset_name)
+
+    # Apply training params if not already set
+    for key, value in ds_training.items():
+        if key not in expes_config or getattr(expes_config, key, None) is None:
+            try:
+                expes_config[key] = value
+            except Exception:
+                pass
+
+    for key, value in ds_loss.items():
+        try:
+            expes_config[key] = value
+            logging.info(f"Applied dataset loss config: {key}={value}")
+        except Exception:
+            pass
+    hpo_override = getattr(expes_config, "hpo_override", None)
+    if isinstance(hpo_override, dict) and hpo_override:
+        for key, value in hpo_override.items():
+            try:
+                expes_config[key] = value
+            except Exception:
+                pass
+
+    # Get dynamic output channels (number of devices)
+    app_list = getattr(expes_config, "app", None)
+    if app_list is not None:
+        n_devices = get_dynamic_output_channels(app_list, dataset_name, params_manager)
+        expes_config["c_out"] = n_devices
+        logging.info(f"Dynamic output channels: {n_devices} devices")
+
     cache_path = get_cache_path(expes_config)
     if os.path.isfile(cache_path):
         logging.info("Load cached preprocessed data from %s", cache_path)
@@ -749,6 +826,14 @@ def launch_one_experiment(expes_config: OmegaConf):
             expes_config["app"] = cached_app_list
             logging.info("Restored device names from cache: %s", cached_app_list)
 
+        # Update c_out from cached data shape
+        if isinstance(tuple_data, tuple) and len(tuple_data) >= 4:
+            data_for_stats = tuple_data[3]
+            if isinstance(data_for_stats, np.ndarray) and data_for_stats.ndim == 4:
+                n_devices = data_for_stats.shape[1] - 1  # Subtract aggregate
+                expes_config["c_out"] = n_devices
+                logging.info(f"Updated c_out from cache: {n_devices}")
+
         _apply_cutoff_to_loss_params(expes_config)
         try:
             if isinstance(tuple_data, tuple) and len(tuple_data) >= 4:
@@ -759,6 +844,21 @@ def launch_one_experiment(expes_config: OmegaConf):
                     )
         except Exception:
             pass
+
+        for key, value in ds_loss.items():
+            try:
+                expes_config[key] = value
+                logging.info(f"Re-applied dataset loss config (after auto-config): {key}={value}")
+            except Exception:
+                pass
+        hpo_override = getattr(expes_config, "hpo_override", None)
+        if isinstance(hpo_override, dict) and hpo_override:
+            for key, value in hpo_override.items():
+                try:
+                    expes_config[key] = value
+                except Exception:
+                    pass
+
         return launch_models_training(tuple_data, scaler, expes_config)
 
     logging.info("Process data ...")
@@ -797,6 +897,29 @@ def launch_one_experiment(expes_config: OmegaConf):
             house_indicies=expes_config.ind_house_test
         )
 
+        # CRITICAL FIX: Sync expes_config.app with actual data shape
+        # This ensures device names match actual data for visualization and metrics
+        actual_n_devices = data_train.shape[1] - 1  # Subtract aggregate
+        actual_devices = [d for d in data_builder.mask_app if d != "aggregate"]
+        original_devices = expes_config.app if isinstance(expes_config.app, list) else [expes_config.app]
+
+        if len(actual_devices) != len(original_devices) or set(actual_devices) != set(original_devices):
+            logging.warning(
+                "UKDALE: Syncing expes_config.app from %s to %s",
+                original_devices, actual_devices
+            )
+            expes_config.app = actual_devices
+            expes_config["c_out"] = len(actual_devices)
+            # Also update appliance_group_members if it exists
+            if hasattr(expes_config, "appliance_group_members"):
+                expes_config.appliance_group_members = actual_devices
+        elif actual_n_devices != len(original_devices):
+            logging.warning(
+                "UKDALE: Data shape (%d devices) differs from config (%d). Updating c_out.",
+                actual_n_devices, len(original_devices)
+            )
+            expes_config["c_out"] = actual_n_devices
+
         if overlap == 0:
             data_train, st_date_train, data_valid, st_date_valid = (
                 split_train_test_nilmdataset(
@@ -824,31 +947,184 @@ def launch_one_experiment(expes_config: OmegaConf):
             )
 
     elif expes_config.dataset == "REFIT":
+        # Support overlap parameter like REDD/UKDALE
+        overlap = getattr(expes_config, "overlap", 0.5)
+        if overlap == 0:
+            window_stride = expes_config.window_size
+        else:
+            if not (0 < overlap < 1):
+                raise ValueError(
+                    "Invalid overlap value {}. Expected 0 or 0 < overlap < 1.".format(
+                        overlap
+                    )
+                )
+            window_stride = max(
+                1, int(round(expes_config.window_size * (1.0 - float(overlap))))
+            )
+
         data_builder = REFIT_DataBuilder(
             data_path=f"{expes_config.data_path}/REFIT/RAW_DATA_CLEAN/",
             mask_app=expes_config.app,
             sampling_rate=expes_config.sampling_rate,
             window_size=expes_config.window_size,
+            window_stride=window_stride,
         )
 
-        data, st_date = data_builder.get_nilm_dataset(
-            house_indicies=expes_config.house_with_app_i
+        # Use ind_house_train_val/ind_house_test if available, else use house_with_app_i
+        train_houses = getattr(expes_config, "ind_house_train_val", None)
+        test_houses = getattr(expes_config, "ind_house_test", None)
+
+        if train_houses is not None and test_houses is not None:
+            # New style: explicit train/test split
+            all_houses = list(set(train_houses + test_houses))
+            data, st_date = data_builder.get_nilm_dataset(house_indicies=all_houses)
+
+            if isinstance(expes_config.window_size, str):
+                expes_config.window_size = data_builder.window_size
+
+            data_train, st_date_train = data_builder.get_nilm_dataset(
+                house_indicies=train_houses
+            )
+            data_test, st_date_test = data_builder.get_nilm_dataset(
+                house_indicies=test_houses
+            )
+
+            # Split train into train/valid
+            data_train, st_date_train, data_valid, st_date_valid = (
+                split_train_valid_timeblock_nilmdataset(
+                    data_train,
+                    st_date_train,
+                    perc_valid=0.2,
+                    window_size=expes_config.window_size,
+                    window_stride=data_builder.window_stride,
+                )
+            )
+        else:
+            # Legacy style: use house_with_app_i and auto-split
+            data, st_date = data_builder.get_nilm_dataset(
+                house_indicies=expes_config.house_with_app_i
+            )
+
+            if isinstance(expes_config.window_size, str):
+                expes_config.window_size = data_builder.window_size
+
+            data_train, st_date_train, data_test, st_date_test = (
+                split_train_test_pdl_nilmdataset(
+                    data.copy(), st_date.copy(), nb_house_test=2, seed=expes_config.seed
+                )
+            )
+
+            data_train, st_date_train, data_valid, st_date_valid = (
+                split_train_test_pdl_nilmdataset(
+                    data_train, st_date_train, nb_house_test=1, seed=expes_config.seed
+                )
+            )
+
+        # CRITICAL FIX: Sync expes_config.app with actual data shape
+        actual_n_devices = data_train.shape[1] - 1  # Subtract aggregate
+        actual_devices = [d for d in data_builder.mask_app if d != "Aggregate"]
+        original_devices = expes_config.app if isinstance(expes_config.app, list) else [expes_config.app]
+
+        if len(actual_devices) != len(original_devices) or set(actual_devices) != set(original_devices):
+            logging.warning(
+                "REFIT: Syncing expes_config.app from %s to %s",
+                original_devices, actual_devices
+            )
+            expes_config.app = actual_devices
+            expes_config["c_out"] = len(actual_devices)
+            if hasattr(expes_config, "appliance_group_members"):
+                expes_config.appliance_group_members = actual_devices
+        elif actual_n_devices != len(original_devices):
+            expes_config["c_out"] = actual_n_devices
+
+    elif expes_config.dataset == "REDD":
+        overlap = getattr(expes_config, "overlap", 0.0)
+        if overlap == 0:
+            window_stride = expes_config.window_size
+        else:
+            if not (0 < overlap < 1):
+                raise ValueError(
+                    "Invalid overlap value {}. Expected 0 or 0 < overlap < 1.".format(
+                        overlap
+                    )
+                )
+            window_stride = max(
+                1, int(round(expes_config.window_size * (1.0 - float(overlap))))
+            )
+
+        # Load REDD-specific appliance params from dataset_params.yaml
+        redd_appliance_params = {}
+        ds_config = params_manager.get_dataset_config("REDD")
+        if ds_config:
+            for app_name, app_cfg in ds_config.get("appliances", {}).items():
+                redd_appliance_params[app_name.lower()] = {
+                    k: v for k, v in app_cfg.items()
+                    if k in ["min_threshold", "max_threshold", "min_on_duration",
+                             "min_off_duration", "min_activation_time"]
+                }
+
+        data_builder = REDD_DataBuilder(
+            data_path=f"{expes_config.data_path}/REDD/",
+            mask_app=expes_config.app,
+            sampling_rate=expes_config.sampling_rate,
+            window_size=expes_config.window_size,
+            window_stride=window_stride,
+            appliance_params=redd_appliance_params if redd_appliance_params else None,
         )
+
+        # Get all available houses for full data
+        all_houses = list(set(expes_config.ind_house_train_val + expes_config.ind_house_test))
+        data, st_date = data_builder.get_nilm_dataset(house_indicies=all_houses)
 
         if isinstance(expes_config.window_size, str):
             expes_config.window_size = data_builder.window_size
 
-        data_train, st_date_train, data_test, st_date_test = (
-            split_train_test_pdl_nilmdataset(
-                data.copy(), st_date.copy(), nb_house_test=2, seed=expes_config.seed
-            )
+        data_train, st_date_train = data_builder.get_nilm_dataset(
+            house_indicies=expes_config.ind_house_train_val
+        )
+        data_test, st_date_test = data_builder.get_nilm_dataset(
+            house_indicies=expes_config.ind_house_test
         )
 
-        data_train, st_date_train, data_valid, st_date_valid = (
-            split_train_test_pdl_nilmdataset(
-                data_train, st_date_train, nb_house_test=1, seed=expes_config.seed
+        # CRITICAL FIX: Sync expes_config.app with actual filtered devices
+        # After auto_filter_devices, data_builder.mask_app may have changed
+        actual_devices = [d for d in data_builder.mask_app if d != "aggregate"]
+        original_devices = expes_config.app if isinstance(expes_config.app, list) else [expes_config.app]
+        if set(actual_devices) != set(original_devices):
+            logging.warning(
+                "SYNC: Updated expes_config.app from %s to %s (after device auto-filter)",
+                original_devices, actual_devices
             )
-        )
+            expes_config.app = actual_devices
+            # Also update appliance_group_members if it exists
+            if hasattr(expes_config, "appliance_group_members"):
+                expes_config.appliance_group_members = actual_devices
+            # CRITICAL: Update c_out to match actual number of devices
+            expes_config["c_out"] = len(actual_devices)
+            logging.info(f"Updated c_out to {len(actual_devices)} (from data shape)")
+
+        if overlap == 0:
+            data_train, st_date_train, data_valid, st_date_valid = (
+                split_train_test_nilmdataset(
+                    data_train,
+                    st_date_train,
+                    perc_house_test=0.2,
+                    seed=expes_config.seed,
+                )
+            )
+        else:
+            data_train, st_date_train, data_valid, st_date_valid = (
+                split_train_valid_timeblock_nilmdataset(
+                    data_train,
+                    st_date_train,
+                    perc_valid=0.2,
+                    window_size=expes_config.window_size,
+                    window_stride=data_builder.window_stride,
+                )
+            )
+
+    else:
+        raise ValueError(f"Unknown dataset: {expes_config.dataset}. Supported: UKDALE, REFIT, REDD")
 
     logging.info("             ... Done.")
 
@@ -861,6 +1137,14 @@ def launch_one_experiment(expes_config: OmegaConf):
     threshold = data_builder.appliance_param[app_key]["min_threshold"]
     expes_config.threshold = threshold
     _configure_nilm_loss_hyperparams(expes_config, data, threshold)
+
+    # Re-apply YAML loss config AFTER auto-config to ensure YAML takes precedence
+    for key, value in ds_loss.items():
+        try:
+            expes_config[key] = value
+            logging.info(f"Re-applied dataset loss config (after auto-config): {key}={value}")
+        except Exception:
+            pass
 
     scaler = NILMscaler(
         power_scaling_type=expes_config.power_scaling_type,
@@ -936,6 +1220,8 @@ def main(
     overlap=None,
     epochs=None,
     batch_size=None,
+    ind_house_train_val=None,
+    ind_house_test=None,
 ):
     """
     Main function to load configuration, update it with parameters,
@@ -947,6 +1233,8 @@ def main(
         window_size (int or str): Size of the window (converted to int if possible not day, week or month).
         appliance (str): Selected appliance (case-insensitive).
         name_model (str): Name of the model to use for the experiment (case-insensitive).
+        ind_house_train_val (list): Optional list of house indices for training/validation.
+        ind_house_test (list): Optional list of house indices for testing.
     """
 
     seed = 42
@@ -1075,8 +1363,29 @@ def main(
     expes_config["resume"] = bool(resume)
     expes_config["skip_final_eval"] = bool(no_final_eval)
 
-    # Auto-select loss type for multi-device training
+    # Override house indices if provided via command line
+    if ind_house_train_val is not None:
+        expes_config["ind_house_train_val"] = ind_house_train_val
+        logging.info("      Using custom train/val houses: %s", ind_house_train_val)
+    if ind_house_test is not None:
+        expes_config["ind_house_test"] = ind_house_test
+        logging.info("      Using custom test houses: %s", ind_house_test)
+
+    # CRITICAL FIX: For REDD Multi mode, ensure consistent house configuration
+    # Different REDD devices have different availability - use common houses
     is_multi_device = len(selected_keys) > 1 or appliance_lower == "multi"
+    if is_multi_device and dataset_key == "REDD":
+        # If user didn't specify houses, use the recommended REDD multi-device config
+        # Houses 1,2,3 have fridge, microwave, dishwasher with good activity
+        if ind_house_train_val is None and ind_house_test is None:
+            logging.warning(
+                "REDD Multi mode: Using recommended house config [1,2] train, [3] test. "
+                "Devices with insufficient data will be auto-filtered."
+            )
+            expes_config["ind_house_train_val"] = [1, 2]
+            expes_config["ind_house_test"] = [3]
+
+    # Auto-select loss type for multi-device training
     if loss_type is not None:
         expes_config["loss_type"] = str(loss_type)
     elif is_multi_device and model_key.lower() == "nilmformer":
@@ -1209,8 +1518,29 @@ if __name__ == "__main__":
         default=None,
         help="Override batch size defined in configs/expes.yaml.",
     )
+    parser.add_argument(
+        "--ind_house_train_val",
+        type=str,
+        default=None,
+        help="Comma-separated list of house indices for training/validation (e.g., '1,2,3').",
+    )
+    parser.add_argument(
+        "--ind_house_test",
+        type=str,
+        default=None,
+        help="Comma-separated list of house indices for testing (e.g., '5').",
+    )
 
     args = parser.parse_args()
+
+    # Parse house indices
+    ind_house_train_val = None
+    ind_house_test = None
+    if args.ind_house_train_val:
+        ind_house_train_val = [int(x.strip()) for x in args.ind_house_train_val.split(",")]
+    if args.ind_house_test:
+        ind_house_test = [int(x.strip()) for x in args.ind_house_test.split(",")]
+
     main(
         dataset=args.dataset,
         sampling_rate=args.sampling_rate,
@@ -1223,4 +1553,6 @@ if __name__ == "__main__":
         overlap=args.overlap,
         epochs=args.epochs,
         batch_size=args.batch_size,
+        ind_house_train_val=ind_house_train_val,
+        ind_house_test=ind_house_test,
     )

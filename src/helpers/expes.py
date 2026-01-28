@@ -32,6 +32,18 @@ from src.helpers.metrics import NILMmetrics, eval_win_energy_aggregation
 from src.helpers.loss_tuning import AdaptiveLossTuner
 
 
+def _to_jsonable(value):
+    if isinstance(value, dict):
+        return {k: _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 def _append_jsonl(path, record):
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
@@ -71,13 +83,13 @@ def _append_jsonl(path, record):
                         and appliance_old == appliance_new
                     ):
                         continue
-                    existing_lines.append(json.dumps(obj, ensure_ascii=False))
+                    existing_lines.append(json.dumps(_to_jsonable(obj), ensure_ascii=False))
         except Exception:
             with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.write(json.dumps(_to_jsonable(record), ensure_ascii=False) + "\n")
             return
 
-    existing_lines.append(json.dumps(record, ensure_ascii=False))
+    existing_lines.append(json.dumps(_to_jsonable(record), ensure_ascii=False))
 
     with open(path, "w", encoding="utf-8") as f:
         for line in existing_lines:
@@ -1106,11 +1118,11 @@ class ValidationNILMMetricCallback(pl.Callback):
         off_run_min_len = int(
             getattr(self.expes_config, "state_zero_kernel", max(min_on_steps, 0))
         )
-        y = np.array([])
-        y_hat = np.array([])
-        y_win = np.array([])
-        y_hat_win = np.array([])
-        y_state = np.array([])
+        y = np.array([], dtype=np.float32)
+        y_hat = np.array([], dtype=np.float32)
+        y_win = np.array([], dtype=np.float32)
+        y_hat_win = np.array([], dtype=np.float32)
+        y_state = np.array([], dtype=np.int8)
         per_device_data = None
         stats = {
             "pred_scaled_sum": 0.0,
@@ -1318,13 +1330,13 @@ class ValidationNILMMetricCallback(pl.Callback):
                 pred_post_np = torch.flatten(pred_inv).detach().cpu().numpy()
                 target_np = torch.flatten(target_inv).detach().cpu().numpy()
                 pred_raw_np = np.nan_to_num(
-                    pred_raw_np.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0
+                    pred_raw_np.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
                 )
                 pred_post_np = np.nan_to_num(
-                    pred_post_np.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0
+                    pred_post_np.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
                 )
                 target_np = np.nan_to_num(
-                    target_np.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0
+                    target_np.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
                 )
                 stats["pred_raw_sum"] += float(pred_raw_np.sum())
                 stats["pred_raw_sumsq"] += float((pred_raw_np**2).sum())
@@ -1348,13 +1360,13 @@ class ValidationNILMMetricCallback(pl.Callback):
                 pred_post_3d = pred_inv.detach().cpu().numpy()
                 pred_raw_3d = pred_inv_raw.detach().cpu().numpy()
                 target_3d = np.nan_to_num(
-                    target_3d.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0
+                    target_3d.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
                 )
                 pred_post_3d = np.nan_to_num(
-                    pred_post_3d.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0
+                    pred_post_3d.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
                 )
                 pred_raw_3d = np.nan_to_num(
-                    pred_raw_3d.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0
+                    pred_raw_3d.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
                 )
                 off_s = _off_run_stats(
                     target_3d,
@@ -1409,18 +1421,18 @@ class ValidationNILMMetricCallback(pl.Callback):
 
                 target_win = target_inv.sum(dim=-1)
                 pred_win = pred_inv.sum(dim=-1)
-                target_np_all = target_inv.detach().cpu().numpy()
-                pred_np_all = pred_inv.detach().cpu().numpy()
-                target_win_np_all = target_win.detach().cpu().numpy()
-                pred_win_np_all = pred_win.detach().cpu().numpy()
+                target_np_all = target_inv.detach().cpu().numpy().astype(np.float32, copy=False)
+                pred_np_all = pred_inv.detach().cpu().numpy().astype(np.float32, copy=False)
+                target_win_np_all = target_win.detach().cpu().numpy().astype(np.float32, copy=False)
+                pred_win_np_all = pred_win.detach().cpu().numpy().astype(np.float32, copy=False)
                 target_flat = target_np_all.reshape(-1)
                 pred_flat = pred_np_all.reshape(-1)
                 target_win_flat = target_win_np_all.reshape(-1)
                 pred_win_flat = pred_win_np_all.reshape(-1)
                 state_np_all = None
-                state_flat = np.array([])
+                state_flat = np.array([], dtype=np.int8)
                 if state is not None:
-                    state_np_all = state.detach().cpu().numpy()
+                    state_np_all = state.detach().cpu().numpy().astype(np.int8, copy=False)
                     state_flat = state_np_all.reshape(-1)
                 y = np.concatenate((y, target_flat)) if y.size else target_flat
                 y_hat = np.concatenate((y_hat, pred_flat)) if y_hat.size else pred_flat
@@ -1431,11 +1443,11 @@ class ValidationNILMMetricCallback(pl.Callback):
                     if per_device_data is None:
                         n_app = target_np_all.shape[1]
                         per_device_data = {
-                            "y": [np.array([]) for _ in range(n_app)],
-                            "y_hat": [np.array([]) for _ in range(n_app)],
-                            "y_win": [np.array([]) for _ in range(n_app)],
-                            "y_hat_win": [np.array([]) for _ in range(n_app)],
-                            "y_state": [np.array([]) for _ in range(n_app)],
+                            "y": [np.array([], dtype=np.float32) for _ in range(n_app)],
+                            "y_hat": [np.array([], dtype=np.float32) for _ in range(n_app)],
+                            "y_win": [np.array([], dtype=np.float32) for _ in range(n_app)],
+                            "y_hat_win": [np.array([], dtype=np.float32) for _ in range(n_app)],
+                            "y_state": [np.array([], dtype=np.int8) for _ in range(n_app)],
                         }
                     n_app = target_np_all.shape[1]
                     for j in range(n_app):
@@ -1603,7 +1615,7 @@ class ValidationNILMMetricCallback(pl.Callback):
             "collapse_flag": collapse_flag,
         }
         _append_jsonl(os.path.join(group_dir, "val_report.jsonl"), record)
-        logging.info("VAL_REPORT_JSON: %s", json.dumps(record, ensure_ascii=False))
+        logging.info("VAL_REPORT_JSON: %s", json.dumps(_to_jsonable(record), ensure_ascii=False))
 
         # Adaptive loss tuning using AdaptiveLossTuner
         try:
@@ -1777,11 +1789,11 @@ def evaluate_nilm_split(
     expes_config=None,
 ):
     metrics_helper = NILMmetrics()
-    y = np.array([])
-    y_hat = np.array([])
-    y_win = np.array([])
-    y_hat_win = np.array([])
-    y_state = np.array([])
+    y = np.array([], dtype=np.float32)
+    y_hat = np.array([], dtype=np.float32)
+    y_win = np.array([], dtype=np.float32)
+    y_hat_win = np.array([], dtype=np.float32)
+    y_state = np.array([], dtype=np.int8)
     per_device_data = None
     threshold_postprocess = float(threshold_small_values)
     off_run_min_len = int(max(int(min_on_duration_steps or 0), 0))
@@ -1906,18 +1918,18 @@ def evaluate_nilm_split(
                     pass
             target_win = target_inv.sum(dim=-1)
             pred_win = pred_inv.sum(dim=-1)
-            target_np_all = target_inv.detach().cpu().numpy()
-            pred_np_all = pred_inv.detach().cpu().numpy()
-            target_win_np_all = target_win.detach().cpu().numpy()
-            pred_win_np_all = pred_win.detach().cpu().numpy()
+            target_np_all = target_inv.detach().cpu().numpy().astype(np.float32, copy=False)
+            pred_np_all = pred_inv.detach().cpu().numpy().astype(np.float32, copy=False)
+            target_win_np_all = target_win.detach().cpu().numpy().astype(np.float32, copy=False)
+            pred_win_np_all = pred_win.detach().cpu().numpy().astype(np.float32, copy=False)
             target_flat = target_np_all.reshape(-1)
             pred_flat = pred_np_all.reshape(-1)
             target_win_flat = target_win_np_all.reshape(-1)
             pred_win_flat = pred_win_np_all.reshape(-1)
             state_np_all = None
-            state_flat = np.array([])
+            state_flat = np.array([], dtype=np.int8)
             if state is not None:
-                state_np_all = state.detach().cpu().numpy()
+                state_np_all = state.detach().cpu().numpy().astype(np.int8, copy=False)
                 state_flat = state_np_all.reshape(-1)
             y = np.concatenate((y, target_flat)) if y.size else target_flat
             y_hat = np.concatenate((y_hat, pred_flat)) if y_hat.size else pred_flat
@@ -1936,11 +1948,11 @@ def evaluate_nilm_split(
                 if per_device_data is None:
                     n_app = target_np_all.shape[1]
                     per_device_data = {
-                        "y": [np.array([]) for _ in range(n_app)],
-                        "y_hat": [np.array([]) for _ in range(n_app)],
-                        "y_win": [np.array([]) for _ in range(n_app)],
-                        "y_hat_win": [np.array([]) for _ in range(n_app)],
-                        "y_state": [np.array([]) for _ in range(n_app)],
+                    "y": [np.array([], dtype=np.float32) for _ in range(n_app)],
+                    "y_hat": [np.array([], dtype=np.float32) for _ in range(n_app)],
+                    "y_win": [np.array([], dtype=np.float32) for _ in range(n_app)],
+                    "y_hat_win": [np.array([], dtype=np.float32) for _ in range(n_app)],
+                    "y_state": [np.array([], dtype=np.int8) for _ in range(n_app)],
                     }
                 n_app = target_np_all.shape[1]
                 for j in range(n_app):
@@ -2320,11 +2332,37 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
 
             warmup_epochs = int(getattr(expes_config, "n_warmup_epochs", 2))
             output_ratio = float(getattr(expes_config, "output_ratio", 1.0))
+
+            # Build config overrides from YAML config for loss function scaling
+            # These scale the internal parameters of AdaptiveDeviceLoss
+            config_overrides = {}
+            # loss_lambda_energy scales the w_energy weight
+            # New defaults are ~0.17-0.22, so scale is relative to 0.20
+            lambda_energy = float(getattr(expes_config, "loss_lambda_energy", 1.0))
+            if lambda_energy > 1.0:  # Only scale if explicitly set higher
+                config_overrides["energy_weight_scale"] = lambda_energy  # Direct multiplier
+            # loss_alpha_on scales alpha_on (default ~1.5-2.6 depending on device)
+            alpha_on = float(getattr(expes_config, "loss_alpha_on", 1.0))
+            if alpha_on > 2.0:  # Only scale if significantly higher
+                config_overrides["alpha_on_scale"] = alpha_on / 2.0  # 2.0 is approx base
+            # loss_alpha_off scales alpha_off
+            alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
+            if alpha_off != 1.0:
+                config_overrides["alpha_off_scale"] = alpha_off
+            # loss_lambda_on_recall scales recall weight
+            lambda_recall = float(getattr(expes_config, "loss_lambda_on_recall", 1.0))
+            if lambda_recall > 1.0:
+                config_overrides["recall_weight_scale"] = lambda_recall
+
+            if config_overrides:
+                logging.info("AdaptiveDeviceLoss config overrides: %s", config_overrides)
+
             criterion = AdaptiveDeviceLoss(
                 n_devices=n_app,
                 device_stats=device_stats,
                 warmup_epochs=warmup_epochs,
                 output_ratio=output_ratio,
+                config_overrides=config_overrides if config_overrides else None,
             )
             # Log device classifications with full stats
             device_info = criterion.get_device_info()
@@ -2539,6 +2577,20 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                     max_epochs = (ckpt_epoch + 1) + max(1, int(expes_config.epochs))
         except Exception:
             pass
+    limit_train_batches = getattr(expes_config, "limit_train_batches", 1.0)
+    limit_val_batches = getattr(expes_config, "limit_val_batches", 1.0)
+    try:
+        limit_train_batches = float(limit_train_batches)
+    except Exception:
+        limit_train_batches = 1.0
+    try:
+        limit_val_batches = float(limit_val_batches)
+    except Exception:
+        limit_val_batches = 1.0
+    if limit_train_batches <= 0:
+        limit_train_batches = 1.0
+    if limit_val_batches <= 0:
+        limit_val_batches = 1.0
     trainer_kwargs = dict(
         max_epochs=max_epochs,
         accelerator=accelerator,
@@ -2550,6 +2602,8 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         logger=tb_logger,
         gradient_clip_val=gradient_clip_val,
         accumulate_grad_batches=accumulate_grad_batches,
+        limit_train_batches=limit_train_batches,
+        limit_val_batches=limit_val_batches,
     )
     trainer = pl.Trainer(**trainer_kwargs)
     if ckpt_path_resume is not None:

@@ -169,14 +169,14 @@ NILMFormer:
 
     use_efficient_attention: false
     n_encoder_layers: 4
-    d_model: 128
-    dp_rate: 0.1
-    pffn_ratio: 4
+    d_model: 176
+    dp_rate: 0.07956860646723331
+    pffn_ratio: 5
     n_head: 8
     norm_eps: 1e-5
   model_training_param:
-    lr: 1e-4
-    wd: 0.01
+    lr: 0.00030069384832521074
+    wd: 0.0396732917352668
     training_in_model: false
   model_training_param_eaec:
     lr: 5e-5

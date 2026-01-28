@@ -1,449 +1,405 @@
-#################################################################################################################
-#
-# @description : Optuna search for NILMFormer experiments
-#
-#################################################################################################################
-
 import argparse
+import json
 import logging
 import os
+import sys
+from typing import Any, Dict, List, Tuple
 
-logging.getLogger("torch.utils.flop_counter").disabled = True
-
-import numpy as np
 import optuna
-import torch
 import yaml
-
 from omegaconf import OmegaConf
 
-from src.helpers.expes import launch_models_training
-from src.helpers.preprocessing import (
-    REFIT_DataBuilder,
-    UKDALE_DataBuilder,
-    nilmdataset_to_tser,
-    split_train_test_nilmdataset,
-    split_train_test_pdl_nilmdataset,
-    split_train_valid_timeblock_nilmdataset,
-)
-from src.helpers.dataset import NILMscaler
+_ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _ROOT_DIR not in sys.path:
+    sys.path.insert(0, _ROOT_DIR)
+
 from src.helpers.utils import create_dir
+from src.helpers.dataset_params import DatasetParamsManager, validate_appliances_for_dataset
+from scripts.run_one_expe import launch_one_experiment
 
 
-def load_base_configs():
-    with open("configs/expes.yaml", "r") as f:
-        expes_config = yaml.safe_load(f)
-    with open("configs/datasets.yaml", "r") as f:
-        datasets_config = yaml.safe_load(f)
-    with open("configs/models.yaml", "r") as f:
-        baselines_config = yaml.safe_load(f)
-    with open("configs/hpo_search_spaces.yaml", "r") as f:
-        hpo_spaces = yaml.safe_load(f)
-    return expes_config, datasets_config, baselines_config, hpo_spaces
+def _load_yaml(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    return data or {}
 
 
-def build_exp_config(
-    base_exp,
-    datasets_config,
-    baselines_config,
-    dataset,
-    appliance,
-    name_model,
-    sampling_rate,
-    window_size,
-    seed,
-):
-    if dataset not in datasets_config:
-        raise ValueError(
-            "Dataset {} unknown. Only 'UKDALE' and 'REFIT' available.".format(dataset)
-        )
-    dataset_cfg = datasets_config[dataset]
-    if name_model not in baselines_config:
-        raise ValueError(
-            "Model {} unknown. List of implemented baselines: {}".format(
-                name_model, list(baselines_config.keys())
-            )
-        )
-    if appliance not in dataset_cfg:
-        raise ValueError(
-            "Appliance {} unknown. List of available appliances (for selected {} dataset): {}".format(
-                appliance, dataset, list(dataset_cfg.keys())
-            )
-        )
-    cfg = dict(base_exp)
-    cfg.update(baselines_config[name_model])
-    cfg.update(dataset_cfg[appliance])
-    cfg["dataset"] = dataset
-    cfg["appliance"] = appliance
-    cfg["window_size"] = window_size
-    cfg["sampling_rate"] = sampling_rate
-    cfg["seed"] = seed
-    cfg["name_model"] = name_model
-    result_path = create_dir(cfg["result_path"])
-    result_path = create_dir(f"{result_path}{dataset}_{sampling_rate}/")
-    result_path = create_dir(f"{result_path}{window_size}/")
-    cfg = OmegaConf.create(cfg)
-    cfg.result_path = f"{result_path}{cfg.name_model}_{cfg.seed}"
-    return cfg
+def _resolve_dataset_keys(datasets_all: Dict[str, Any], dataset_arg: str) -> List[str]:
+    if not dataset_arg:
+        raise ValueError("dataset is required")
+    if dataset_arg.strip().lower() in ("all", "*"):
+        return list(datasets_all.keys())
+    dataset_key_map = {k.lower(): k for k in datasets_all.keys()}
+    dataset_key = dataset_key_map.get(dataset_arg.strip().lower())
+    if dataset_key is None:
+        available = ", ".join(sorted(datasets_all.keys()))
+        raise ValueError(f"Dataset {dataset_arg} unknown. Choices: {available}")
+    return [dataset_key]
 
 
-def suggest_from_space(trial, model_name, hpo_spaces, base_cfg):
-    space = hpo_spaces.get(model_name, {})
-    lr = base_cfg.model_training_param.lr
-    wd = base_cfg.model_training_param.wd
-    if "lr" in space:
-        spec = space["lr"]
-        if spec["type"] == "loguniform":
-            lr = trial.suggest_float(
-                "lr", float(spec["low"]), float(spec["high"]), log=True
+def _select_multi_keys(dataset_config: Dict[str, Any], appliance_arg: str) -> List[str]:
+    if appliance_arg is None or str(appliance_arg).strip().lower() == "multi":
+        return list(dataset_config.keys())
+    appliance_str = str(appliance_arg).strip()
+    if "," not in appliance_str:
+        raise ValueError("Only multi-device mode is supported in this script")
+    requested = [s.strip().lower() for s in appliance_str.split(",") if s.strip()]
+    if len(requested) <= 1:
+        raise ValueError("Multi-device mode requires at least two appliances")
+    appliance_key_map = {k.lower(): k for k in dataset_config.keys()}
+    selected_keys = []
+    for name in requested:
+        key = appliance_key_map.get(name)
+        if key is None:
+            available = ", ".join(sorted(dataset_config.keys()))
+            raise ValueError(
+                f"Appliance {name} unknown for dataset. Available: {available}"
             )
-        else:
-            lr = trial.suggest_float(
-                "lr", float(spec["low"]), float(spec["high"])
-            )
-    if "wd" in space:
-        spec = space["wd"]
-        if spec["type"] == "loguniform":
-            wd = trial.suggest_float(
-                "wd", float(spec["low"]), float(spec["high"]), log=True
-            )
-        else:
-            wd = trial.suggest_float(
-                "wd", float(spec["low"]), float(spec["high"])
-            )
-    base_cfg.model_training_param.lr = float(lr)
-    base_cfg.model_training_param.wd = float(wd)
+        selected_keys.append(key)
+    return selected_keys
 
-    train_keys = [
-        "batch_size",
-        "epochs",
-        "n_warmup_epochs",
-        "warmup_type",
-        "sampling_rate",
-        "window_size",
-    ]
-    for tkey in train_keys:
-        t_spec = space.get(tkey)
-        if t_spec is None:
-            continue
-        if t_spec["type"] == "int":
-            low = int(t_spec["low"])
-            high = int(t_spec["high"])
-            step = int(t_spec["step"]) if "step" in t_spec else 1
-            val = trial.suggest_int(tkey, low, high, step=step)
-        elif t_spec["type"] == "loguniform":
-            val = trial.suggest_float(
-                tkey, float(t_spec["low"]), float(t_spec["high"]), log=True
-            )
-        elif t_spec["type"] == "categorical":
-            val = trial.suggest_categorical(tkey, t_spec["choices"])
-        else:
-            val = trial.suggest_float(
-                tkey, float(t_spec["low"]), float(t_spec["high"])
-            )
-        setattr(base_cfg, tkey, val)
 
-    if model_name == "NILMFormer":
-        model_kwargs = dict(base_cfg.model_kwargs)
-        d_spec = space.get("d_model")
-        if d_spec is not None:
-            d_low = int(d_spec["low"])
-            d_high = int(d_spec["high"])
-            d_step = int(d_spec.get("step", 4))
-            d_model = trial.suggest_int("d_model", d_low, d_high, step=d_step)
-        else:
-            d_model = model_kwargs.get("d_model", base_cfg.model_kwargs.d_model)
-        model_kwargs["d_model"] = int(d_model)
-        h_spec = space.get("n_head")
-        if h_spec is not None:
-            h_low = int(h_spec["low"])
-            h_high = int(h_spec["high"])
-            candidates = [h for h in range(h_low, h_high + 1) if int(d_model) % h == 0]
-            if not candidates:
-                candidates = [h_low]
-            n_head = trial.suggest_categorical("n_head", candidates)
-            model_kwargs["n_head"] = int(n_head)
-        for key, spec in space.items():
-            if key in ["lr", "wd", "d_model", "n_head"] + train_keys:
+def _build_multi_entry(
+    dataset_config: Dict[str, Any],
+    selected_keys: List[str],
+    params_manager: DatasetParamsManager,
+    dataset_key: str,
+) -> Dict[str, Any]:
+    base_entry: Dict[str, Any] = {}
+    for k in selected_keys:
+        cfg_k = dataset_config[k]
+        for ck, cv in cfg_k.items():
+            if ck == "app":
                 continue
-            if spec["type"] == "int":
-                low = int(spec["low"])
-                high = int(spec["high"])
-                step = int(spec["step"]) if "step" in spec else 1
-                val = trial.suggest_int(key, low, high, step=step)
-            elif spec["type"] == "loguniform":
-                val = trial.suggest_float(
-                    key, float(spec["low"]), float(spec["high"]), log=True
-                )
-            elif spec["type"] == "categorical":
-                val = trial.suggest_categorical(key, spec["choices"])
-            else:
-                val = trial.suggest_float(
-                    key, float(spec["low"]), float(spec["high"])
-                )
-            model_kwargs[key] = val
-        base_cfg.model_kwargs = OmegaConf.create(model_kwargs)
-        return base_cfg
-
-    model_kwargs = dict(base_cfg.model_kwargs)
-    for key, spec in space.items():
-        if key in ["lr", "wd"] + train_keys:
-            continue
-        if spec["type"] == "int":
-            low = int(spec["low"])
-            high = int(spec["high"])
-            step = int(spec["step"]) if "step" in spec else 1
-            val = trial.suggest_int(key, low, high, step=step)
-        elif spec["type"] == "loguniform":
-            val = trial.suggest_float(
-                key, float(spec["low"]), float(spec["high"]), log=True
-            )
-        elif spec["type"] == "categorical":
-            val = trial.suggest_categorical(key, spec["choices"])
+            if ck not in base_entry:
+                base_entry[ck] = cv
+    app_list: List[str] = []
+    for k in selected_keys:
+        app_val = dataset_config[k].get("app", k)
+        if isinstance(app_val, list):
+            app_list.extend(list(app_val))
         else:
-            val = trial.suggest_float(
-                key, float(spec["low"]), float(spec["high"])
-            )
-        model_kwargs[key] = val
-    base_cfg.model_kwargs = OmegaConf.create(model_kwargs)
-    return base_cfg
+            app_list.append(app_val)
+    valid_apps = validate_appliances_for_dataset(app_list, dataset_key, params_manager)
+    base_entry["app"] = valid_apps if valid_apps else app_list
+    base_entry["appliance_group_members"] = selected_keys
+    return base_entry
 
 
-def prepare_data(expes_config):
-    np.random.seed(seed=expes_config.seed)
-    overlap = getattr(expes_config, "overlap", 0.0)
-    overlap_str = "ov{}".format(str(overlap).replace(".", "p"))
-    cache_key = "{}_{}_{}_{}_{}_{}_{}".format(
-        expes_config.dataset,
-        expes_config.appliance,
-        expes_config.sampling_rate,
-        expes_config.window_size,
-        expes_config.power_scaling_type,
-        expes_config.appliance_scaling_type,
-        overlap_str,
-    )
-    if expes_config.name_model == "DiffNILM":
-        cache_key += "_DiffNILM"
-    cache_key = cache_key.replace("/", "-")
-    cache_dir = os.path.join("data_cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    cache_path = os.path.join(cache_dir, cache_key + ".pt")
-    if os.path.isfile(cache_path):
-        cache = torch.load(cache_path, weights_only=False)
-        tuple_data = cache["tuple_data"]
-        scaler = cache["scaler"]
-        expes_config.cutoff = cache["cutoff"]
-        expes_config.threshold = cache["threshold"]
-        return tuple_data, scaler
-    if expes_config.dataset == "UKDALE":
-        overlap = getattr(expes_config, "overlap", 0.0)
-        if overlap == 0:
-            window_stride = expes_config.window_size
-        else:
-            if not (0 < overlap < 1):
-                raise ValueError(
-                    "Invalid overlap value {}. Expected 0 or 0 < overlap < 1.".format(
-                        overlap
-                    )
-                )
-            window_stride = max(
-                1, int(round(expes_config.window_size * (1.0 - float(overlap))))
-            )
+def _parse_search_space(path: str, model_name: str) -> Dict[str, Any]:
+    data = _load_yaml(path)
+    model_key_map = {k.lower(): k for k in data.keys()}
+    key = model_key_map.get(model_name.strip().lower())
+    if key is None:
+        available = ", ".join(sorted(data.keys()))
+        raise ValueError(f"Search space for {model_name} not found. Choices: {available}")
+    return data[key] or {}
 
-        data_builder = UKDALE_DataBuilder(
-            data_path=f"{expes_config.data_path}/UKDALE/",
-            mask_app=expes_config.app,
-            sampling_rate=expes_config.sampling_rate,
-            window_size=expes_config.window_size,
-            window_stride=window_stride,
-        )
-        data, st_date = data_builder.get_nilm_dataset(house_indicies=[1, 2, 3, 4, 5])
-        if isinstance(expes_config.window_size, str):
-            expes_config.window_size = data_builder.window_size
-        data_train, st_date_train = data_builder.get_nilm_dataset(
-            house_indicies=expes_config.ind_house_train_val
-        )
-        data_test, st_date_test = data_builder.get_nilm_dataset(
-            house_indicies=expes_config.ind_house_test
-        )
-        overlap = getattr(expes_config, "overlap", 0.0)
-        if overlap == 0:
-            data_train, st_date_train, data_valid, st_date_valid = (
-                split_train_test_nilmdataset(
-                    data_train,
-                    st_date_train,
-                    perc_house_test=0.2,
-                    seed=expes_config.seed,
-                )
-            )
-        else:
-            if not (0 < overlap < 1):
-                raise ValueError(
-                    "Invalid overlap value {}. Expected 0 or 0 < overlap < 1.".format(
-                        overlap
-                    )
-                )
-            data_train, st_date_train, data_valid, st_date_valid = (
-                split_train_valid_timeblock_nilmdataset(
-                    data_train,
-                    st_date_train,
-                    perc_valid=0.2,
-                    window_size=expes_config.window_size,
-                    window_stride=data_builder.window_stride,
-                )
-            )
-    elif expes_config.dataset == "REFIT":
-        data_builder = REFIT_DataBuilder(
-            data_path=f"{expes_config.data_path}/REFIT/RAW_DATA_CLEAN/",
-            mask_app=expes_config.app,
-            sampling_rate=expes_config.sampling_rate,
-            window_size=expes_config.window_size,
-        )
-        data, st_date = data_builder.get_nilm_dataset(
-            house_indicies=expes_config.house_with_app_i
-        )
-        if isinstance(expes_config.window_size, str):
-            expes_config.window_size = data_builder.window_size
-        data_train, st_date_train, data_test, st_date_test = (
-            split_train_test_pdl_nilmdataset(
-                data.copy(), st_date.copy(), nb_house_test=2, seed=expes_config.seed
-            )
-        )
-        data_train, st_date_train, data_valid, st_date_valid = (
-            split_train_test_pdl_nilmdataset(
-                data_train, st_date_train, nb_house_test=1, seed=expes_config.seed
-            )
-        )
-    else:
-        raise ValueError("Unsupported dataset {}".format(expes_config.dataset))
-    scaler = NILMscaler(
-        power_scaling_type=expes_config.power_scaling_type,
-        appliance_scaling_type=expes_config.appliance_scaling_type,
-    )
-    data = scaler.fit_transform(data)
-    expes_config.cutoff = float(scaler.appliance_stat2[0])
-    expes_config.threshold = data_builder.appliance_param[expes_config.app][
-        "min_threshold"
+
+def _suggest_param(trial: optuna.Trial, name: str, spec: Dict[str, Any]) -> Any:
+    if not isinstance(spec, dict):
+        return spec
+    ptype = str(spec.get("type", "")).lower()
+    if ptype == "loguniform":
+        return trial.suggest_float(name, float(spec["low"]), float(spec["high"]), log=True)
+    if ptype == "uniform":
+        return trial.suggest_float(name, float(spec["low"]), float(spec["high"]))
+    if ptype == "int":
+        step = int(spec.get("step", 1))
+        return trial.suggest_int(name, int(spec["low"]), int(spec["high"]), step=step)
+    if ptype == "categorical":
+        return trial.suggest_categorical(name, list(spec.get("choices", [])))
+    if "value" in spec:
+        return spec["value"]
+    return spec
+
+
+def _sample_params(trial: optuna.Trial, space: Dict[str, Any]) -> Dict[str, Any]:
+    params: Dict[str, Any] = {}
+    for name, spec in space.items():
+        params[name] = _suggest_param(trial, name, spec)
+    d_model = int(params.get("d_model", 0) or 0)
+    n_head = int(params.get("n_head", 0) or 0)
+    if d_model and n_head and d_model % n_head != 0:
+        valid = [h for h in range(2, 17, 2) if d_model % h == 0]
+        params["n_head"] = valid[0] if valid else max(1, n_head)
+    if d_model and d_model % 4 != 0:
+        d_model = int(round(d_model / 4.0) * 4)
+        params["d_model"] = max(4, d_model)
+    return params
+
+
+def _apply_model_params(expes_config: Dict[str, Any], params: Dict[str, Any]) -> None:
+    model_kwargs = dict(expes_config.get("model_kwargs", {}) or {})
+    for k in [
+        "d_model",
+        "n_encoder_layers",
+        "n_head",
+        "dp_rate",
+        "pffn_ratio",
+        "kernel_size",
+        "kernel_size_head",
+    ]:
+        if k in params:
+            model_kwargs[k] = params[k]
+    expes_config["model_kwargs"] = model_kwargs
+    model_training = dict(expes_config.get("model_training_param", {}) or {})
+    if "lr" in params:
+        model_training["lr"] = params["lr"]
+    if "wd" in params:
+        model_training["wd"] = params["wd"]
+    expes_config["model_training_param"] = model_training
+
+
+def _split_loss_params(params: Dict[str, Any]) -> Dict[str, Any]:
+    keys = [
+        "loss_lambda_energy",
+        "loss_alpha_on",
+        "loss_alpha_off",
+        "loss_lambda_on_recall",
+        "loss_on_recall_margin",
+        "loss_lambda_sparse",
+        "loss_lambda_off_hard",
+        "output_ratio",
+        "gate_soft_scale",
+        "gate_floor",
     ]
-    if expes_config.name_model in ["ConvNet", "ResNet", "Inception"]:
-        X, y = nilmdataset_to_tser(data)
-        data_train = scaler.transform(data_train)
-        data_valid = scaler.transform(data_valid)
-        data_test = scaler.transform(data_test)
-        X_train, y_train = nilmdataset_to_tser(data_train)
-        X_valid, y_valid = nilmdataset_to_tser(data_valid)
-        X_test, y_test = nilmdataset_to_tser(data_test)
-        tuple_data = (
-            (X_train, y_train, st_date_train),
-            (X_valid, y_valid, st_date_valid),
-            (X_test, y_test, st_date_test),
-            (X, y, st_date),
-        )
-    else:
-        data_train = scaler.transform(data_train)
-        data_valid = scaler.transform(data_valid)
-        data_test = scaler.transform(data_test)
-        tuple_data = (
-            data_train,
-            data_valid,
-            data_test,
-            data,
-            st_date_train,
-            st_date_valid,
-            st_date_test,
-            st_date,
-        )
-    cache = {
-        "tuple_data": tuple_data,
-        "scaler": scaler,
-        "cutoff": expes_config.cutoff,
-        "threshold": expes_config.threshold,
-    }
-    torch.save(cache, cache_path)
-    return tuple_data, scaler
+    return {k: params[k] for k in keys if k in params}
 
 
-def objective_factory(
-    base_exp, datasets_cfg, models_cfg, hpo_spaces, dataset, appliance, model, sampling_rate, window_size, seed
-):
-    def objective(trial):
-        cfg = build_exp_config(
-            base_exp,
-            datasets_cfg,
-            models_cfg,
-            dataset,
-            appliance,
-            model,
-            sampling_rate,
-            window_size,
-            seed,
-        )
-        cfg = suggest_from_space(trial, model, hpo_spaces, cfg)
-        tuple_data, scaler = prepare_data(cfg)
-        metrics = launch_models_training(tuple_data, scaler, cfg)
-        loss = metrics["best_loss"] if metrics is not None else np.inf
-        trial.set_user_attr("metrics", metrics)
-        return loss
-
-    return objective
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Optuna HPO for NILMFormer experiments.")
-    parser.add_argument("--dataset", required=True, type=str)
-    parser.add_argument("--appliance", required=True, type=str)
-    parser.add_argument("--name_model", required=True, type=str)
-    parser.add_argument("--sampling_rate", required=True, type=str)
-    parser.add_argument("--window_size", required=True, type=str)
-    parser.add_argument("--seed", required=True, type=int)
-    parser.add_argument("--n_trials", required=False, type=int, default=20)
-    parser.add_argument("--storage", required=False, type=str, default=None)
-    parser.add_argument("--study_name", required=False, type=str, default=None)
-    args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO)
-    base_exp, datasets_cfg, models_cfg, hpo_spaces = load_base_configs()
+def _build_expes_config(
+    dataset_key: str,
+    dataset_config: Dict[str, Any],
+    model_key: str,
+    model_config: Dict[str, Any],
+    sampling_rate: str,
+    window_size: str,
+    seed: int,
+    appliance_arg: str,
+    trial_number: int,
+    params: Dict[str, Any],
+    params_manager: DatasetParamsManager,
+    base_config: Dict[str, Any],
+) -> OmegaConf:
+    expes_config = dict(base_config)
+    expes_config.update(model_config)
+    selected_keys = _select_multi_keys(dataset_config, appliance_arg)
+    multi_entry = _build_multi_entry(dataset_config, selected_keys, params_manager, dataset_key)
+    expes_config.update(multi_entry)
+    expes_config["dataset"] = dataset_key
+    expes_config["sampling_rate"] = str(sampling_rate).strip().lower()
     try:
-        window_size = int(args.window_size)
-    except ValueError:
-        window_size = args.window_size
-    study_name = args.study_name
-    if study_name is None:
-        study_name = "{}_{}_{}_{}_{}".format(
-            args.dataset,
-            args.appliance,
-            args.name_model,
-            args.sampling_rate,
-            args.window_size,
+        window_size_val = int(window_size)
+    except Exception:
+        window_size_val = window_size
+    expes_config["window_size"] = window_size_val
+    expes_config["seed"] = int(seed)
+    expes_config["name_model"] = model_key
+    expes_config["resume"] = False
+    expes_config["loss_type"] = "multi_nilm"
+    _apply_model_params(expes_config, params)
+    loss_override = _split_loss_params(params)
+    if loss_override:
+        expes_config["hpo_override"] = loss_override
+    appliance_tag = f"Multi_T{trial_number}"
+    expes_config["appliance"] = appliance_tag
+    result_path = create_dir(expes_config["result_path"])
+    result_path = create_dir(f"{result_path}{dataset_key}_{expes_config['sampling_rate']}/")
+    result_path = create_dir(f"{result_path}{expes_config['window_size']}/")
+    expes_config = OmegaConf.create(expes_config)
+    expes_config.result_path = (
+        f"{result_path}{expes_config.name_model}_{expes_config.seed}_t{trial_number}"
+    )
+    return expes_config
+
+
+def _read_jsonl(path: str) -> List[Dict[str, Any]]:
+    if not os.path.isfile(path):
+        return []
+    records: List[Dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except Exception:
+                continue
+    return records
+
+
+def _best_score_from_records(records: List[Dict[str, Any]]) -> Tuple[float, Dict[str, Any]]:
+    best_score = None
+    best_meta: Dict[str, Any] = {}
+    for record in records:
+        per_device = record.get("metrics_timestamp_per_device") or record.get("metrics_win_per_device")
+        f1_vals: List[float] = []
+        worst_name = None
+        worst_val = None
+        if isinstance(per_device, dict) and per_device:
+            for name, mdict in per_device.items():
+                try:
+                    val = float(mdict.get("F1_SCORE"))
+                except Exception:
+                    continue
+                f1_vals.append(val)
+                if worst_val is None or val < worst_val:
+                    worst_val = val
+                    worst_name = str(name)
+        if not f1_vals:
+            metrics = record.get("metrics_timestamp") or record.get("metrics_win") or {}
+            if "F1_SCORE" in metrics:
+                try:
+                    f1_vals = [float(metrics.get("F1_SCORE"))]
+                except Exception:
+                    f1_vals = []
+        if not f1_vals:
+            continue
+        min_f1 = float(min(f1_vals))
+        score = 1.0 - min_f1
+        if bool(record.get("collapse_flag", False)):
+            score += 1.0
+        if best_score is None or score < best_score:
+            best_score = score
+            best_meta = {
+                "epoch": int(record.get("epoch", -1)),
+                "min_f1": min_f1,
+                "worst_device": worst_name if isinstance(worst_name, str) else None,
+                "energy_ratio": float(record.get("energy_ratio", 0.0)),
+                "off_energy_ratio": float(record.get("off_energy_ratio", 0.0)),
+                "pred_raw_max": float(record.get("pred_raw_max", 0.0)),
+                "target_max": float(record.get("target_max", 0.0)),
+            }
+    if best_score is None:
+        return 1e9, {}
+    return float(best_score), best_meta
+
+
+def _get_group_dir(expes_config: OmegaConf) -> str:
+    result_root = os.path.dirname(os.path.dirname(os.path.dirname(expes_config.result_path)))
+    return os.path.join(
+        result_root,
+        f"{expes_config.dataset}_{expes_config.sampling_rate}",
+        str(expes_config.window_size),
+        str(expes_config.appliance),
+    )
+
+
+def _build_study_name(
+    dataset_key: str, model_key: str, sampling_rate: str, window_size: str, prefix: str
+) -> str:
+    parts = [prefix, dataset_key, "multi", model_key, str(sampling_rate), str(window_size)]
+    return "_".join([p for p in parts if p])
+
+
+def run_study_for_dataset(
+    dataset_key: str,
+    datasets_all: Dict[str, Any],
+    models_all: Dict[str, Any],
+    args: argparse.Namespace,
+    params_manager: DatasetParamsManager,
+) -> None:
+    dataset_config = datasets_all[dataset_key]
+    model_key_map = {k.lower(): k for k in models_all.keys()}
+    model_key = model_key_map.get(args.name_model.strip().lower())
+    if model_key is None:
+        available = ", ".join(sorted(models_all.keys()))
+        raise ValueError(f"Model {args.name_model} unknown. Choices: {available}")
+    model_config = models_all[model_key]
+    base_config = _load_yaml("configs/expes.yaml")
+    if args.epochs is not None:
+        base_config["epochs"] = int(args.epochs)
+    if args.batch_size is not None:
+        base_config["batch_size"] = int(args.batch_size)
+    space = _parse_search_space(args.search_space, model_key)
+    sampling_tag = args.sampling_rate
+    window_tag = args.window_size
+    if "sampling_rate" in space:
+        sampling_tag = "var"
+    if "window_size" in space:
+        window_tag = "var"
+    storage_dir = args.storage_dir
+    os.makedirs(storage_dir, exist_ok=True)
+    study_name = (
+        args.study_name
+        or _build_study_name(
+            dataset_key, model_key, sampling_tag, window_tag, args.study_prefix
         )
-    storage = args.storage
-    if storage is None:
-        storage_dir = os.path.join("results", "optuna")
-        os.makedirs(storage_dir, exist_ok=True)
-        db_path = os.path.join(storage_dir, study_name + ".db")
-        storage = "sqlite:///{}".format(os.path.abspath(db_path))
+    )
+    storage = f"sqlite:///{os.path.join(storage_dir, study_name)}.db"
+    sampler = optuna.samplers.TPESampler(seed=int(args.seed))
+    pruner = optuna.pruners.MedianPruner(n_warmup_steps=3)
     study = optuna.create_study(
         study_name=study_name,
         storage=storage,
         direction="minimize",
+        sampler=sampler,
+        pruner=pruner,
         load_if_exists=True,
     )
-    objective = objective_factory(
-        base_exp,
-        datasets_cfg,
-        models_cfg,
-        hpo_spaces,
-        args.dataset,
-        args.appliance,
-        args.name_model,
-        args.sampling_rate,
-        window_size,
-        args.seed,
-    )
-    study.optimize(objective, n_trials=args.n_trials)
-    best = study.best_trial
-    logging.info("Best value: %s", best.value)
-    logging.info("Best params: %s", best.params)
-    logging.info("Best metrics: %s", best.user_attrs.get("metrics"))
+
+    def objective(trial: optuna.Trial) -> float:
+        params = _sample_params(trial, space)
+        trial_seed = int(args.seed) + int(trial.number)
+        sampling_rate = params.get("sampling_rate", args.sampling_rate)
+        window_size = params.get("window_size", args.window_size)
+        if args.lock_sampling_rate:
+            sampling_rate = args.sampling_rate
+        if args.lock_window_size:
+            window_size = args.window_size
+        expes_config = _build_expes_config(
+            dataset_key=dataset_key,
+            dataset_config=dataset_config,
+            model_key=model_key,
+            model_config=model_config,
+            sampling_rate=sampling_rate,
+            window_size=window_size,
+            seed=trial_seed,
+            appliance_arg=args.appliance,
+            trial_number=trial.number,
+            params=params,
+            params_manager=params_manager,
+            base_config=base_config,
+        )
+        launch_one_experiment(expes_config)
+        group_dir = _get_group_dir(expes_config)
+        records = _read_jsonl(os.path.join(group_dir, "val_report.jsonl"))
+        score, meta = _best_score_from_records(records)
+        trial.set_user_attr("group_dir", group_dir)
+        for k, v in meta.items():
+            trial.set_user_attr(k, v)
+        return float(score)
+
+    study.optimize(objective, n_trials=int(args.n_trials), timeout=args.timeout)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", required=True, type=str)
+    parser.add_argument("--sampling_rate", required=True, type=str)
+    parser.add_argument("--window_size", required=True, type=str)
+    parser.add_argument("--appliance", type=str, default="multi")
+    parser.add_argument("--name_model", required=True, type=str)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--n_trials", type=int, default=30)
+    parser.add_argument("--timeout", type=int, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--lock_sampling_rate", action="store_true")
+    parser.add_argument("--lock_window_size", action="store_true")
+    parser.add_argument("--search_space", type=str, default="configs/hpo_search_spaces.yaml")
+    parser.add_argument("--storage_dir", type=str, default="optuna_studies")
+    parser.add_argument("--study_name", type=str, default=None)
+    parser.add_argument("--study_prefix", type=str, default="study")
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    datasets_all = _load_yaml("configs/datasets.yaml")
+    models_all = _load_yaml("configs/models.yaml")
+    params_manager = DatasetParamsManager()
+    dataset_keys = _resolve_dataset_keys(datasets_all, args.dataset)
+    for dataset_key in dataset_keys:
+        run_study_for_dataset(dataset_key, datasets_all, models_all, args, params_manager)
 
 
 if __name__ == "__main__":

@@ -1,16 +1,31 @@
 REFIT:
+  # REFIT houses: 1-21 (20 houses total, no house 14)
+  # Common devices across many houses: Dishwasher, WashingMachine
+  # RECOMMENDED multi-device config: houses [2,3,5,6,7] have all 4 devices
   Dishwasher:
-    app:  Dishwasher
+    app: Dishwasher
     house_with_app_i: [1, 2, 3, 5, 6, 7, 9, 10, 13, 15, 16, 18, 20]
+    ind_house_train_val: [2, 3, 5, 6]
+    ind_house_test: [7]
+    overlap: 0.5
   WashingMachine:
-    app:   WashingMachine
+    app: WashingMachine
     house_with_app_i: [1, 2, 3, 5, 6, 7, 8, 9, 10, 13, 15, 16, 17, 18, 19]
+    ind_house_train_val: [2, 3, 5, 6]
+    ind_house_test: [7]
+    overlap: 0.5
   Kettle:
-    app:  Kettle
+    app: Kettle
     house_with_app_i: [2, 3, 4, 5, 6, 7, 9, 12, 13, 15, 19, 20]
+    ind_house_train_val: [2, 3, 5, 6]
+    ind_house_test: [7]
+    overlap: 0.5
   Microwave:
-    app:  Microwave
+    app: Microwave
     house_with_app_i: [2, 3, 4, 6, 8, 9, 10, 12, 13, 15, 17, 18, 19, 20]
+    ind_house_train_val: [2, 3, 6]
+    ind_house_test: [9]
+    overlap: 0.5
 
 UKDALE:
   WashingMachine:
@@ -37,4 +52,34 @@ UKDALE:
     app:  fridge
     ind_house_train_val: [1, 3, 4, 5]
     ind_house_test: [2]
+    overlap: 0.75
+
+REDD:
+  # REDD houses: 1, 2, 3, 4, 5, 6
+  # Device availability (analyzed with scripts/analyze_redd_devices.py):
+  # - fridge: houses 1,2,3,5,6 (house 4 has no fridge column)
+  # - microwave: houses 1,2,3,5 (houses 4,6 have no microwave)
+  # - dishwasher: houses 1,2,3,4 (houses 5,6 have 0% activity)
+  # - washing_machine: houses 1,3,4 only (houses 2,5,6 have 0% activity)
+  #
+  # RECOMMENDED multi-device config: fridge, microwave, dishwasher for houses 1,2,3
+  Fridge:
+    app: fridge
+    ind_house_train_val: [1, 2]
+    ind_house_test: [3]
+    overlap: 0.75
+  Microwave:
+    app: microwave
+    ind_house_train_val: [1, 2]
+    ind_house_test: [3]
+    overlap: 0.75
+  Dishwasher:
+    app: dishwasher
+    ind_house_train_val: [1, 2]
+    ind_house_test: [3]
+    overlap: 0.75
+  WashingMachine:
+    app: washing_machine
+    ind_house_train_val: [1]
+    ind_house_test: [3]
     overlap: 0.75

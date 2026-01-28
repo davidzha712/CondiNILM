@@ -88,9 +88,9 @@ class NILMmetrics:
             assert y_hat is not None, (
                 "Target y_hat not provided, please provide y_hat to compute regression metrics."
             )
-            y = np.nan_to_num(y.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+            y = np.nan_to_num(y.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
             y_hat = np.nan_to_num(
-                y_hat.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0
+                y_hat.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
             )
 
             # MAE, MSE and RMSE
@@ -135,32 +135,39 @@ class NILMmetrics:
                 "Target y_hat_state not provided, please pass y_hat_state to compute classification metrics."
             )
             y_state = np.nan_to_num(
-                y_state.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0
+                y_state.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
             )
             y_hat_state = np.nan_to_num(
-                y_hat_state.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0
+                y_hat_state.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
             )
 
             # Accuracy and Balanced Accuracy
             metrics["ACCURACY"] = round(
                 accuracy_score(y_state, y_hat_state), self.round_to
             )
-            metrics["BALANCED_ACCURACY"] = round(
-                balanced_accuracy_score(y_state, y_hat_state), self.round_to
-            )
-            # Pr, Rc and F1 Score
-            metrics["PRECISION"] = round(
-                precision_score(y_state, y_hat_state, zero_division=0),
-                self.round_to,
-            )
-            metrics["RECALL"] = round(
-                recall_score(y_state, y_hat_state, zero_division=0),
-                self.round_to,
-            )
-            metrics["F1_SCORE"] = round(
-                f1_score(y_state, y_hat_state, zero_division=0),
-                self.round_to,
-            )
+            uniq_true = np.unique(y_state)
+            uniq_pred = np.unique(y_hat_state)
+            if uniq_true.size >= 2 and uniq_pred.size >= 2:
+                metrics["BALANCED_ACCURACY"] = round(
+                    balanced_accuracy_score(y_state, y_hat_state), self.round_to
+                )
+                metrics["PRECISION"] = round(
+                    precision_score(y_state, y_hat_state, zero_division=0),
+                    self.round_to,
+                )
+                metrics["RECALL"] = round(
+                    recall_score(y_state, y_hat_state, zero_division=0),
+                    self.round_to,
+                )
+                metrics["F1_SCORE"] = round(
+                    f1_score(y_state, y_hat_state, zero_division=0),
+                    self.round_to,
+                )
+            else:
+                metrics["BALANCED_ACCURACY"] = metrics["ACCURACY"]
+                metrics["PRECISION"] = 0.0
+                metrics["RECALL"] = 0.0
+                metrics["F1_SCORE"] = 0.0
 
         return metrics
 
@@ -179,9 +186,9 @@ class REGmetrics:
         metrics["MAE"] = round(mean_absolute_error(y, y_hat), self.round_to)
         metrics["MSE"] = round(mean_squared_error(y, y_hat), self.round_to)
         metrics["RMSE"] = round(np.sqrt(mean_squared_error(y, y_hat)), self.round_to)
-        y_arr = np.nan_to_num(np.asarray(y, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+        y_arr = np.nan_to_num(np.asarray(y, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
         y_hat_arr = np.nan_to_num(
-            np.asarray(y_hat, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0
+            np.asarray(y_hat, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
         )
         denom = np.maximum(np.abs(y_arr), 1e-12)
         mape = float(np.mean(np.abs((y_arr - y_hat_arr) / denom)))

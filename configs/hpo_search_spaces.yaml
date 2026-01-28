@@ -1,222 +1,10 @@
-BiGRU:
-  lr:
-    type: loguniform
-    low: 1e-5
-    high: 1e-3
-  wd:
-    type: loguniform
-    low: 1e-6
-    high: 1e-2
-  dropout:
-    type: uniform
-    low: 0.0
-    high: 0.5
-
-BiLSTM:
-  lr:
-    type: loguniform
-    low: 1e-5
-    high: 1e-3
-  wd:
-    type: loguniform
-    low: 1e-6
-    high: 1e-2
-
-CNN1D:
-  lr:
-    type: loguniform
-    low: 1e-5
-    high: 1e-3
-  wd:
-    type: loguniform
-    low: 1e-6
-    high: 1e-2
-  dropout:
-    type: uniform
-    low: 0.0
-    high: 0.5
-  pooling_size:
-    type: int
-    low: 8
-    high: 32
-
-UNET_NILM:
-  lr:
-    type: loguniform
-    low: 1e-5
-    high: 1e-3
-  wd:
-    type: loguniform
-    low: 1e-6
-    high: 1e-2
-  features_start:
-    type: int
-    low: 4
-    high: 32
-  num_layers:
-    type: int
-    low: 3
-    high: 6
-  dropout:
-    type: uniform
-    low: 0.0
-    high: 0.5
-
-FCN:
-  lr:
-    type: loguniform
-    low: 1e-5
-    high: 1e-3
-  wd:
-    type: loguniform
-    low: 1e-6
-    high: 1e-2
-
-DResNet:
-  lr:
-    type: loguniform
-    low: 1e-5
-    high: 1e-3
-  wd:
-    type: loguniform
-    low: 1e-6
-    high: 1e-2
-  kernel_size:
-    type: int
-    low: 3
-    high: 9
-
-DAResNet:
-  lr:
-    type: loguniform
-    low: 1e-5
-    high: 1e-3
-  wd:
-    type: loguniform
-    low: 1e-6
-    high: 1e-2
-  kernel_size:
-    type: int
-    low: 3
-    high: 9
-
-BERT4NILM:
-  lr:
-    type: loguniform
-    low: 1e-5
-    high: 5e-4
-  wd:
-    type: loguniform
-    low: 1e-6
-    high: 1e-2
-  dp_rate:
-    type: uniform
-    low: 0.0
-    high: 0.5
-  mask_prob:
-    type: uniform
-    low: 0.05
-    high: 0.5
-
-DiffNILM:
-  lr:
-    type: loguniform
-    low: 1e-5
-    high: 1e-2
-  wd:
-    type: loguniform
-    low: 1e-6
-    high: 1e-2
-
-STNILM:
-  lr:
-    type: loguniform
-    low: 1e-5
-    high: 1e-3
-  wd:
-    type: loguniform
-    low: 1e-6
-    high: 1e-2
-  dp_rate:
-    type: uniform
-    low: 0.0
-    high: 0.5
-  n_experts:
-    type: int
-    low: 4
-    high: 16
-  weight_moe:
-    type: uniform
-    low: 0.01
-    high: 1.0
-
-TSILNet:
-  lr:
-    type: loguniform
-    low: 1e-5
-    high: 1e-3
-  wd:
-    type: loguniform
-    low: 1e-6
-    high: 1e-2
-
-Energformer:
-  lr:
-    type: loguniform
-    low: 1e-5
-    high: 1e-3
-  wd:
-    type: loguniform
-    low: 1e-6
-    high: 1e-2
-  d_model:
-    type: int
-    low: 64
-    high: 256
-  n_encoder_layers:
-    type: int
-    low: 2
-    high: 6
-  att_dropout:
-    type: uniform
-    low: 0.0
-    high: 0.5
-  ffn_dropout:
-    type: uniform
-    low: 0.0
-    high: 0.5
-
-ConvNet:
-  lr:
-    type: loguniform
-    low: 1e-5
-    high: 1e-3
-  wd:
-    type: loguniform
-    low: 1e-6
-    high: 1e-2
-
-ResNet:
-  lr:
-    type: loguniform
-    low: 1e-5
-    high: 1e-3
-  wd:
-    type: loguniform
-    low: 1e-6
-    high: 1e-2
-
-Inception:
-  lr:
-    type: loguniform
-    low: 1e-5
-    high: 1e-3
-  wd:
-    type: loguniform
-    low: 1e-6
-    high: 1e-2
-
 NILMFormer:
+  sampling_rate:
+    type: categorical
+    choices: ["30s", "1min"]
+  window_size:
+    type: categorical
+    choices: [64, 128, 256]
   lr:
     type: loguniform
     low: 1e-5
@@ -224,45 +12,78 @@ NILMFormer:
   wd:
     type: loguniform
     low: 1e-6
-    high: 1e-2
+    high: 5e-2
   d_model:
     type: int
     low: 64
     high: 192
-    step: 4
+    step: 16
   n_encoder_layers:
     type: int
     low: 2
     high: 6
+    step: 1
+  n_head:
+    type: int
+    low: 2
+    high: 8
+    step: 2
   dp_rate:
     type: uniform
-    low: 0.0
-    high: 0.5
+    low: 0.05
+    high: 0.3
   pffn_ratio:
     type: int
     low: 2
     high: 6
-  n_head:
-    type: int
-    low: 4
-    high: 16
-  batch_size:
-    type: categorical
-    choices: [128, 256, 512]
-  epochs:
+    step: 1
+  kernel_size:
     type: int
     low: 3
-    high: 30
-  n_warmup_epochs:
+    high: 9
+    step: 2
+  kernel_size_head:
     type: int
-    low: 0
-    high: 3
-  warmup_type:
-    type: categorical
-    choices: ["linear", "exponential", "constant"]
-  sampling_rate:
-    type: categorical
-    choices: ["30s", "1min", "10min"]
-  window_size:
-    type: categorical
-    choices: [128, 256, 512]
+    low: 1
+    high: 5
+    step: 2
+  loss_lambda_energy:
+    type: loguniform
+    low: 0.05
+    high: 5.0
+  loss_alpha_on:
+    type: loguniform
+    low: 1.0
+    high: 15.0
+  loss_alpha_off:
+    type: loguniform
+    low: 0.1
+    high: 2.0
+  loss_lambda_on_recall:
+    type: loguniform
+    low: 0.1
+    high: 8.0
+  loss_on_recall_margin:
+    type: uniform
+    low: 0.5
+    high: 0.95
+  output_ratio:
+    type: uniform
+    low: 0.4
+    high: 0.8
+  gate_soft_scale:
+    type: uniform
+    low: 0.8
+    high: 3.5
+  gate_floor:
+    type: loguniform
+    low: 0.001
+    high: 0.08
+  loss_lambda_sparse:
+    type: loguniform
+    low: 0.0002
+    high: 0.02
+  loss_lambda_off_hard:
+    type: loguniform
+    low: 0.003
+    high: 0.15

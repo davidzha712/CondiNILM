@@ -23,6 +23,8 @@ rlr_min_lr:  1e-6
 
 device:  auto          # auto / cuda / mps / cpu
 accumulate_grad_batches: 1
+limit_train_batches: 0.1
+limit_val_batches: 0.2
 
 num_workers: 8
 prefetch_factor: 4
@@ -45,9 +47,8 @@ gate_window_weight_eaec: 0.5
 gate_focal_gamma_eaec: 2.0
 
 # seq2subseq: Only supervise center region of output to reduce boundary effects
-# 0.5 means supervise middle 50% (e.g., input 128 -> supervise middle 64 points)
-# Inference will also only use center predictions, discarding edges
-output_ratio: 0.5
+# 0.627 means supervise middle 62.7% (per Optuna best trial)
+output_ratio: 0.6273735795474594
 
 # Zero-run penalty for target=0 segments
 state_zero_penalty_weight: 0.1
@@ -76,18 +77,28 @@ anti_collapse_weight: 0.8
 loss_type: multi_nilm
 
 # ===== OFF false-positive penalty (mild, prevents learning all-zero output) =====
-# lambda_off_hard: OFF-state hard constraint weight (lower!)
-loss_lambda_off_hard: 0.1
+# lambda_off_hard: OFF-state hard constraint weight (tuned)
+loss_lambda_off_hard: 0.04867828600398974
+
+# lambda_sparse: sparsity penalty (tuned)
+loss_lambda_sparse: 0.003128418891709596
 
 # off_margin: power tolerance margin in OFF state (after normalization), allowing small noise
 loss_off_margin: 0.02
 
 # ===== ON missed-detection penalty (critical! prevents all-zero output) =====
 # lambda_on_recall: ON missed-detection penalty weight, penalizing too-low outputs when ON
-loss_lambda_on_recall: 0.3
+loss_lambda_on_recall: 2.0672824354689343
+
+# alpha_on/alpha_off: class weighting for ON/OFF
+loss_alpha_on: 3.0738331012839955
+loss_alpha_off: 0.24591256383397345
 
 # on_recall_margin: minimum fraction of target output when ON
-loss_on_recall_margin: 0.5
+loss_on_recall_margin: 0.759652616275792
+
+# lambda_energy: energy regression weight (tuned)
+loss_lambda_energy: 1.105851072569646
 
 # ===== Gate classification (mild setting) =====
 # lambda_gate_cls: gate classification loss weight
@@ -99,12 +110,12 @@ loss_gate_focal_gamma: 2.0
 
 # ===== Soft Gating Parameters (control OFF energy leakage) =====
 # gate_soft_scale: Sigmoid sharpness (higher = more binary gate decisions)
-# Increased from 1.0 to 3.0 to make OFF decisions more decisive
-gate_soft_scale: 3.0
+# Tuned via Optuna best trial
+gate_soft_scale: 1.0563694013090654
 
 # gate_floor: Minimum gate probability (0 = allow complete shutdown when OFF)
-# Reduced from 0.02 to 0.005 to minimize OFF energy leakage
-gate_floor: 0.005
+# Tuned via Optuna best trial
+gate_floor: 0.011203254019178552
 
 postprocess_gate_avg_threshold: 0.25
 postprocess_gate_max_threshold: 0.5
