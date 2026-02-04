@@ -1,0 +1,11 @@
+REDD:
+  Multi:
+    appliances:
+    - Fridge
+    - Dishwasher
+    ind_house_test:
+    - 2
+    ind_house_train_val:
+    - 1
+    - 2
+    overlap: 0.75

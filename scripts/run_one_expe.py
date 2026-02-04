@@ -10,7 +10,7 @@ import os
 import sys
 import yaml
 import logging
-from collections.abc import Sequence
+from collections.abc import Sequence, Mapping
 
 logging.getLogger("torch.utils.flop_counter").disabled = True
 
@@ -222,6 +222,29 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                     "name": names[i] if i < len(names) else str(i),
                     "device_type": dev_type_i,
                 })
+            existing_params = None
+            try:
+                if hasattr(expes_config, "get"):
+                    existing_params = expes_config.get("loss_params_per_device")
+            except Exception:
+                existing_params = None
+            if existing_params is None:
+                existing_params = getattr(expes_config, "loss_params_per_device", None)
+            if isinstance(existing_params, Mapping) and existing_params:
+                existing_norm = {
+                    str(k).strip().lower(): v for k, v in existing_params.items()
+                }
+                for name, params in list(per_device_params.items()):
+                    key = str(name).strip().lower()
+                    override = existing_norm.get(key)
+                    if isinstance(override, Mapping):
+                        merged = dict(params)
+                        merged.update(override)
+                        per_device_params[name] = merged
+                for name, override in existing_norm.items():
+                    if name not in {str(k).strip().lower() for k in per_device_params.keys()}:
+                        if isinstance(override, Mapping):
+                            per_device_params[name] = dict(override)
             if per_device:
                 expes_config["device_type_per_device"] = per_device
             if per_device_params:
@@ -244,19 +267,22 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
 
                 try:
                     base_per_device = getattr(expes_config, "postprocess_per_device", None)
-                    if isinstance(base_per_device, dict):
+                    if isinstance(base_per_device, Mapping):
                         per_device_post = dict(base_per_device)
                     else:
                         per_device_post = {}
                     thr_cfg = float(threshold)
                 except Exception:
                     base_per_device = getattr(expes_config, "postprocess_per_device", None)
-                    if isinstance(base_per_device, dict):
+                    if isinstance(base_per_device, Mapping):
                         per_device_post = dict(base_per_device)
                     else:
                         per_device_post = {}
                     thr_cfg = float(getattr(expes_config, "threshold", 0.0) or 0.0)
                 if per_device_post is not None:
+                    per_device_post_norm = {
+                        str(k).strip().lower(): v for k, v in per_device_post.items()
+                    }
                     for ds in device_stats_for_loss:
                         name = str(ds.get("name", ""))
                         if not name:
@@ -288,8 +314,8 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                             )
                         except Exception:
                             continue
-                        user_cfg = per_device_post.get(name, {})
-                        if isinstance(user_cfg, dict):
+                        user_cfg = per_device_post_norm.get(str(name).strip().lower(), {})
+                        if isinstance(user_cfg, Mapping):
                             post_thr = float(
                                 user_cfg.get(
                                     "postprocess_threshold",
@@ -319,6 +345,35 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                         }
                     if per_device_post:
                         expes_config["postprocess_per_device"] = per_device_post
+                        try:
+                            is_multi = False
+                            app_name = str(getattr(expes_config, "appliance", "") or "")
+                            if app_name.lower() == "multi":
+                                is_multi = True
+                            else:
+                                app_val = getattr(expes_config, "app", None)
+                                if isinstance(app_val, Sequence) and not isinstance(
+                                    app_val, (str, bytes)
+                                ):
+                                    if len(app_val) > 1:
+                                        is_multi = True
+                            if not is_multi:
+                                per_device_norm = {
+                                    str(k).strip().lower(): v for k, v in per_device_post.items()
+                                }
+                                target_name = app_name.strip().lower()
+                                cfg_single = per_device_norm.get(target_name)
+                                if isinstance(cfg_single, Mapping):
+                                    if "postprocess_threshold" in cfg_single:
+                                        expes_config["postprocess_threshold"] = float(
+                                            cfg_single["postprocess_threshold"]
+                                        )
+                                    if "postprocess_min_on_steps" in cfg_single:
+                                        expes_config["postprocess_min_on_steps"] = int(
+                                            cfg_single["postprocess_min_on_steps"]
+                                        )
+                        except Exception:
+                            pass
 
                 try:
                     model_name = str(getattr(expes_config, "name_model", "")).lower()
@@ -657,6 +712,36 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                 "Single device stats for loss: %s (duty=%.3f, peak=%.0f, type=%s)",
                 app_name, duty_cycle, peak_power, device_type
             )
+    per_device_cfg = None
+    try:
+        if isinstance(expes_config, dict):
+            per_device_cfg = expes_config.get("postprocess_per_device")
+        else:
+            per_device_cfg = getattr(expes_config, "postprocess_per_device", None)
+    except Exception:
+        per_device_cfg = None
+    if isinstance(per_device_cfg, Mapping) and per_device_cfg:
+        try:
+            if isinstance(expes_config, dict):
+                app_name = str(expes_config.get("appliance", "") or "")
+            else:
+                app_name = str(getattr(expes_config, "appliance", "") or "")
+            if app_name:
+                per_device_cfg_norm = {
+                    str(k).strip().lower(): v for k, v in per_device_cfg.items()
+                }
+                cfg_single = per_device_cfg_norm.get(app_name.strip().lower())
+                if isinstance(cfg_single, Mapping):
+                    if "postprocess_threshold" in cfg_single:
+                        expes_config["postprocess_threshold"] = float(
+                            cfg_single["postprocess_threshold"]
+                        )
+                    if "postprocess_min_on_steps" in cfg_single:
+                        expes_config["postprocess_min_on_steps"] = int(
+                            cfg_single["postprocess_min_on_steps"]
+                        )
+        except Exception:
+            pass
 
     try:
         tuned_keys = [
@@ -796,6 +881,93 @@ def launch_one_experiment(expes_config: OmegaConf):
             logging.info(f"Applied dataset loss config: {key}={value}")
         except Exception:
             pass
+    ds_post = params_manager.get_postprocess_config(dataset_name)
+    if isinstance(ds_post, dict) and ds_post:
+        base_per_device = getattr(expes_config, "postprocess_per_device", None)
+        per_device_post = {}
+        if isinstance(base_per_device, Mapping):
+            for k, v in base_per_device.items():
+                cfg = v
+                if isinstance(cfg, Mapping):
+                    cfg = dict(cfg)
+                    if "threshold" in cfg and "postprocess_threshold" not in cfg:
+                        cfg["postprocess_threshold"] = cfg["threshold"]
+                    if "min_on_steps" in cfg and "postprocess_min_on_steps" not in cfg:
+                        cfg["postprocess_min_on_steps"] = cfg["min_on_steps"]
+                per_device_post[str(k).strip().lower()] = cfg
+        for k, v in ds_post.items():
+            cfg = v
+            if isinstance(cfg, Mapping):
+                cfg = dict(cfg)
+                if "threshold" in cfg and "postprocess_threshold" not in cfg:
+                    cfg["postprocess_threshold"] = cfg["threshold"]
+                if "min_on_steps" in cfg and "postprocess_min_on_steps" not in cfg:
+                    cfg["postprocess_min_on_steps"] = cfg["min_on_steps"]
+            per_device_post[str(k).strip().lower()] = cfg
+        if per_device_post:
+            expes_config["postprocess_per_device"] = per_device_post
+            app_name = getattr(expes_config, "appliance", None)
+            if app_name is None:
+                app_name = getattr(expes_config, "app", None)
+            if isinstance(app_name, (list, tuple)):
+                if len(app_name) == 1:
+                    app_name = app_name[0]
+                else:
+                    app_name = None
+            if app_name is not None:
+                cfg_single = per_device_post.get(str(app_name).strip().lower())
+                if isinstance(cfg_single, Mapping):
+                    if "postprocess_threshold" in cfg_single:
+                        expes_config["postprocess_threshold"] = float(
+                            cfg_single["postprocess_threshold"]
+                        )
+                    if "postprocess_min_on_steps" in cfg_single:
+                        expes_config["postprocess_min_on_steps"] = int(
+                            cfg_single["postprocess_min_on_steps"]
+                        )
+    base_loss_per_device = getattr(expes_config, "loss_params_per_device", None)
+    loss_overrides = {}
+    app_list = getattr(expes_config, "app", None)
+    if app_list is None:
+        app_list = getattr(expes_config, "appliance", None)
+    if isinstance(app_list, Sequence) and not isinstance(app_list, (str, bytes)):
+        apps = list(app_list)
+    elif isinstance(app_list, str):
+        if app_list.lower() in ("multi", "all"):
+            apps = params_manager.get_available_appliances(dataset_name)
+        else:
+            apps = [app_list]
+    else:
+        apps = []
+    for app_name in apps:
+        if app_name is None:
+            continue
+        app_key = str(app_name).strip()
+        if not app_key:
+            continue
+        app_cfg = params_manager.get_appliance_params(dataset_name, app_key)
+        loss_override = app_cfg.get("loss_override") if isinstance(app_cfg, Mapping) else None
+        if isinstance(loss_override, Mapping) and loss_override:
+            loss_overrides[app_key.strip().lower()] = dict(loss_override)
+    if loss_overrides:
+        merged = {}
+        if isinstance(base_loss_per_device, Mapping):
+            for k, v in base_loss_per_device.items():
+                key = str(k).strip().lower()
+                if isinstance(v, Mapping):
+                    merged[key] = dict(v)
+                else:
+                    merged[key] = v
+        for k, v in loss_overrides.items():
+            cur = merged.get(k)
+            if isinstance(cur, Mapping):
+                cur_dict = dict(cur)
+            else:
+                cur_dict = {}
+            cur_dict.update(v)
+            merged[k] = cur_dict
+        if merged:
+            expes_config["loss_params_per_device"] = merged
     hpo_override = getattr(expes_config, "hpo_override", None)
     if isinstance(hpo_override, dict) and hpo_override:
         for key, value in hpo_override.items():
@@ -1145,6 +1317,18 @@ def launch_one_experiment(expes_config: OmegaConf):
             logging.info(f"Re-applied dataset loss config (after auto-config): {key}={value}")
         except Exception:
             pass
+    hpo_override = None
+    try:
+        hpo_override = expes_config.get("hpo_override")
+    except Exception:
+        hpo_override = getattr(expes_config, "hpo_override", None)
+    if isinstance(hpo_override, dict):
+        for key, value in hpo_override.items():
+            try:
+                expes_config[key] = value
+                logging.info("Applied HPO override: %s=%s", key, value)
+            except Exception:
+                pass
 
     scaler = NILMscaler(
         power_scaling_type=expes_config.power_scaling_type,
@@ -1203,7 +1387,7 @@ def launch_one_experiment(expes_config: OmegaConf):
         "threshold": expes_config.threshold,
         "app_list": app_list_serializable,  # Save device names for visualization
     }
-    torch.save(cache, cache_path)
+    torch.save(cache, cache_path, pickle_protocol=4)
 
     return launch_models_training(tuple_data, scaler, expes_config)
 
@@ -1222,6 +1406,9 @@ def main(
     batch_size=None,
     ind_house_train_val=None,
     ind_house_test=None,
+    freeze_devices=None,
+    load_pretrained=None,
+    sparse_lr_scale=1.0,
 ):
     """
     Main function to load configuration, update it with parameters,
@@ -1235,6 +1422,9 @@ def main(
         name_model (str): Name of the model to use for the experiment (case-insensitive).
         ind_house_train_val (list): Optional list of house indices for training/validation.
         ind_house_test (list): Optional list of house indices for testing.
+        freeze_devices (list): Optional list of device names to freeze during training.
+        load_pretrained (str): Optional path to pretrained checkpoint.
+        sparse_lr_scale (float): Learning rate scale for sparse devices.
     """
 
     seed = 42
@@ -1385,6 +1575,21 @@ def main(
             expes_config["ind_house_train_val"] = [1, 2]
             expes_config["ind_house_test"] = [3]
 
+    # CRITICAL FIX: For UKDALE Multi mode, use only clean data houses
+    # Analysis results:
+    # - House 4: microwave channel is MIXED (washing_machine_microwave_breadmaker)
+    # - House 5: microwave is noise data (mean_on=59W < 50W threshold)
+    # - Houses 1, 2: All 5 devices have clean data
+    # Note: Use [1, 2] for both train and test to maximize sparse device events
+    if is_multi_device and dataset_key == "UKDALE":
+        if ind_house_train_val is None and ind_house_test is None:
+            logging.warning(
+                "UKDALE Multi mode: Using recommended house config [1,2] train, [2] test. "
+                "Houses 4,5 excluded due to microwave data quality issues."
+            )
+            expes_config["ind_house_train_val"] = [1, 2]
+            expes_config["ind_house_test"] = [2]
+
     # Auto-select loss type for multi-device training
     if loss_type is not None:
         expes_config["loss_type"] = str(loss_type)
@@ -1399,6 +1604,17 @@ def main(
         expes_config["epochs"] = int(epochs)
     if batch_size is not None:
         expes_config["batch_size"] = int(batch_size)
+
+    # Two-stage training configuration
+    if freeze_devices is not None and len(freeze_devices) > 0:
+        expes_config["freeze_devices"] = freeze_devices
+        logging.info("      Freeze devices: %s", freeze_devices)
+    if load_pretrained is not None:
+        expes_config["load_pretrained"] = load_pretrained
+        logging.info("      Load pretrained: %s", load_pretrained)
+    if sparse_lr_scale != 1.0:
+        expes_config["sparse_lr_scale"] = sparse_lr_scale
+        logging.info("      Sparse LR scale: %s", sparse_lr_scale)
 
     result_path = create_dir(expes_config["result_path"])
     result_path = create_dir(f"{result_path}{dataset_key}_{sampling_rate}/")
@@ -1530,6 +1746,28 @@ if __name__ == "__main__":
         default=None,
         help="Comma-separated list of house indices for testing (e.g., '5').",
     )
+    # ============ Two-Stage Training Arguments ============
+    parser.add_argument(
+        "--freeze_devices",
+        type=str,
+        default=None,
+        help="Comma-separated list of devices to freeze (e.g., 'Kettle,Microwave'). "
+             "Frozen devices will not be trained, only use pretrained weights.",
+    )
+    parser.add_argument(
+        "--load_pretrained",
+        type=str,
+        default=None,
+        help="Path to pretrained checkpoint to load weights from. "
+             "Use with --freeze_devices for two-stage training.",
+    )
+    parser.add_argument(
+        "--sparse_lr_scale",
+        type=float,
+        default=1.0,
+        help="Learning rate scale for sparse devices (Kettle, Microwave). "
+             "Set <1.0 to use lower LR for sparse devices in joint training.",
+    )
 
     args = parser.parse_args()
 
@@ -1540,6 +1778,11 @@ if __name__ == "__main__":
         ind_house_train_val = [int(x.strip()) for x in args.ind_house_train_val.split(",")]
     if args.ind_house_test:
         ind_house_test = [int(x.strip()) for x in args.ind_house_test.split(",")]
+
+    # Parse freeze_devices
+    freeze_devices = None
+    if args.freeze_devices:
+        freeze_devices = [x.strip() for x in args.freeze_devices.split(",") if x.strip()]
 
     main(
         dataset=args.dataset,
@@ -1555,4 +1798,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         ind_house_train_val=ind_house_train_val,
         ind_house_test=ind_house_test,
+        freeze_devices=freeze_devices,
+        load_pretrained=args.load_pretrained,
+        sparse_lr_scale=args.sparse_lr_scale,
     )

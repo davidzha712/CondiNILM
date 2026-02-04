@@ -23,8 +23,12 @@ from sklearn.metrics import (
     average_precision_score,
     mean_absolute_error,
     mean_squared_error,
-    mean_absolute_percentage_error,
 )
+
+
+# ========================================= Constants ========================================= #
+EPS = 1e-12  # Machine epsilon for numerical stability
+BINARY_THRESHOLD = 0.5  # Threshold for binary classification
 
 
 # ========================================= Metrics ========================================= #
@@ -40,6 +44,21 @@ class Classifmetrics:
 
     def __call__(self, y, y_hat):
         metrics = {}
+
+        # Handle empty arrays
+        y = np.asarray(y)
+        y_hat = np.asarray(y_hat)
+        if y.size == 0 or y_hat.size == 0:
+            return {
+                "ACCURACY": 0.0,
+                "BALANCED_ACCURACY": 0.0,
+                "PRECISION": 0.0,
+                "RECALL": 0.0,
+                "F1_SCORE": 0.0,
+                "F1_SCORE_MACRO": 0.0,
+                "ROC_AUC_SCORE": 0.0,
+                "AP": 0.0,
+            }
 
         y_hat_round = y_hat.round()
 
@@ -57,7 +76,7 @@ class Classifmetrics:
             self.round_to,
         )
         metrics["F1_SCORE"] = round(
-            f1_score(y, y_hat_round, zero_division=0),
+            f1_score(y, y_hat_round, average="binary", zero_division=0),
             self.round_to,
         )
         metrics["F1_SCORE_MACRO"] = round(
@@ -65,8 +84,14 @@ class Classifmetrics:
             self.round_to,
         )
 
-        metrics["ROC_AUC_SCORE"] = round(roc_auc_score(y, y_hat), self.round_to)
-        metrics["AP"] = round(average_precision_score(y, y_hat), self.round_to)
+        # ROC-AUC and AP require both classes to be present
+        unique_classes = np.unique(y)
+        if len(unique_classes) >= 2:
+            metrics["ROC_AUC_SCORE"] = round(roc_auc_score(y, y_hat), self.round_to)
+            metrics["AP"] = round(average_precision_score(y, y_hat), self.round_to)
+        else:
+            metrics["ROC_AUC_SCORE"] = 0.0
+            metrics["AP"] = 0.0
 
         return metrics
 
@@ -81,53 +106,79 @@ class NILMmetrics:
 
     def __call__(self, y=None, y_hat=None, y_state=None, y_hat_state=None):
         metrics = {}
-        eps = 1e-12
 
         # ======= Basic regression Metrics ======= #
         if y is not None:
             assert y_hat is not None, (
                 "Target y_hat not provided, please provide y_hat to compute regression metrics."
             )
-            y = np.nan_to_num(y.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+            y = np.nan_to_num(
+                np.asarray(y, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
+            )
             y_hat = np.nan_to_num(
-                y_hat.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
+                np.asarray(y_hat, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
             )
 
-            # MAE, MSE and RMSE
-            metrics["MAE"] = round(mean_absolute_error(y, y_hat), self.round_to)
-            metrics["MSE"] = round(mean_squared_error(y, y_hat), self.round_to)
-            metrics["RMSE"] = round(
-                np.sqrt(mean_squared_error(y, y_hat)), self.round_to
-            )
+            # Handle empty arrays for regression metrics
+            if y.size == 0 or y_hat.size == 0:
+                metrics["MAE"] = 0.0
+                metrics["MSE"] = 0.0
+                metrics["RMSE"] = 0.0
+                metrics["TECA"] = 0.0
+                metrics["NDE"] = 0.0
+                metrics["SAE"] = 0.0
+                metrics["MR"] = 0.0
+            else:
+                # MAE, MSE and RMSE
+                metrics["MAE"] = round(mean_absolute_error(y, y_hat), self.round_to)
+                metrics["MSE"] = round(mean_squared_error(y, y_hat), self.round_to)
+                metrics["RMSE"] = round(
+                    np.sqrt(mean_squared_error(y, y_hat)), self.round_to
+                )
 
-            # =======  NILM Metrics ======= #
+                # =======  NILM Metrics ======= #
 
-            # Total Energy Correctly Assigned (TECA)
-            abs_y_sum = float(np.sum(np.abs(y)))
-            abs_y_sum = max(abs_y_sum, eps)
-            metrics["TECA"] = round(
-                1 - ((np.sum(np.abs(y_hat - y))) / (2 * abs_y_sum)),
-                self.round_to,
-            )
-            # Normalized Disaggregation Error (NDE)
-            y_sq_sum = float(np.sum(y**2))
-            y_sq_sum = max(y_sq_sum, eps)
-            metrics["NDE"] = round(
-                (np.sum((y_hat - y) ** 2)) / y_sq_sum, self.round_to
-            )
-            # Signal Aggregate Error (SAE)
-            y_sum = float(np.sum(y))
-            y_sum = max(y_sum, eps)
-            metrics["SAE"] = round(
-                np.abs(np.sum(y_hat) - np.sum(y)) / y_sum, self.round_to
-            )
-            # Matching Rate
-            mr_denom = float(np.sum(np.maximum(y_hat, y)))
-            mr_denom = max(mr_denom, eps)
-            metrics["MR"] = round(
-                np.sum(np.minimum(y_hat, y)) / mr_denom,
-                self.round_to,
-            )
+                # Total Energy Correctly Assigned (TECA)
+                abs_y_sum = float(np.sum(np.abs(y)))
+                if abs_y_sum < EPS:
+                    # When all ground truth is zero, TECA is 1.0 if prediction is also zero
+                    metrics["TECA"] = 1.0 if np.sum(np.abs(y_hat)) < EPS else 0.0
+                else:
+                    metrics["TECA"] = round(
+                        1 - ((np.sum(np.abs(y_hat - y))) / (2 * abs_y_sum)),
+                        self.round_to,
+                    )
+
+                # Normalized Disaggregation Error (NDE)
+                y_sq_sum = float(np.sum(y**2))
+                if y_sq_sum < EPS:
+                    # When all ground truth is zero, NDE is 0 if prediction is also zero
+                    metrics["NDE"] = 0.0 if np.sum(y_hat**2) < EPS else float("inf")
+                else:
+                    metrics["NDE"] = round(
+                        (np.sum((y_hat - y) ** 2)) / y_sq_sum, self.round_to
+                    )
+
+                # Signal Aggregate Error (SAE)
+                # Use absolute value of y_sum to handle negative sums correctly
+                y_sum = float(np.sum(y))
+                abs_y_sum_for_sae = max(abs(y_sum), EPS)
+                metrics["SAE"] = round(
+                    np.abs(np.sum(y_hat) - y_sum) / abs_y_sum_for_sae, self.round_to
+                )
+
+                # Matching Rate (MR)
+                # Clip negative values to 0 as MR assumes non-negative power values
+                y_clipped = np.maximum(y, 0)
+                y_hat_clipped = np.maximum(y_hat, 0)
+                mr_denom = float(np.sum(np.maximum(y_hat_clipped, y_clipped)))
+                if mr_denom < EPS:
+                    metrics["MR"] = 1.0  # Both are zero, perfect match
+                else:
+                    metrics["MR"] = round(
+                        np.sum(np.minimum(y_hat_clipped, y_clipped)) / mr_denom,
+                        self.round_to,
+                    )
 
         # =======  Event Detection Metrics ======= #
         if y_state is not None:
@@ -135,19 +186,31 @@ class NILMmetrics:
                 "Target y_hat_state not provided, please pass y_hat_state to compute classification metrics."
             )
             y_state = np.nan_to_num(
-                y_state.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
+                np.asarray(y_state, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
             )
             y_hat_state = np.nan_to_num(
-                y_hat_state.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
+                np.asarray(y_hat_state, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
             )
+            if y_state.size == 0 or y_hat_state.size == 0:
+                metrics["ACCURACY"] = 0.0
+                metrics["BALANCED_ACCURACY"] = 0.0
+                metrics["PRECISION"] = 0.0
+                metrics["RECALL"] = 0.0
+                metrics["F1_SCORE"] = 0.0
+                return metrics
 
-            # Accuracy and Balanced Accuracy
+            # Binarize using configurable threshold
+            y_state = (y_state > BINARY_THRESHOLD).astype(np.int64, copy=False)
+            y_hat_state = (y_hat_state > BINARY_THRESHOLD).astype(np.int64, copy=False)
+
+            # Accuracy
             metrics["ACCURACY"] = round(
                 accuracy_score(y_state, y_hat_state), self.round_to
             )
+
+            # Check if both classes are present in ground truth (more robust check)
             uniq_true = np.unique(y_state)
-            uniq_pred = np.unique(y_hat_state)
-            if uniq_true.size >= 2 and uniq_pred.size >= 2:
+            if uniq_true.size >= 2:
                 metrics["BALANCED_ACCURACY"] = round(
                     balanced_accuracy_score(y_state, y_hat_state), self.round_to
                 )
@@ -160,10 +223,11 @@ class NILMmetrics:
                     self.round_to,
                 )
                 metrics["F1_SCORE"] = round(
-                    f1_score(y_state, y_hat_state, zero_division=0),
+                    f1_score(y_state, y_hat_state, average="binary", zero_division=0),
                     self.round_to,
                 )
             else:
+                # Single class in ground truth: degrade gracefully
                 metrics["BALANCED_ACCURACY"] = metrics["ACCURACY"]
                 metrics["PRECISION"] = 0.0
                 metrics["RECALL"] = 0.0
@@ -174,7 +238,7 @@ class NILMmetrics:
 
 class REGmetrics:
     """
-    Basics regrssion metrics
+    Basics regression metrics
     """
 
     def __init__(self, round_to=5):
@@ -183,14 +247,32 @@ class REGmetrics:
     def __call__(self, y, y_hat):
         metrics = {}
 
-        metrics["MAE"] = round(mean_absolute_error(y, y_hat), self.round_to)
-        metrics["MSE"] = round(mean_squared_error(y, y_hat), self.round_to)
-        metrics["RMSE"] = round(np.sqrt(mean_squared_error(y, y_hat)), self.round_to)
-        y_arr = np.nan_to_num(np.asarray(y, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        # Clean data BEFORE computing any metrics
+        y_arr = np.nan_to_num(
+            np.asarray(y, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
+        )
         y_hat_arr = np.nan_to_num(
             np.asarray(y_hat, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
         )
-        denom = np.maximum(np.abs(y_arr), 1e-12)
+
+        # Handle empty arrays
+        if y_arr.size == 0 or y_hat_arr.size == 0:
+            return {
+                "MAE": 0.0,
+                "MSE": 0.0,
+                "RMSE": 0.0,
+                "MAPE": 0.0,
+            }
+
+        # Now compute metrics with clean data
+        metrics["MAE"] = round(mean_absolute_error(y_arr, y_hat_arr), self.round_to)
+        metrics["MSE"] = round(mean_squared_error(y_arr, y_hat_arr), self.round_to)
+        metrics["RMSE"] = round(
+            np.sqrt(mean_squared_error(y_arr, y_hat_arr)), self.round_to
+        )
+
+        # MAPE with numerical stability
+        denom = np.maximum(np.abs(y_arr), EPS)
         mape = float(np.mean(np.abs((y_arr - y_hat_arr) / denom)))
         if not np.isfinite(mape):
             mape = 0.0
@@ -224,7 +306,7 @@ def eval_win_energy_aggregation(
     list_pdl_test = st_date_test["ID_PDL"].unique()
 
     for freq_agg in ["D", "W", "ME"]:
-        df = pd.DataFrame()
+        all_dfs = []  # Collect DataFrames for efficient concat
 
         true_app_power = []
         pred_app_power = []
@@ -277,18 +359,17 @@ def eval_win_energy_aggregation(
                             )
                         )
 
-                pred = model(input_seq.to(device))
-
-                pred = scaler.inverse_transform_appliance(pred)
-
-                pred[pred < threshold_small_values] = 0
+                # Use torch.no_grad() to prevent unnecessary gradient computation
+                with torch.no_grad():
+                    pred = model(input_seq.to(device))
+                    pred = scaler.inverse_transform_appliance(pred)
+                    pred[pred < threshold_small_values] = 0
+                    pred = pred.cpu().numpy().flatten()
 
                 inv_scale = scaler.inverse_transform(data_test[val, :, :, :])
 
                 agg = inv_scale[0, 0, :]
                 app = inv_scale[1, 0, :]
-
-                pred = pred.detach().cpu().numpy().flatten()
 
                 list_date.extend(
                     list(
@@ -302,37 +383,51 @@ def eval_win_energy_aggregation(
                 pdl_pred_app_power.extend(list(pred))
 
             df_inst = pd.DataFrame(
-                list(
-                    zip(
-                        list_date,
-                        pdl_total_power,
-                        pdl_true_app_power,
-                        pdl_pred_app_power,
-                    )
-                ),
-                columns=["date", "total_power", "true_app_power", "pred_app_power"],
+                {
+                    "date": list_date,
+                    "total_power": pdl_total_power,
+                    "true_app_power": pdl_true_app_power,
+                    "pred_app_power": pdl_pred_app_power,
+                }
             )
             df_inst["date"] = pd.to_datetime(df_inst["date"])
             df_inst = df_inst.set_index("date")
 
             df_inst = df_inst.groupby(pd.Grouper(freq=freq_agg)).sum()
-            df_inst += (
-                1  # Prevent total power or appliance power is 0 to calculate ratio
-            )
 
             true_app_power.extend(df_inst["true_app_power"].tolist())
             pred_app_power.extend(df_inst["pred_app_power"].tolist())
 
-            df_inst["true_ratio"] = df_inst["true_app_power"] / df_inst["total_power"]
-            df_inst["pred_ratio"] = df_inst["pred_app_power"] / df_inst["total_power"]
+            # Calculate ratios with proper zero handling (no +1 offset)
+            total_power_arr = df_inst["total_power"].values
+            true_app_arr = df_inst["true_app_power"].values
+            pred_app_arr = df_inst["pred_app_power"].values
 
+            # Safe division: only divide where total_power > 0
+            df_inst["true_ratio"] = np.divide(
+                true_app_arr,
+                total_power_arr,
+                out=np.zeros_like(true_app_arr, dtype=np.float64),
+                where=total_power_arr > EPS,
+            )
+            df_inst["pred_ratio"] = np.divide(
+                pred_app_arr,
+                total_power_arr,
+                out=np.zeros_like(pred_app_arr, dtype=np.float64),
+                where=total_power_arr > EPS,
+            )
+
+            # Clean up any remaining inf/nan values
             df_inst = df_inst.replace([np.inf, -np.inf], 0)
             df_inst = df_inst.fillna(value=0)
 
             true_ratio.extend(df_inst["true_ratio"].tolist())
             pred_ratio.extend(df_inst["pred_ratio"].tolist())
 
-            df = df_inst if not df.size else pd.concat((df, df_inst), axis=0)
+            all_dfs.append(df_inst)
+
+        # Efficient single concat at the end
+        df = pd.concat(all_dfs, axis=0) if all_dfs else pd.DataFrame()
 
         if log_dict is not None:
             log_dict[mask_metric + "_" + freq_agg] = metrics(

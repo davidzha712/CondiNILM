@@ -1,191 +1,137 @@
 # CondiNILM
 
-<div align="center">
+面向 NILM（Non-Intrusive Load Monitoring，非侵入式负荷分解）的研究代码库，包含：
+- 统一的训练/评估流程（单设备与 Multi 多设备联合学习）
+- NILMFormer 与多种 NILM / TSER 基线模型
+- 预处理、指标评估、可视化与实验脚本
 
-**CondiNILM: Feature-wise Modulated Multi-Task Learning for Non-Intrusive Load Monitoring**
+**Python**：建议 3.10+（已在 Windows 环境下以 3.12 运行）
 
-Research codebase by ** **  
+## 安装（仅支持原生 Python）
 
+本项目**不支持 uv 安装**。请使用 **python + venv + pip**。
 
-![Python](https://img.shields.io/badge/Python-3.9%20|%203.10%20|%203.11-blue)
+### 1) 创建虚拟环境
 
-</div>
-
----
-
-## Overview
-
-**CondiNILM** is a **novel multi-task deep learning framework for Non-Intrusive Load Monitoring (NILM)**, developed as part of a Master’s thesis at **TU Braunschweig**.
-
-The framework targets **device-level power disaggregation from aggregate household measurements**, with a particular focus on:
-
-- **Multi-appliance joint learning**
-- **Non-stationary power signals**
-- **Time–frequency feature fusion**
-- **Device-conditioned modeling via FiLM (Feature-wise Linear Modulation)**
-
-Unlike classical NILM approaches that train **one model per appliance**, CondiNILM formulates NILM as a **single multi-output learning problem**, where **shared representations** are dynamically modulated by **device-specific conditions**.
-
----
-
-## Key Contributions
-
-CondiNILM introduces several original design choices:
-
-### 1. Multi-Task NILM with Device Conditioning
-
-- A **single unified model** predicts power consumption for multiple appliances simultaneously
-- Each appliance is modeled via **device-conditioned output heads**
-- Reduces parameter redundancy and improves cross-device generalization
-
-### 2. FiLM-Modulated Feature Decoding
-
-- **FiLM layers** are used to modulate intermediate representations:
-  
-  \[
-  \text{FiLM}(x \mid d) = \gamma_d \cdot x + \beta_d
-  \]
-
-- Enables **explicit device-aware control** over shared temporal features
-- Prevents power “leakage” and cross-device interference common in multi-head NILM
-
-### 3. Time–Frequency Feature Fusion
-
-- The model jointly exploits:
-  - **Time-domain power sequences**
-  - **Frequency-domain representations** (FFT / STFT / spectral statistics)
-  - **Engineered auxiliary features** (e.g. activity priors, signal energy)
-
-- These modalities are fused through attention-based encoders
-
-### 4. Sequence-Level Supervision with Dense Outputs
-
-- Supports **Seq2Seq**, **Seq2Subsequence**, and **Seq2Point** supervision
-- Enables **high-resolution waveform reconstruction** at inference time
-- Training and inference strategies can be decoupled for efficiency
-
----
-
-## Project Scope
-
-This repository serves as the **official thesis codebase of CondiNILM** and includes:
-
-- The complete implementation of **CondiNILM**
-- A unified training and evaluation pipeline
-- Re-implementations of **10+ recent NILM baselines** in PyTorch
-- Reproducible experiment scripts and configurations
-
-The framework is designed for **research extensibility**, not only benchmark reproduction.
-
----
-
-## Installation
-
-### 1. Clone the Repository
-
+Windows（PowerShell）：
 ```bash
-git clone https://github.com/your-username/CondiNILM.git
-cd CondiNILM
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -U pip
 ```
 
-### 2.Create Conda Environment
-
+Linux/macOS（bash/zsh）：
 ```bash
-conda env create -f environment.yml
-conda activate film-multinilm
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip
 ```
 
-### Verify Installation
+### 2) 安装依赖
+
+先安装 PyTorch（请根据你的 CUDA/CPU 环境选择官方命令）：
 ```bash
-python -c "import torch; print(torch.version.cuda)"
-```
----
-
-## Environment Specification
-environment.yml:
-
-```yaml
-name: film-multinilm
-channels:
-  - conda-forge
-  - pytorch
-dependencies:
-  - python=3.10
-  - pytorch
-  - torchvision
-  - torchaudio
-  - numpy
-  - scipy
-  - pandas
-  - scikit-learn
-  - matplotlib
-  - seaborn
-  - tqdm
-  - pyyaml
-  - einops
-  - pip
-  - pip:
-      - pytorch-lightning
-      - hydra-core
-      - mlflow
+pip install -U torch torchvision torchaudio
+python -c "import torch; print(torch.__version__)"
 ```
 
----
-
-## Code Structure
+然后安装其余 Python 依赖（覆盖训练、评估与脚本所需的常用依赖）：
 ```bash
-.
-├── assets/                 # figures and visual assets
-├── configs/                # experiment configuration files (YAML)
-├── data/                   # dataset metadata and splits
-├── results/                # experiment outputs and logs
-├── scripts/                # experiment launch scripts
-│   ├── run_one_expe.py
-│   └── run_all_expe.sh
-├── src/
-│   ├── helpers/            # training, metrics, preprocessing
-│   ├── baselines/          # NILM baseline models
-│   └── film_multinilm/     # CondiNILM core implementation
-├── environment.yml
-└── README.md
+pip install -U numpy pandas scipy scikit-learn tqdm pyyaml omegaconf matplotlib tensorboard
+pip install -U pytorch-lightning lightning
+pip install -U streamlit optuna optuna-dashboard
 ```
----
 
-## Running Experiments
-Run a Single Experiment
+## 数据准备
+
+默认数据根目录来自 [expes.yaml](file:///c:/Users/Workstation/Workspace/CondiNILM/configs/expes.yaml) 的 `data_path`（默认 `data/`）。
+
+- UKDALE：脚本会读取 `${data_path}/UKDALE/house_1`、`house_2`… 这样的目录结构
+- REFIT：脚本会读取 `${data_path}/REFIT/RAW_DATA_CLEAN/` 下的清洗 CSV
+
+如果你的数据不在上述路径，请修改 `configs/expes.yaml` 的 `data_path`。
+
+## 运行实验
+
+入口脚本为 [run_one_expe.py](file:///c:/Users/Workstation/Workspace/CondiNILM/scripts/run_one_expe.py)，参数以 `-h` 输出为准：
+```bash
+python scripts/run_one_expe.py -h
+```
+
+### 单设备训练示例
+
+Windows（PowerShell）：
+```bash
+python scripts/run_one_expe.py ^
+  --dataset UKDALE ^
+  --sampling_rate 1min ^
+  --window_size 128 ^
+  --appliance WashingMachine ^
+  --name_model NILMFormer
+```
+
+Linux/macOS（bash/zsh）：
 ```bash
 python scripts/run_one_expe.py \
-    --dataset "UKDALE" \
-    --sampling_rate "1min" \
-    --appliance "WashingMachine" \
-    --window_size 128 \
-    --name_model NILMFormer \
-    --seed 42
+  --dataset UKDALE \
+  --sampling_rate 1min \
+  --window_size 128 \
+  --appliance WashingMachine \
+  --name_model NILMFormer
 ```
-Run Full Benchmark Suite
+
+### Multi（多设备）训练示例
+`--appliance` 支持 `multi` 或逗号分隔的设备列表：
+
+Windows（PowerShell）：
 ```bash
-bash scripts/run_all_expe.sh
+python scripts/run_one_expe.py ^
+  --dataset UKDALE ^
+  --sampling_rate 1min ^
+  --window_size 128 ^
+  --appliance Kettle,Fridge ^
+  --name_model NILMFormer
 ```
 
----
-Research Context
+Linux/macOS（bash/zsh）：
+```bash
+python scripts/run_one_expe.py \
+  --dataset UKDALE \
+  --sampling_rate 1min \
+  --window_size 128 \
+  --appliance Kettle,Fridge \
+  --name_model NILMFormer
+```
 
-CondiNILM was developed in the context of:
-	•	Advanced NILM research
-	•	Multi-task learning for energy disaggregation
-	•	Transformer-based time-series modeling
-	•	Device-aware representation learning
+## 输出与可视化
 
-The codebase is structured to support ablation studies, loss-function research, and architecture extensions.
+输出根目录来自 `configs/expes.yaml` 的 `result_path`（默认 `result/`）。
 
----
-## Acknowledgement
-This project builds upon established NILM research and re-implements several prior baselines for comparison.
-All newly introduced architectures, FiLM conditioning mechanisms, multi-task heads, and training strategies are original contributions of this work.
+典型输出包括：
+- `val_compare.html`：验证集曲线可视化（支持选择设备、模型、epoch）
+- `val_report.jsonl`：每个 epoch 一条验证记录，包含整体指标与 per-device 指标
 
-## Contact
-**Siyi Li**
-M.Sc. Electrical Engineering · TU Braunschweig
-For questions or collaborations, please reach out to:
-- **Email**: [your.email@example.com](mailto:your.email@example.com)
-- **GitHub**: [your-username](https://github.com/your-username)
+此外，可以用 Streamlit 查看保存的验证片段：
+```bash
+streamlit run scripts/streamlit_val_viewer.py
+```
+
+## 目录结构（当前仓库真实结构）
+
+```text
+.
+├── assets/                  # 图片资源
+├── configs/                 # 实验配置（YAML）
+├── scripts/                 # 运行脚本（run_one_expe 等）
+├── src/
+│   ├── baselines/           # NILM / TSER 基线模型
+│   ├── helpers/             # 训练、评估、预处理、指标等
+│   └── nilmformer/          # NILMFormer 实现
+├── environment_win.yaml     # 历史环境记录（不作为安装入口）
+├── environment_mac.yaml     # 历史环境记录（不作为安装入口）
+└── README.md
+```
+
+## 说明
+
+本仓库偏研究用途：代码与配置以可复现实验和快速迭代为目标，默认不提供“一键安装”打包发布形式。

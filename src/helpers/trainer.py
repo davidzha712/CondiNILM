@@ -14,6 +14,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 import pytorch_lightning as pl
 
+from src.helpers.device_config import get_gate_config, get_device_loss_params
+
 
 
 # Note: Old loss classes (EAECLoss, GAEAECLoss, etc.) have been removed.
@@ -95,6 +97,22 @@ class AdaptiveDeviceLoss(nn.Module):
         gate_floors = []
         gate_biases = []
 
+        # Per-device learnable loss parameters
+        alpha_on_init = []
+        alpha_off_init = []
+        threshold_init = []
+
+        # Per-device learnable regression weights
+        w_energy_init = []
+        w_on_power_init = []
+        w_peak_init = []
+        w_grad_init = []
+        w_range_init = []
+
+        # Per-device learnable focal loss parameters
+        focal_gamma_init = []
+        focal_alpha_init = []
+
         for i in range(self.n_devices):
             stats = device_stats[i] if device_stats and i < len(device_stats) else {}
             device_type, params = self._classify_and_derive_params(stats)
@@ -109,13 +127,37 @@ class AdaptiveDeviceLoss(nn.Module):
             gate_soft_scales.append(float(params.get("gate_soft_scale", 3.0)))
             gate_floors.append(float(params.get("gate_floor", 0.005)))
             gate_biases.append(float(params.get("gate_bias", 0.0)))
+            # Track which devices have frozen gate_bias (V7: prevent collapse for sparse devices)
+            if not hasattr(self, "_gate_bias_frozen_mask"):
+                self._gate_bias_frozen_mask = []
+            self._gate_bias_frozen_mask.append(bool(params.get("gate_bias_frozen", False)))
+            # V30: Track per-device gate_logits_floor to prevent collapse
+            if not hasattr(self, "_gate_logits_floors"):
+                self._gate_logits_floors = []
+            # Default floor is -inf (no clamping), sparse devices can use e.g. -2.0
+            self._gate_logits_floors.append(float(params.get("gate_logits_floor", float("-inf"))))
 
-            # Dynamic device weights based on device type and characteristics
-            # This prevents "robbing Peter to pay Paul" by giving appropriate
-            # attention to each device type
+            # Extract per-device loss parameters for learnable weights
+            alpha_on_init.append(float(params.get("alpha_on", 2.0)))
+            alpha_off_init.append(float(params.get("alpha_off", 2.0)))
+            threshold_init.append(float(params.get("threshold", 0.01)))
+
+            # Extract per-device regression weights for learnable parameters
+            w_energy_init.append(float(params.get("w_energy", 0.1)))
+            w_on_power_init.append(float(params.get("w_on_power", 0.03)))
+            w_peak_init.append(float(params.get("w_peak", 0.0)))
+            w_grad_init.append(float(params.get("w_grad", 0.0)))
+            w_range_init.append(float(params.get("w_range", 0.0)))
+
+            # Extract per-device focal loss parameters for learnable weights
+            # Default: gamma=0 (no focal), alpha=0.5 (balanced)
+            # Sparse devices like microwave/kettle use gamma=3.0, alpha=0.9
+            focal_gamma_init.append(float(params.get("focal_gamma", 0.0)))
+            focal_alpha_init.append(float(params.get("focal_alpha", 0.5)))
+
             duty_cycle = float(stats.get("duty_cycle", 0.1))
-            weight = self._compute_device_weight(device_type, duty_cycle)
-            init_weights.append(weight)
+            mean_on = float(stats.get("mean_on", 0.0))
+            init_weights.append(self._compute_device_weight(device_type, duty_cycle, mean_on, params))
 
         # Normalize weights so they sum to n_devices (preserves total gradient magnitude)
         total_weight = sum(init_weights)
@@ -125,13 +167,149 @@ class AdaptiveDeviceLoss(nn.Module):
         # Register as buffer (not learnable, but dynamically computed)
         self.register_buffer("device_weights", torch.tensor(init_weights, dtype=torch.float32))
 
-        # Register per-device gate parameters as buffers
-        self.register_buffer("gate_soft_scales", torch.tensor(gate_soft_scales, dtype=torch.float32))
-        self.register_buffer("gate_floors", torch.tensor(gate_floors, dtype=torch.float32))
-        self.register_buffer("gate_biases", torch.tensor(gate_biases, dtype=torch.float32))
+        # Register per-device gate parameters
+        # ARCHITECTURAL IMPROVEMENT: Make gate_soft_scales and gate_floors LEARNABLE
+        # This allows the model to learn the optimal gate sharpness and minimum activation
+        # for each device, adapting to different device characteristics.
+        self.gate_soft_scales = nn.Parameter(torch.tensor(gate_soft_scales, dtype=torch.float32))
+        self.gate_floors = nn.Parameter(torch.tensor(gate_floors, dtype=torch.float32))
+
+        # ARCHITECTURAL IMPROVEMENT: Make gate_bias LEARNABLE
+        # This allows the model to learn the optimal gate bias for each device,
+        # solving the "constant high background" vs "collapse" trade-off.
+        # Initial values from device-specific configs provide good starting points.
+        self.gate_biases = nn.Parameter(torch.tensor(gate_biases, dtype=torch.float32))
+
+        # ARCHITECTURAL IMPROVEMENT: Make alpha_on, alpha_off, threshold LEARNABLE
+        # This allows the model to learn optimal ON/OFF sample weighting per device.
+        # Using log-space for alpha to ensure positive values
+        self.alpha_on_log = nn.Parameter(torch.log(torch.tensor(alpha_on_init, dtype=torch.float32)))
+        self.alpha_off_log = nn.Parameter(torch.log(torch.tensor(alpha_off_init, dtype=torch.float32)))
+        # Threshold in logit space, mapped to [0.005, 0.05] via sigmoid
+        # Initial logit computed from initial threshold values
+        threshold_tensor = torch.tensor(threshold_init, dtype=torch.float32)
+        # Map threshold from [0.005, 0.05] to logit space
+        # threshold = 0.005 + 0.045 * sigmoid(logit)
+        # logit = logit((threshold - 0.005) / 0.045)
+        threshold_normalized = (threshold_tensor - 0.005) / 0.045
+        threshold_normalized = torch.clamp(threshold_normalized, 0.01, 0.99)  # Avoid inf
+        self.threshold_logit = nn.Parameter(torch.logit(threshold_normalized))
+
+        # LEARNABLE REGRESSION WEIGHTS: w_energy, w_on_power, w_peak, w_grad, w_range
+        # Using log-space to ensure positive values, with eps to avoid log(0)
+        eps = 1e-6
+        self.w_energy_log = nn.Parameter(
+            torch.log(torch.tensor(w_energy_init, dtype=torch.float32).clamp(min=eps))
+        )
+        self.w_on_power_log = nn.Parameter(
+            torch.log(torch.tensor(w_on_power_init, dtype=torch.float32).clamp(min=eps))
+        )
+        self.w_peak_log = nn.Parameter(
+            torch.log(torch.tensor(w_peak_init, dtype=torch.float32).clamp(min=eps))
+        )
+        self.w_grad_log = nn.Parameter(
+            torch.log(torch.tensor(w_grad_init, dtype=torch.float32).clamp(min=eps))
+        )
+        self.w_range_log = nn.Parameter(
+            torch.log(torch.tensor(w_range_init, dtype=torch.float32).clamp(min=eps))
+        )
+
+        # LEARNABLE FOCAL LOSS PARAMETERS: focal_gamma, focal_alpha
+        # - focal_gamma: Controls focus on hard samples. Range [0, 5]. gamma=0 disables focal loss.
+        #   Using log-space: gamma = exp(focal_gamma_log), clamped to [0, 5]
+        # - focal_alpha: Class weight for ON samples. Range [0.1, 0.95].
+        #   Using logit-space: alpha = sigmoid(focal_alpha_logit) * 0.85 + 0.1
+        # This allows the model to LEARN optimal imbalance handling per device.
+        focal_gamma_tensor = torch.tensor(focal_gamma_init, dtype=torch.float32).clamp(min=eps)
+        self.focal_gamma_log = nn.Parameter(torch.log(focal_gamma_tensor))
+
+        # Map focal_alpha from [0.1, 0.95] to logit space
+        # alpha = 0.1 + 0.85 * sigmoid(logit)
+        # logit = logit((alpha - 0.1) / 0.85)
+        focal_alpha_tensor = torch.tensor(focal_alpha_init, dtype=torch.float32)
+        focal_alpha_normalized = (focal_alpha_tensor - 0.1) / 0.85
+        focal_alpha_normalized = torch.clamp(focal_alpha_normalized, 0.01, 0.99)  # Avoid inf
+        self.focal_alpha_logit = nn.Parameter(torch.logit(focal_alpha_normalized))
+
+        # Learnable loss weights using Uncertainty Weighting (Kendall et al., 2018)
+        # log_var = log(σ²), initialized to 0 (σ² = 1)
+        # Loss weight = exp(-log_var) = 1/σ², regularized by + 0.5*log_var
+        n_loss_components = 15  # main, global, recall, off_fp, on_power, energy, peak, grad, range, edge, hard_zero, bce, bg_suppress, event, amplitude
+        self.loss_log_vars = nn.Parameter(torch.zeros(self.n_devices, n_loss_components))
 
         # Base loss function
         self.base_loss = nn.SmoothL1Loss(reduction="none")
+
+    def get_learnable_alpha(self, device_idx: int) -> tuple:
+        """
+        Get constrained learnable alpha_on and alpha_off for a device.
+
+        Returns:
+            (alpha_on, alpha_off) - both constrained to [0.5, 10.0]
+        """
+        alpha_on = torch.exp(self.alpha_on_log[device_idx])
+        alpha_off = torch.exp(self.alpha_off_log[device_idx])
+        # Clamp to reasonable range
+        alpha_on = torch.clamp(alpha_on, 0.5, 10.0)
+        alpha_off = torch.clamp(alpha_off, 0.5, 10.0)
+        return alpha_on, alpha_off
+
+    def get_learnable_threshold(self, device_idx: int) -> torch.Tensor:
+        """
+        Get constrained learnable threshold for a device.
+
+        Returns:
+            threshold - constrained to [0.005, 0.05]
+        """
+        # threshold = 0.005 + 0.045 * sigmoid(logit)
+        threshold = 0.005 + 0.045 * torch.sigmoid(self.threshold_logit[device_idx])
+        return threshold
+
+    def get_learnable_regression_weights(self, device_idx: int) -> tuple:
+        """
+        Get constrained learnable regression weights for a device.
+
+        Returns:
+            (w_energy, w_on_power, w_peak, w_grad, w_range) - all constrained to appropriate ranges
+        """
+        w_energy = torch.exp(self.w_energy_log[device_idx]).clamp(0.001, 1.0)
+        w_on_power = torch.exp(self.w_on_power_log[device_idx]).clamp(0.001, 0.5)
+        w_peak = torch.exp(self.w_peak_log[device_idx]).clamp(0.001, 0.5)
+        w_grad = torch.exp(self.w_grad_log[device_idx]).clamp(0.001, 0.5)
+        w_range = torch.exp(self.w_range_log[device_idx]).clamp(0.001, 0.5)
+        return w_energy, w_on_power, w_peak, w_grad, w_range
+
+    def get_learnable_focal_params(self, device_idx: int) -> tuple:
+        """
+        Get constrained learnable focal loss parameters for a device.
+
+        Returns:
+            (focal_gamma, focal_alpha) where:
+            - focal_gamma: Focus parameter [0, 5]. 0 disables focal loss.
+            - focal_alpha: ON class weight [0.1, 0.95].
+        """
+        # gamma = exp(log_gamma), clamped to [0, 5]
+        focal_gamma = torch.exp(self.focal_gamma_log[device_idx]).clamp(0.0, 5.0)
+        # alpha = 0.1 + 0.85 * sigmoid(logit), giving range [0.1, 0.95]
+        focal_alpha = 0.1 + 0.85 * torch.sigmoid(self.focal_alpha_logit[device_idx])
+        return focal_gamma, focal_alpha
+
+    def get_loss_weights(self, device_idx: int) -> tuple:
+        """
+        Get uncertainty-weighted loss weights for a device.
+        Based on Kendall et al., 2018 - Multi-Task Learning Using Uncertainty to Weigh Losses.
+
+        Returns:
+            (weights, regularization) where:
+            - weights: tensor of 13 loss weights (precision = exp(-log_var))
+            - regularization: sum of 0.5 * log_var terms
+        """
+        log_vars = self.loss_log_vars[device_idx]  # Shape: [13]
+        # Precision (inverse variance) as weight
+        weights = torch.exp(-log_vars)
+        # Regularization term: encourages learning appropriate uncertainty
+        regularization = 0.5 * log_vars.sum()
+        return weights, regularization
 
     def _classify_and_derive_params(self, stats: dict) -> tuple:
         """
@@ -178,6 +356,26 @@ class AdaptiveDeviceLoss(nn.Module):
         params = self._derive_params_from_stats(
             device_type, duty_cycle, peak_power, mean_on, cv_on, mean_event_dur
         )
+        try:
+            gate_cfg = get_gate_config(device_type)
+        except Exception:
+            gate_cfg = None
+        if isinstance(gate_cfg, dict):
+            params = dict(params)
+            if "gate_soft_scale" not in params:
+                params["gate_soft_scale"] = float(gate_cfg.get("gate_soft_scale", 3.0))
+            if "gate_floor" not in params:
+                params["gate_floor"] = float(gate_cfg.get("gate_floor", 0.005))
+            if "gate_bias" not in params:
+                params["gate_bias"] = float(gate_cfg.get("gate_bias", 0.0))
+        try:
+            base_params = get_device_loss_params(device_type, duty_cycle)
+        except Exception:
+            base_params = None
+        if isinstance(base_params, dict) and "lambda_gate_cls" not in params:
+            if "lambda_gate_cls" in base_params:
+                params = dict(params)
+                params["lambda_gate_cls"] = float(base_params["lambda_gate_cls"])
 
         # ============================================================
         # Device-specific parameter overrides based on observed metrics
@@ -191,95 +389,185 @@ class AdaptiveDeviceLoss(nn.Module):
         # - Dishwasher: P=0.463, R=0.868, F1=0.604 ✅ GOOD
         # ============================================================
 
-        if lname in ("fridge", "refrigerator", "fridge_freezer"):
-            # Fridge: Cycling device - F1=0.832 good, NDE=0.402 needs improvement
-            # Need better power regression while maintaining classification
-            params = dict(params)
-            params["w_recall"] = 0.08
-            params["w_main"] = 0.32      # REDUCED to make room for energy
-            params["w_off_fp"] = 0.20    # REDUCED
-            params["w_global"] = 0.04
-            params["w_on_power"] = 0.12  # INCREASED for better power accuracy
-            params["w_energy"] = 0.24    # INCREASED for energy regression
-            params["alpha_on"] = 2.0     # INCREASED slightly
-            params["alpha_off"] = 1.5    # REDUCED for better balance
-            params["off_margin"] = 0.015
-            # Gate parameters - slightly less suppressive
-            params["gate_soft_scale"] = 2.5
-            params["gate_floor"] = 0.01
-            params["gate_bias"] = -4.0
+        # OPTIMIZED: 始终启用设备特定参数调整，即使在多设备训练中
+        # 原来仅在单设备时启用，导致多设备训练时Microwave等设备被其他设备梯度主导
+        allow_manual_tuning = True  # 原: self.n_devices <= 1
 
-        elif lname in ("dishwasher",):
-            # Dishwasher: Long-cycle device with variable power patterns
-            # Problem: Previous config had alpha_off=2.5 too high, gate_bias=-6 too suppressive
-            # Result: Poor power regression despite good F1
+        if allow_manual_tuning and lname in ("fridge", "refrigerator", "fridge_freezer"):
+            # Fridge: BENCHMARK DEVICE - updated for learnable gate architecture
+            # Original F1=0.830 achieved with fixed negative bias
+            # With learnable bias, use neutral initial and let training optimize
             params = dict(params)
-            params["w_recall"] = 0.10    # Moderate recall
-            params["w_main"] = 0.28      # REDUCED to make room for energy
-            params["w_off_fp"] = 0.20    # REDUCED - less aggressive
-            params["w_global"] = 0.03
-            params["w_on_power"] = 0.14  # INCREASED - better power accuracy
-            params["w_energy"] = 0.25    # INCREASED - stronger energy regression
-            params["alpha_on"] = 2.2     # INCREASED - emphasize ON state learning
-            params["alpha_off"] = 1.5    # REDUCED - more balanced
-            params["off_margin"] = 0.008
-            # Gate parameters - less suppressive
-            params["gate_soft_scale"] = 2.5
-            params["gate_floor"] = 0.01   # INCREASED floor
-            params["gate_bias"] = -4.0    # LESS negative
-
-        elif lname in ("washingmachine", "washing_machine", "washer"):
-            # WashingMachine: Previous gate saturation fixed, now tuning for balance
-            params = dict(params)
-            params["w_recall"] = 0.07
-            params["w_main"] = 0.32
-            params["w_off_fp"] = 0.32
-            params["w_global"] = 0.03
-            params["w_on_power"] = 0.08
-            params["w_energy"] = 0.18    # Strong energy weight for power regression
-            params["alpha_on"] = 1.5
-            params["alpha_off"] = 3.5
-            params["off_margin"] = 0.005
-            # Gate parameters - moderate suppression
-            params["gate_soft_scale"] = 2.0
-            params["gate_floor"] = 0.005
-            params["gate_bias"] = -4.0
-
-        elif lname == "kettle":
-            # Kettle: Was over-suppressing, need to boost gate
-            params = dict(params)
+            params["threshold"] = 0.015  # Fridge专用阈值
+            params["w_energy"] = 0.18    # 能量回归权重
             params["w_recall"] = 0.10
-            params["w_main"] = 0.32
-            params["w_off_fp"] = 0.30
-            params["w_global"] = 0.03
-            params["w_on_power"] = 0.08
-            params["w_energy"] = 0.17    # Strong energy weight for power regression
-            params["alpha_on"] = 2.2
-            params["alpha_off"] = 2.0
-            params["off_margin"] = 0.005
-            # Gate parameters - LESS aggressive to allow more detections
-            params["gate_soft_scale"] = 2.0
-            params["gate_floor"] = 0.05
-            params["gate_bias"] = -2.0
+            params["w_main"] = 0.45
+            params["w_off_fp"] = 0.35    # V4: Moderate OFF penalty
+            params["w_global"] = 0.04
+            params["w_on_power"] = 0.09
+            params["alpha_on"] = 1.8
+            params["alpha_off"] = 2.2    # V4: Moderate
+            params["off_margin"] = 0.012 # V4: Balanced margin
+            # V4: Moderate hard zero + peak learning
+            params["w_hard_zero"] = 0.05
+            params["w_peak"] = 0.25      # Enable peak learning
+            # GATE: Learnable with slight negative initial (Fridge is high-duty)
+            params["gate_soft_scale"] = 3.0
+            params["gate_floor"] = 0.005
+            params["gate_bias"] = -1.0  # Slight negative for high-duty device
+            params["lambda_gate_cls"] = 0.10  # Moderate gate supervision
 
-        elif lname == "microwave":
-            # Microwave: Sparse high power device - SHORT bursts, need aggressive ON detection
-            # Problem: Previous config was too conservative (gate_bias=-5.0, alpha_on=1.5)
-            # Result: F1=0.388, precision=0.348, recall=0.439 (both low!)
+        elif allow_manual_tuning and lname in ("dishwasher",):
+            # Dishwasher: updated for learnable gate architecture
+            # V4: Keep moderate OFF penalties - long-cycle devices need to learn complex patterns
             params = dict(params)
-            params["w_recall"] = 0.15    # INCREASED - need more recall for sparse events
-            params["w_main"] = 0.28
-            params["w_off_fp"] = 0.25    # REDUCED - was too aggressive on false positives
+            params["threshold"] = 0.012  # Dishwasher专用阈值
+            params["w_energy"] = 0.16    # 能量回归权重
+            params["w_recall"] = 0.08
+            params["w_main"] = 0.42
+            params["w_off_fp"] = 0.40    # V4: Restored moderate OFF penalty
             params["w_global"] = 0.03
-            params["w_on_power"] = 0.12  # INCREASED - better power accuracy for peaks
-            params["w_energy"] = 0.17
-            params["alpha_on"] = 3.0     # INCREASED - strongly emphasize ON state learning
-            params["alpha_off"] = 1.5    # REDUCED - less penalty for OFF false positives
-            params["off_margin"] = 0.005
-            # Gate parameters - LESS conservative to detect short peaks
-            params["gate_soft_scale"] = 2.0   # Softer decision boundary
-            params["gate_floor"] = 0.03       # HIGHER floor - don't over-suppress
-            params["gate_bias"] = -2.0        # LESS negative - allow more ON predictions
+            params["w_on_power"] = 0.09
+            params["alpha_on"] = 1.6
+            params["alpha_off"] = 2.5    # V4: Restored
+            params["off_margin"] = 0.008 # V4: Restored original margin
+            # V4: Light hard zero + peak learning
+            params["w_hard_zero"] = 0.05
+            params["w_peak"] = 0.28      # Enable peak learning
+            # GATE: Learnable with slight negative initial (long-cycle device)
+            params["gate_soft_scale"] = 3.0
+            params["gate_floor"] = 0.005
+            params["gate_bias"] = -0.5  # Slight negative for long-cycle
+            params["lambda_gate_cls"] = 0.12  # Moderate gate supervision
+
+        elif allow_manual_tuning and lname in ("washingmachine", "washing_machine", "washer"):
+            # WashingMachine: updated for learnable gate architecture
+            # V4: Keep moderate OFF penalties - long-cycle devices need to learn complex patterns
+            params = dict(params)
+            params["threshold"] = 0.010  # WashingMachine专用阈值
+            params["w_energy"] = 0.15    # 能量回归权重
+            params["w_recall"] = 0.08
+            params["w_main"] = 0.38
+            params["w_off_fp"] = 0.42    # V4: Restored moderate OFF penalty
+            params["w_global"] = 0.03
+            params["w_on_power"] = 0.11
+            params["alpha_on"] = 1.5
+            params["alpha_off"] = 3.5    # V4: Restored
+            params["off_margin"] = 0.005 # V4: Restored original margin
+            # V4: Light hard zero + peak learning
+            params["w_hard_zero"] = 0.06
+            params["w_peak"] = 0.30      # Enable peak learning
+            # GATE: Learnable with slight negative initial (sparse long-cycle)
+            params["gate_soft_scale"] = 2.5  # Sharper decision
+            params["gate_floor"] = 0.005
+            params["gate_bias"] = -0.5  # Slight negative for sparse device
+            params["lambda_gate_cls"] = 0.12  # Moderate gate supervision
+
+        elif allow_manual_tuning and lname == "kettle":
+            # Kettle: ULTRA-SPARSE device (~0.8% duty cycle)
+            # === V9: STRICT OFF + PEAK LEARNING mode ===
+            # V8 had too many false positives during OFF periods
+            # V9: Much stronger OFF penalties + better peak learning
+            params = dict(params)
+            params["threshold"] = 0.008  # Kettle专用阈值
+            # === V9: STRICT OFF mode ===
+            params["w_recall"] = 0.42  # Slightly reduced recall pressure
+            params["w_main"] = 0.30    # Strong main regression loss
+            params["w_global"] = 0.02
+            params["w_off_fp"] = 0.15  # V9: MUCH higher OFF penalty (was 0.05)
+            params["w_on_power"] = 0.30  # Strong power accuracy
+            params["off_margin"] = 0.015  # V9: Tighter margin (was 0.025)
+            params["recall_coef_override"] = 1.0  # Keep FULL amplitude
+            # ALPHA: Stronger OFF suppression
+            params["alpha_on"] = 5.5   # Slightly reduced
+            params["alpha_off"] = 1.5  # V9: MUCH higher (was 0.8)
+            # GATE: Keep positive bias but frozen
+            params["gate_soft_scale"] = 2.5  # Slightly sharper
+            params["gate_floor"] = 0.015  # V9: Lower floor (was 0.02)
+            params["gate_bias"] = 1.0  # Keep positive bias
+            params["gate_bias_frozen"] = True  # FREEZE gate_bias!
+            # Gate classification loss
+            params["lambda_gate_cls"] = 0.40  # Increased gate supervision
+            # V9: MUCH stronger suppression losses
+            params["w_bg_suppress"] = 0.08  # V9: Increased (was 0.03)
+            params["w_hard_zero"] = 0.15    # V9: MUCH higher (was 0.05)
+            params["_explicit_gate_params"] = True
+            params["w_peak"] = 0.45  # V9: Higher for peak learning (was 0.30)
+            params["w_grad"] = 0.03  # Gradient smoothness
+            params["w_energy"] = 0.15
+            params["w_edge"] = 0.15  # Increased edge detection
+            params["w_event"] = 0.30  # Event-level loss
+            # Keep amplitude matching
+            params["w_amplitude"] = 0.40  # Strong amplitude matching
+            # FOCAL LOSS - more balanced
+            params["focal_gamma"] = 2.0
+            params["focal_alpha"] = 0.75  # V9: More balanced (was 0.80)
+            params["w_bce"] = 0.25
+            import logging
+            logging.info("[KETTLE_V9] STRICT_OFF+PEAK: w_off_fp=%.2f, w_hard_zero=%.2f, alpha_off=%.1f, w_peak=%.2f",
+                        params["w_off_fp"], params["w_hard_zero"], params["alpha_off"], params["w_peak"])
+
+        # Microwave: V31 - STRICT OFF + PEAK LEARNING mode
+        # V30 fixed collapse but still has false positives during OFF
+        # V31: Add stronger OFF penalties while keeping recall
+        elif allow_manual_tuning and lname == "microwave":
+            params = dict(params)
+            params["threshold"] = 0.008  # Microwave专用阈值
+            # === V31: STRICT OFF + PEAK LEARNING mode ===
+            params["loss_weight_multiplier"] = 2.5  # 2.5x weight vs kettle
+            params["gate_logits_floor"] = -1.5  # Clamp gate_logits >= -1.5
+            params["w_recall"] = 0.45  # Moderate recall pressure
+            params["w_main"] = 0.30    # Strong main regression
+            params["w_global"] = 0.02
+            params["w_off_fp"] = 0.08  # V31: Increased OFF penalty (was 0.015)
+            params["w_on_power"] = 0.32  # Strong power accuracy
+            params["off_margin"] = 0.020  # V31: Tighter margin (was 0.035)
+            params["recall_coef_override"] = 1.0  # Keep FULL amplitude
+            # ALPHA: More balanced
+            params["alpha_on"] = 7.0   # Reduced from 9.0
+            params["alpha_off"] = 0.8  # V31: Higher OFF (was 0.35)
+            # GATE: Strong positive bias - FROZEN + FLOOR
+            params["gate_soft_scale"] = 2.0  # Softer for gradients
+            params["gate_floor"] = 0.025  # V31: Lower floor (was 0.03)
+            params["gate_bias"] = 1.5  # Strong positive bias
+            params["gate_bias_frozen"] = True  # Keep frozen
+            # Gate classification loss
+            params["lambda_gate_cls"] = 0.40  # Strong gate supervision
+            # V31: Increased suppression losses
+            params["w_bg_suppress"] = 0.04  # V31: Higher (was 0.008)
+            params["w_hard_zero"] = 0.08    # V31: MUCH higher (was 0.012)
+            params["_explicit_gate_params"] = True
+            params["w_peak"] = 0.50  # V31: Higher for peak learning (was 0.42)
+            params["w_energy"] = 0.15
+            params["w_edge"] = 0.15  # V31: Higher edge detection
+            params["w_event"] = 0.35  # Event-level loss
+            # Keep amplitude matching
+            params["w_amplitude"] = 0.50  # Strong
+            # FOCAL LOSS - more balanced
+            params["focal_gamma"] = 2.5  # V31: Reduced (was 3.0)
+            params["focal_alpha"] = 0.88  # V31: More balanced (was 0.92)
+            # BCE
+            params["w_bce"] = 0.28  # Moderate
+            import logging
+            logging.info("[MICROWAVE_V31] STRICT_OFF+PEAK: w_off_fp=%.2f, w_hard_zero=%.2f, alpha_off=%.1f, w_peak=%.2f",
+                        params["w_off_fp"], params["w_hard_zero"], params["alpha_off"], params["w_peak"])
+
+        # Only apply global gate config_overrides if no explicit device params were set
+        if not params.get("_explicit_gate_params", False):
+            gate_soft_scale_override = self.config_overrides.get("gate_soft_scale")
+            if gate_soft_scale_override is not None:
+                params["gate_soft_scale"] = float(gate_soft_scale_override)
+            gate_floor_override = self.config_overrides.get("gate_floor")
+            if gate_floor_override is not None:
+                params["gate_floor"] = float(gate_floor_override)
+            gate_bias_override = self.config_overrides.get("gate_bias")
+            if gate_bias_override is not None:
+                params["gate_bias"] = float(gate_bias_override)
+
+        extra_params = stats.get("loss_params") if isinstance(stats, dict) else None
+        if isinstance(extra_params, dict) and extra_params:
+            params = dict(params)
+            params.update(extra_params)
 
         return device_type, params
 
@@ -393,7 +681,7 @@ class AdaptiveDeviceLoss(nn.Module):
 
         return params
 
-    def _compute_device_weight(self, device_type: str, duty_cycle: float) -> float:
+    def _compute_device_weight(self, device_type: str, duty_cycle: float, mean_on: float, params: dict = None) -> float:
         """
         Compute loss weight for a device based on its type and duty cycle.
 
@@ -404,43 +692,154 @@ class AdaptiveDeviceLoss(nn.Module):
         - Sparse devices get MODERATE weights (not too high to avoid dominating)
         - Focus on better loss function design rather than weight boosting
         - More balanced weights across all device types
+        - V29: Support loss_weight_multiplier in params for fine-grained control
 
         Args:
             device_type: Classification of device behavior
             duty_cycle: Fraction of time device is ON (0-1)
+            params: Optional device params dict with loss_weight_multiplier
 
         Returns:
             Weight multiplier for this device's loss
         """
-        # Base weights by device type - more balanced now
+        # V3: AGGRESSIVE weights for sparse devices to prevent gradient drowning
+        # in multi-device training. Sparse devices need MUCH stronger gradients
+        # to compete with frequent devices like Fridge.
+        # Problem: Kettle/Microwave collapse in multi-device training despite PCGrad
+        # Solution: Give sparse devices 5-10x weight advantage
         base_weights = {
-            self.SPARSE_HIGH_POWER: 1.2,  # Reduced from 2.0 - rely on loss design instead
-            self.LONG_CYCLE: 1.1,         # Reduced from 1.5
-            self.CYCLING: 1.0,            # Fridge - standard
-            self.ALWAYS_ON: 0.9,          # Always on - slightly lower
+            self.SPARSE_HIGH_POWER: 3.0,  # INCREASED from 1.5 - aggressive for sparse
+            self.LONG_CYCLE: 1.3,         # INCREASED from 1.2
+            self.CYCLING: 1.0,
+            self.ALWAYS_ON: 0.8,          # DECREASED to give more relative weight to sparse
         }
         base = base_weights.get(device_type, 1.0)
 
-        # Duty cycle adjustment: more moderate now
-        # Very sparse devices no longer get extreme weights
+        if not math.isfinite(mean_on) or mean_on <= 0:
+            mean_on = 1.0
+        # V3: AGGRESSIVE duty factors for very sparse devices
         if duty_cycle < 0.01:
-            duty_factor = 1.3  # Reduced from 2.0 - prevent over-weighting
+            duty_factor = 2.5  # INCREASED from 1.5 - ultra-sparse needs MUCH more weight
         elif duty_cycle < 0.05:
-            duty_factor = 1.2  # Reduced from 1.5
+            duty_factor = 1.8  # INCREASED from 1.3
         elif duty_cycle < 0.15:
-            duty_factor = 1.1  # Reduced from 1.2
+            duty_factor = 1.1
         elif duty_cycle > 0.5:
-            duty_factor = 0.9  # Slight reduction for high duty
+            duty_factor = 0.9
         else:
-            duty_factor = 1.0  # Normal
+            duty_factor = 1.0
 
-        return base * duty_factor
+        weight = base * duty_factor
+
+        # V29: Apply optional loss_weight_multiplier from params
+        if params is not None:
+            multiplier = float(params.get("loss_weight_multiplier", 1.0))
+            weight = weight * multiplier
+
+        return weight
 
     def set_epoch(self, epoch: int):
         """Set current epoch for warmup scheduling."""
         self.current_epoch = int(epoch)
 
-    def _compute_cycling_loss(self, pred, target, params):
+    def _get_device_type(self, device_name: str) -> str:
+        """
+        Return device type category based on device name.
+
+        Categories:
+        - sparse_high_power: Short, high-power bursts with ultra-low duty cycle
+          (Kettle, Microwave, Toaster)
+        - cycling_low_power: Periodic cycling with moderate duty cycle
+          (Fridge, Freezer, Refrigerator)
+        - long_cycle: Long operation cycles
+          (Washing Machine, Dishwasher, Dryer)
+        - unknown: Default category
+
+        Args:
+            device_name: Name of the device
+
+        Returns:
+            Device type category string
+        """
+        name_lower = device_name.lower()
+
+        sparse_high_power = ["kettle", "microwave", "toaster"]
+        cycling_low_power = ["fridge", "freezer", "refrigerator", "fridge_freezer"]
+        long_cycle = ["washing_machine", "washingmachine", "washer", "dishwasher", "dryer"]
+
+        if any(s in name_lower for s in sparse_high_power):
+            return "sparse_high_power"
+        elif any(s in name_lower for s in cycling_low_power):
+            return "cycling_low_power"
+        elif any(s in name_lower for s in long_cycle):
+            return "long_cycle"
+        else:
+            return "unknown"
+
+    def _get_epoch_adjusted_params(self, params: dict, epoch: int, total_epochs: int = 25, device_name: str = None) -> dict:
+        """
+        Adjust loss parameters based on training epoch for curriculum learning.
+
+        STRATEGY (v5): Device-type-aware three-phase curriculum
+        - cycling_low_power devices (Fridge): NO curriculum - keep stable parameters
+          Reason: Fridge already has good F1, curriculum caused regression
+        - sparse_high_power devices (Kettle, Microwave): Full curriculum
+          - Phase 1 (epoch < 8): Detection priority - higher recall, lower FP penalty
+          - Phase 2 (8 <= epoch < 16): Balanced - use original parameters
+          - Phase 3 (epoch >= 16): Precision priority - lower recall, higher FP penalty
+        - Other devices: Default curriculum (same as sparse_high_power)
+
+        Args:
+            params: Original device-specific parameters
+            epoch: Current epoch number
+            total_epochs: Total training epochs (default 25)
+            device_name: Name of the device (optional, for device-type-aware adjustment)
+
+        Returns:
+            Adjusted parameters dict (copy, does not modify original)
+        """
+        # Make a copy to avoid modifying original
+        adjusted = dict(params)
+
+        # Check device type for device-specific curriculum strategy
+        if device_name:
+            device_type = self._get_device_type(device_name)
+            name_lower = device_name.lower()
+
+            # cycling_low_power devices (Fridge): NO curriculum learning
+            # LESSON LEARNED: Curriculum learning caused Fridge F1 to drop from 0.752 to 0.0
+            # because early-phase recall boost led to over-activation
+            if device_type == "cycling_low_power":
+                return adjusted  # Return original params without modification
+
+            # Microwave: Also skip curriculum learning
+            # LESSON LEARNED (v12): Microwave is extremely sensitive to parameter changes
+            # Even with v89bb189 parameters restored, curriculum causes collapse
+            if "microwave" in name_lower:
+                return adjusted  # Return original params without modification
+
+        # Get current values
+        w_recall = float(adjusted.get("w_recall", 0.1))
+        w_off_fp = float(adjusted.get("w_off_fp", 0.1))
+
+        # Apply curriculum only for sparse_high_power and other devices
+        if epoch < 8:
+            # Phase 1: Detection priority
+            # Increase recall weight, decrease FP penalty
+            adjusted["w_recall"] = w_recall * 1.3
+            adjusted["w_off_fp"] = w_off_fp * 0.5
+        elif epoch < 16:
+            # Phase 2: Balanced (use original params)
+            pass
+        else:
+            # Phase 3: Precision priority
+            # Decrease recall weight, increase FP penalty
+            adjusted["w_recall"] = w_recall * 0.8
+            adjusted["w_off_fp"] = w_off_fp * 1.3
+
+        return adjusted
+
+    def _compute_cycling_loss(self, pred, target, params, device_name: str = None, device_idx: int = 0):
         """
         Per-device loss with independent optimization.
 
@@ -454,40 +853,258 @@ class AdaptiveDeviceLoss(nn.Module):
         3. ON recall loss (prevents collapse to zero)
         4. OFF false positive loss (prevents over-prediction) - for TECA/precision
         5. ON power accuracy loss (relative error) - for NDE improvement
+        6. Binary classification loss for sparse devices (hard gating training)
+
+        CRITICAL FIX for sparse devices: Add explicit binary classification loss
+        to train the gate head separately from power regression.
+
+        Args:
+            pred: Predicted power values
+            target: Target power values
+            params: Device-specific loss parameters
+            device_name: Name of the device (optional, for device-type-aware recall_coef)
+            device_idx: Index of the device (for learnable parameters)
         """
         eps = 1e-6
-        threshold = params["threshold"]
-        alpha_on = params["alpha_on"]
-        alpha_off = params["alpha_off"]
+
+        # Use LEARNABLE parameters instead of fixed params
+        # This allows the model to learn optimal ON/OFF weighting per device
+        alpha_on, alpha_off = self.get_learnable_alpha(device_idx)
+        threshold = self.get_learnable_threshold(device_idx)
+
+        # For backward compatibility, also read from params as fallback reference
+        # (used for other parameters like w_recall, w_off_fp, etc.)
+        _ = params.get("threshold", 0.01)  # Not used, kept for reference
+        _ = params.get("alpha_on", 2.0)    # Not used, kept for reference
+        _ = params.get("alpha_off", 2.0)   # Not used, kept for reference
 
         # Soft weights for smooth gradients
         soft_temp = max(threshold * 2.0, 0.02)
         p_on = torch.sigmoid((target - threshold) / soft_temp)
         p_off = 1.0 - p_on
 
-        # === Component 1: Main regression loss ===
+        # === Component 1: Main regression loss (with optional Focal Loss) ===
         point_loss = self.base_loss(pred, target)
-        loss_on = (point_loss * p_on).sum() / (p_on.sum() + eps)
-        loss_off = (point_loss * p_off).sum() / (p_off.sum() + eps)
+
+        # FOCAL LOSS: Down-weight easy samples, focus on hard samples
+        # Key for ultra-sparse devices like Kettle/Microwave
+        # NOW LEARNABLE: focal_gamma and focal_alpha are nn.Parameter
+        focal_gamma, focal_alpha = self.get_learnable_focal_params(device_idx)
+
+        # Use focal loss when gamma > small threshold (0.1) to allow gradient flow
+        if focal_gamma > 0.1:
+            # Compute prediction "confidence" for ON/OFF classification
+            # pred_prob = P(prediction thinks this is ON)
+            pred_prob = torch.sigmoid((pred - threshold) / soft_temp)
+
+            # For ON samples: p_t = pred_prob (correct if high)
+            # For OFF samples: p_t = 1 - pred_prob (correct if high)
+            # Using soft weights p_on/p_off for smooth gradients
+            p_t = pred_prob * p_on + (1.0 - pred_prob) * p_off
+
+            # Focal weight: (1 - p_t)^gamma
+            # - Easy samples (high p_t): low weight
+            # - Hard samples (low p_t): high weight
+            focal_weight = torch.pow(1.0 - p_t + eps, focal_gamma)
+
+            # Class balance: alpha for ON, (1-alpha) for OFF
+            # This further emphasizes the rare ON class
+            alpha_t = focal_alpha * p_on + (1.0 - focal_alpha) * p_off
+
+            # Apply focal weighting to point loss
+            focal_point_loss = alpha_t * focal_weight * point_loss
+
+            # Compute weighted losses
+            loss_on = (focal_point_loss * p_on).sum() / (p_on.sum() + eps)
+            loss_off = (focal_point_loss * p_off).sum() / (p_off.sum() + eps)
+        else:
+            # Standard loss without focal weighting
+            loss_on = (point_loss * p_on).sum() / (p_on.sum() + eps)
+            loss_off = (point_loss * p_off).sum() / (p_off.sum() + eps)
+
         loss_main = alpha_on * loss_on + alpha_off * loss_off
 
         # === Component 2: Global stability loss ===
         loss_global = point_loss.mean()
 
         # === Component 3: ON recall loss ===
-        # For sparse devices (high w_recall), use stronger recall pressure
-        # This helps detect short peaks that are easily missed
+        # IMPROVED: Device-type-aware recall pressure (v5)
         w_recall = float(params.get("w_recall", 0.1))
-        # recall_coef scales from 0.15 (w_recall=0) to 0.50 (w_recall=0.2)
-        recall_coef = 0.15 + 1.5 * w_recall  # Range: 0.15-0.45 for w_recall 0-0.2
+
+        # Compute actual duty cycle from this batch
+        duty_cycle = (p_on.sum() / (p_on.numel() + eps)).item()
+
+        # Device-type-aware recall_coef (v5.1)
+        # Allow per-device recall_coef_override to bypass the formula
+        recall_coef_override = params.get("recall_coef_override", None)
+        if recall_coef_override is not None:
+            # Device-specific override takes precedence
+            recall_coef = float(recall_coef_override)
+        else:
+            # LESSON LEARNED: Previous duty-cycle-only approach caused Fridge regression
+            # because Fridge (~10% duty) got same treatment as other low-activity devices,
+            # but Fridge needs conservative recall (0.05-0.20) not aggressive (0.25-0.45)
+            device_type = self._get_device_type(device_name) if device_name else "unknown"
+
+            if device_type == "cycling_low_power":
+                # CONSERVATIVE strategy for Fridge/Freezer
+                # These devices have ~10% duty cycle but need stable, low recall pressure
+                # Original Fridge F1=0.830 (v89bb189) was achieved with recall_coef ~0.11
+                # Using original formula to preserve benchmark performance
+                recall_coef = 0.10 + 0.10 * w_recall  # Range: 0.10-0.13 (matches v89bb189)
+            elif device_type == "sparse_high_power":
+                # MODERATE strategy for Kettle/Microwave (ultra-sparse, high-power)
+                # LESSON LEARNED: Previous aggressive coefficients (0.40+1.0*w_recall) caused
+                # massive false positives (Microwave P=0.003). Using balanced approach.
+                # v89bb189 used 0.10+0.10*w_recall but that caused Kettle collapse (F1=0.0)
+                # Compromise: 0.20+0.5*w_recall gives ~0.35 for Kettle, ~0.33 for Microwave
+                recall_coef = 0.20 + 0.5 * w_recall  # Range: 0.20-0.35 (compromise)
+            elif device_type == "long_cycle":
+                # MODERATE strategy for Washing Machine/Dishwasher
+                # These have long cycles with varied power patterns
+                # Slightly higher than v89bb189 (0.10+0.10*w) to help with sparse ON detection
+                recall_coef = 0.12 + 0.3 * w_recall  # Range: 0.12-0.18
+            else:
+                # DEFAULT strategy: use original v89bb189 formula
+                # This is the proven stable baseline
+                recall_coef = 0.10 + 0.10 * w_recall  # Range: 0.10-0.13
+
+        # Hard upper limit to prevent over-prediction
+        # V7: Allow recall_coef=1.0 for sparse_high_power devices
+        # CRITICAL FIX: Previous 0.70 limit caused amplitude suppression
+        # Sparse devices (kettle, microwave) need to predict FULL amplitude
+        device_type = self._get_device_type(device_name) if device_name else "unknown"
+        if device_type == "sparse_high_power":
+            recall_coef = min(recall_coef, 1.0)  # Allow full amplitude
+        else:
+            recall_coef = min(recall_coef, 0.70)
+
         on_deficit = torch.relu(recall_coef * target - pred) * p_on
         on_recall_loss = on_deficit.sum() / (p_on.sum() + eps)
 
+        # === Component 3b: AMPLITUDE MATCHING LOSS for sparse devices ===
+        # CRITICAL: Direct penalty for under-predicting peak amplitude
+        # This ensures model learns to output FULL power values, not suppressed ones
+        # Problem: recall_coef only penalizes "missing" ON, not "weak" ON
+        # Example: target=2000W, pred=500W, threshold=200W
+        #   - Both are "ON" (>threshold), so no recall penalty
+        #   - But pred is 75% too low! Metrics will still fail.
+        w_amplitude = float(params.get("w_amplitude", 0.0))
+        amplitude_loss = pred.new_tensor(0.0)
+        if w_amplitude > 0 and device_type == "sparse_high_power":
+            # Only for ON regions where we have meaningful signal
+            on_mask = (target > threshold * 2.0).float()  # Strong ON signal
+            if on_mask.sum() > 0:
+                # Relative amplitude error: (target - pred) / target
+                # Penalizes under-prediction proportionally
+                relative_deficit = torch.relu(target - pred) / (target + eps)
+                amplitude_loss = (relative_deficit * on_mask).sum() / (on_mask.sum() + eps)
+                amplitude_loss = torch.clamp(amplitude_loss, 0.0, 2.0)
+
         # === Component 4: OFF false positive loss ===
-        # RESTORED: Linear penalty is more stable
+        # V3 FIX: Two-tier penalty with squared component for large violations
+        # This ensures the model strongly suppresses predictions during OFF periods
         off_margin = float(params.get("off_margin", 0.01))
-        off_false_positive = torch.relu(pred - off_margin) * p_off
+        off_margin_hard = off_margin * 2.5  # Threshold for squared penalty
+
+        # Tier 1: Linear penalty for small violations
+        off_small_excess = torch.relu(pred - off_margin) * (pred < off_margin_hard).float() * p_off
+        # Tier 2: Squared penalty for large violations - strong suppression
+        off_large_excess = torch.relu(pred - off_margin_hard) * p_off
+        off_large_excess_sq = off_large_excess ** 2
+
+        # Combined: linear + 2x squared for large violations
+        off_false_positive = off_small_excess + 2.0 * off_large_excess_sq
         off_fp_loss = off_false_positive.sum() / (p_off.sum() + eps)
+
+        # === Component 4b: HARD ZERO LOSS for sparse devices ===
+        # Penalizes non-zero predictions when target is truly zero.
+        #
+        # V3 FIX: Two-tier penalty system:
+        # - Tier 1: Linear penalty for small violations (margin to 2x margin)
+        # - Tier 2: Squared penalty for large violations (> 2x margin)
+        # This forces the model to output ZERO when target is zero, not small non-zero values.
+        w_hard_zero = float(params.get("w_hard_zero", 0.0))
+        hard_zero_loss = pred.new_tensor(0.0)
+        if w_hard_zero > 0:
+            # Mask for truly zero regions - V3: stricter threshold (0.05 instead of 0.1)
+            true_zero_mask = (target < threshold * 0.05).float()
+            # V3: TIGHTER margin (0.08 instead of 0.15) - less tolerance for OFF noise
+            margin = threshold * 0.08
+            margin_2x = margin * 2.0
+
+            # Tier 1: Linear penalty for small excess (margin to 2x margin)
+            small_excess = torch.relu(pred - margin) * (pred < margin_2x).float()
+            # Tier 2: Squared penalty for large excess (> 2x margin) - STRONG suppression
+            large_excess = torch.relu(pred - margin_2x)
+            large_excess_sq = large_excess ** 2
+
+            # Combined penalty with stronger weight on large violations
+            non_zero_penalty = (small_excess + 3.0 * large_excess_sq) * true_zero_mask
+            hard_zero_loss = non_zero_penalty.sum() / (true_zero_mask.sum() + eps)
+            hard_zero_loss = torch.clamp(hard_zero_loss, 0.0, 5.0)  # Higher clamp
+
+        # === Component 4c: BINARY CLASSIFICATION LOSS (BCE) for classification_first mode ===
+        # RESEARCH INSIGHT: "For on/off detection, classification outperforms regression."
+        # This directly trains the model to classify ON/OFF states.
+        #
+        # LESSON LEARNED (v2): Previous implementation with sharp sigmoid (8.0) and
+        # high weight caused gradient issues. Now using softer sigmoid and
+        # RECALL-FOCUSED asymmetric weighting.
+        w_bce = float(params.get("w_bce", 0.0))
+        bce_loss = pred.new_tensor(0.0)
+        if w_bce > 0:
+            # Binary target: 1 for ON, 0 for OFF
+            binary_target = (target > threshold).float()
+
+            # Predicted probability: normalize using threshold (more stable than target.max())
+            # SOFTER sigmoid for better gradient flow early in training
+            pred_scaled = pred / (threshold * 2.0 + eps)  # Normalize relative to threshold
+            pred_prob = torch.sigmoid((pred_scaled - 0.5) * 4.0)  # Softer sigmoid (was 8.0)
+            pred_prob = torch.clamp(pred_prob, 0.01, 0.99)  # Prevent log(0)
+
+            # RECALL-FOCUSED asymmetric weighting
+            # For sparse devices: FALSE NEGATIVES (missing ON) are MUCH worse than FALSE POSITIVES
+            # Reason: In 99% OFF dataset, model easily achieves high precision by always predicting OFF
+            # But recall suffers badly. We need to STRONGLY encourage ON predictions.
+            pos_ratio = p_on.mean()
+            neg_ratio = 1.0 - pos_ratio
+
+            # Base class weights for imbalance
+            # LESSON LEARNED (v4): Previous cap of 50.0 caused weight explosion
+            # For duty=0.7%, base_pos_weight = 0.993/0.007 = 142, clamped to 50
+            # Combined with fn_boost=2.0, effective weight = 100, causing severe FP
+            base_pos_weight = neg_ratio / (pos_ratio + eps)
+            base_pos_weight = torch.clamp(base_pos_weight, 1.0, 25.0)  # REDUCED (was 50.0)
+
+            # ASYMMETRIC BOOST: Extra penalty for missing ON events (false negatives)
+            # REDUCED to prevent over-activation for sparse devices
+            fn_boost = 1.3 if pos_ratio < 0.01 else 1.6  # REDUCED (was 2.0)
+
+            # BCE loss with asymmetric weighting
+            # -[fn_boost * pos_weight * y * log(p) + (1-y) * log(1-p)]
+            bce_fn = -fn_boost * base_pos_weight * binary_target * torch.log(pred_prob + eps)
+            bce_fp = -(1.0 - binary_target) * torch.log(1.0 - pred_prob + eps)
+            bce = bce_fn + bce_fp
+            bce_loss = bce.mean()
+            bce_loss = torch.clamp(bce_loss, 0.0, 5.0)
+
+        # === Component 4d: Background Suppression Loss ===
+        # Penalizes constant high predictions in OFF regions.
+        # NOTE: This helps reduce "constant background" artifacts but cannot fully
+        # fix them due to architectural limitations (fixed positive gate_bias).
+        # A proper fix would require making gate_bias learnable.
+        w_bg_suppress = float(params.get("w_bg_suppress", 0.0))
+        bg_suppress_loss = pred.new_tensor(0.0)
+        if w_bg_suppress > 0:
+            # Mask for truly OFF regions (well below threshold)
+            off_mask = (target < threshold * 0.1).float()
+            if off_mask.sum() > 10:
+                # Compute mean prediction in OFF regions
+                off_pred = pred * off_mask
+                off_mean = off_pred.sum() / (off_mask.sum() + eps)
+                # Penalize OFF-region mean prediction relative to threshold
+                bg_suppress_loss = torch.clamp(off_mean / threshold, 0.0, 2.0)
 
         # === Component 5: ON power accuracy (relative error for NDE) ===
         # Penalize relative error on ON samples - directly improves NDE
@@ -513,19 +1130,185 @@ class AdaptiveDeviceLoss(nn.Module):
         # Clamp to prevent extreme values
         energy_loss = torch.clamp(energy_loss, 0.0, 2.0)
 
-        # Get weights from params
-        w_main = float(params.get("w_main", 0.7))
-        w_global = float(params.get("w_global", 0.1))
-        w_off_fp = float(params.get("w_off_fp", 0.1))
-        w_on_power = float(params.get("w_on_power", 0.03))  # ON power accuracy weight
-        w_energy = float(params.get("w_energy", 0.1))  # Energy regression weight
+        # === Component 7: Peak-aware loss (for capturing power spikes) ===
+        # Especially important for Fridge compressor start-up peaks
+        # Penalize underestimation of local peaks more heavily
+        # Get LEARNABLE regression weights (w_energy, w_on_power, w_peak, w_grad, w_range)
+        w_energy, w_on_power, w_peak, w_grad, w_range = self.get_learnable_regression_weights(device_idx)
+        peak_loss = pred.new_tensor(0.0)
+        if w_peak.item() > 0.001 and target.shape[-1] >= 3:
+            # Find local maxima in target using a simple rolling window approach
+            # Compare each point with its neighbors
+            target_padded = torch.nn.functional.pad(target, (1, 1), mode='replicate')
+            target_left = target_padded[..., :-2]
+            target_right = target_padded[..., 2:]
+            target_center = target
+            # V2: LOWERED peak detection threshold from 1.5 to 0.8 * threshold
+            # This catches more peaks and forces the model to learn sharp transients
+            is_peak = ((target_center >= target_left) & (target_center >= target_right) &
+                       (target_center > threshold * 0.8)).float()
 
-        total = (w_main * loss_main +
-                 w_global * loss_global +
-                 w_recall * on_recall_loss +
-                 w_off_fp * off_fp_loss +
-                 w_on_power * on_power_loss +
-                 w_energy * energy_loss)
+            if is_peak.sum() > 0:
+                # V2: STRONGER peak underestimation penalty
+                # Use relative error: (target - pred) / target for scale-invariant penalty
+                peak_underest_rel = torch.relu(target - pred) / (target + eps) * is_peak
+                # Also penalize large overestimation (pred > target * 1.3) - tighter bound
+                peak_overest = torch.relu(pred - target * 1.3) * is_peak
+                # V2: 2x weight on underestimation to encourage learning peaks
+                peak_loss = (2.0 * peak_underest_rel.sum() + 0.3 * peak_overest.sum()) / (is_peak.sum() + eps)
+                peak_loss = torch.clamp(peak_loss, 0.0, 3.0)  # Higher clamp for stronger signal
+
+        # === Component 8: Gradient smoothness loss (temporal consistency) ===
+        # Penalize difference in gradients between pred and target
+        # This helps predictions follow the actual power change trends
+        # w_grad already obtained from get_learnable_regression_weights above
+        grad_loss = pred.new_tensor(0.0)
+        if w_grad.item() > 0.001 and target.shape[-1] >= 2:
+            # Compute temporal gradients (first differences)
+            pred_grad = pred[..., 1:] - pred[..., :-1]
+            target_grad = target[..., 1:] - target[..., :-1]
+            # L1 loss on gradient differences
+            grad_diff = torch.abs(pred_grad - target_grad)
+            grad_loss = grad_diff.mean()
+            grad_loss = torch.clamp(grad_loss, 0.0, 2.0)
+
+        # === Component 9: Power range constraint loss ===
+        # Penalize predictions that exceed reasonable power bounds
+        # This prevents over-prediction especially for sparse devices
+        # w_range already obtained from get_learnable_regression_weights above
+        range_loss = pred.new_tensor(0.0)
+        if w_range.item() > 0.001:
+            # Get target max as reference for reasonable power range
+            target_max = target.max()
+            # Penalize predictions exceeding 1.3x target max
+            over_range = torch.relu(pred - target_max * 1.3)
+            # Also penalize negative predictions (should be non-negative)
+            under_range = torch.relu(-pred)
+            range_loss = (over_range.mean() + under_range.mean())
+            range_loss = torch.clamp(range_loss, 0.0, 2.0)
+
+        # === Component 10: Edge detection loss (transition detection) ===
+        # IMPORTANT for sparse devices: penalize missing ON/OFF transitions
+        # This helps catch the exact timing of Kettle/Microwave switching events
+        w_edge = float(params.get("w_edge", 0.0))
+        edge_loss = pred.new_tensor(0.0)
+        if w_edge > 0 and target.shape[-1] >= 3:
+            # Find state transitions in target
+            target_diff = torch.abs(target[..., 1:] - target[..., :-1])
+            # Transition threshold: significant change relative to threshold
+            transition_thresh = threshold * 0.5
+            is_transition = (target_diff > transition_thresh).float()
+
+            if is_transition.sum() > 0:
+                # Pred should also have similar transitions at same locations
+                pred_diff = torch.abs(pred[..., 1:] - pred[..., :-1])
+                # Penalize missing transitions (pred should change when target changes)
+                transition_error = torch.abs(pred_diff - target_diff) * is_transition
+                edge_loss = transition_error.sum() / (is_transition.sum() + eps)
+                edge_loss = torch.clamp(edge_loss, 0.0, 2.0)
+
+        # === Component 11: EVENT-LEVEL LOSS (for sparse devices) ===
+        # Instead of point-wise loss, this computes loss per EVENT (ON period)
+        # CRITICAL for ultra-sparse devices: each event gets equal weight regardless of duration
+        # This prevents the model from ignoring short, rare events
+        w_event = float(params.get("w_event", 0.0))
+        event_loss = pred.new_tensor(0.0)
+        if w_event > 0 and target.shape[-1] >= 5:
+            # Detect events: ON periods in target
+            target_on = (target > threshold).float()
+            # Find event boundaries using diff
+            # diff > 0 = start of event, diff < 0 = end of event
+            target_diff = target_on[..., 1:] - target_on[..., :-1]
+
+            # For each batch sample, find and process events
+            batch_event_losses = []
+            for b in range(target.shape[0]):
+                t_diff = target_diff[b].squeeze()
+                starts = (t_diff > 0.5).nonzero(as_tuple=True)[0]
+                ends = (t_diff < -0.5).nonzero(as_tuple=True)[0]
+
+                if len(starts) == 0 or len(ends) == 0:
+                    continue
+
+                # Match starts with ends (event = start to end)
+                event_losses = []
+                for start_idx in starts:
+                    # Find first end after this start
+                    valid_ends = ends[ends > start_idx]
+                    if len(valid_ends) == 0:
+                        end_idx = target.shape[-1] - 1
+                    else:
+                        end_idx = valid_ends[0].item() + 1  # +1 because diff is shifted
+
+                    start_idx = start_idx.item() + 1  # +1 because diff is shifted
+
+                    if end_idx <= start_idx:
+                        continue
+
+                    # Extract event segment
+                    target_event = target[b, :, start_idx:end_idx]
+                    pred_event = pred[b, :, start_idx:end_idx]
+
+                    # Event energy: sum of power over duration
+                    target_energy = target_event.sum()
+                    pred_energy = pred_event.sum()
+
+                    # Event detection: did we predict this event?
+                    pred_on = (pred_event > threshold).float()
+                    detection_rate = pred_on.mean()  # 0-1
+
+                    # Event loss = energy error + detection penalty
+                    energy_error = torch.abs(pred_energy - target_energy) / (target_energy + eps)
+                    detection_penalty = 1.0 - detection_rate  # Penalize missed detection
+
+                    # Combine: prioritize detection for sparse devices
+                    event_loss_i = 0.3 * energy_error + 0.7 * detection_penalty
+                    event_losses.append(event_loss_i)
+
+                if event_losses:
+                    batch_event_losses.append(torch.stack(event_losses).mean())
+
+            if batch_event_losses:
+                event_loss = torch.stack(batch_event_losses).mean()
+                event_loss = torch.clamp(event_loss, 0.0, 2.0)
+
+        # Get base weights from params (used as scaling factors)
+        # NOTE: w_energy, w_on_power, w_peak, w_grad, w_range are now LEARNABLE
+        # (obtained from get_learnable_regression_weights above)
+        w_main_base = float(params.get("w_main", 0.7))
+        w_global_base = float(params.get("w_global", 0.1))
+        w_off_fp_base = float(params.get("w_off_fp", 0.1))
+
+        # UNCERTAINTY WEIGHTING: Get learnable precision weights
+        # This automatically balances losses based on learned uncertainty
+        # weights[i] = exp(-log_var[i]) = 1/σ², regularization = 0.5 * Σlog_var
+        uw, uw_reg = self.get_loss_weights(device_idx)
+
+        # Loss component indices:
+        # 0:main, 1:global, 2:recall, 3:off_fp, 4:on_power, 5:energy
+        # 6:peak, 7:grad, 8:range, 9:edge, 10:hard_zero, 11:bce, 12:bg_suppress, 13:event, 14:amplitude
+
+        # Combine base weights with uncertainty weights
+        # Base weights set relative importance, uncertainty weights fine-tune
+        # NOTE: w_on_power, w_energy, w_peak, w_grad, w_range are LEARNABLE
+        total = (w_main_base * uw[0] * loss_main +
+                 w_global_base * uw[1] * loss_global +
+                 w_recall * uw[2] * on_recall_loss +
+                 w_off_fp_base * uw[3] * off_fp_loss +
+                 w_on_power * uw[4] * on_power_loss +
+                 w_energy * uw[5] * energy_loss +
+                 w_peak * uw[6] * peak_loss +
+                 w_grad * uw[7] * grad_loss +
+                 w_range * uw[8] * range_loss +
+                 w_edge * uw[9] * edge_loss +
+                 w_hard_zero * uw[10] * hard_zero_loss +
+                 w_bce * uw[11] * bce_loss +
+                 w_bg_suppress * uw[12] * bg_suppress_loss +
+                 w_event * uw[13] * event_loss +
+                 w_amplitude * uw[14] * amplitude_loss)
+
+        # Add uncertainty regularization (encourages learning appropriate uncertainty)
+        total = total + 0.01 * uw_reg  # Small weight for regularization
 
         return total
 
@@ -570,9 +1353,19 @@ class AdaptiveDeviceLoss(nn.Module):
             t_c = target[:, c:c+1, :]
 
             params = self.device_params[c]
+            device_name = self.device_names[c] if c < len(self.device_names) else None
+
+            # Apply epoch-adjusted parameters for curriculum learning
+            # This adjusts recall/precision balance based on training phase
+            # Device-type-aware: cycling_low_power devices skip curriculum
+            adjusted_params = self._get_epoch_adjusted_params(
+                params, self.current_epoch, device_name=device_name
+            )
 
             # Apply unified stable loss structure with device-specific parameters
-            device_loss = self._compute_cycling_loss(p_c, t_c, params)
+            # Device-type-aware: recall_coef varies by device type
+            # Pass device_idx for learnable parameters
+            device_loss = self._compute_cycling_loss(p_c, t_c, adjusted_params, device_name=device_name, device_idx=c)
 
             # Numerical stability
             device_loss = torch.nan_to_num(device_loss, nan=1.0, posinf=10.0, neginf=0.0)
@@ -689,6 +1482,239 @@ class SeqToSeqLightningModule(pl.LightningModule):
         self.best_model_state_dict = None
         self.loss_train_history = []
         self.loss_valid_history = []
+
+        # Gradient conflict resolution configuration
+        # Will be set via set_gradient_conflict_config() or from expes_config
+        self._use_gradient_conflict_resolution = False
+        self._gradient_resolver = None
+
+        # Gradient isolation configuration
+        # Completely separates device heads so gradients don't interfere
+        self._use_gradient_isolation = False
+        self._isolation_backbone_training = "frozen"
+        self._isolated_devices = []
+        self._device_param_groups = None
+
+        # Shared parameter prefixes for identifying encoder parameters
+        # These are the parameters that suffer from gradient conflicts in multi-device training
+        self._shared_param_prefixes = [
+            "EmbedBlock", "ProjEmbedding", "ProjStats",
+            "encoder_layers", "final_norm", "SharedHead"
+        ]
+
+    @property
+    def automatic_optimization(self) -> bool:
+        """
+        Disable automatic optimization when using gradient conflict resolution.
+
+        When PCGrad is enabled, we need manual control over:
+        1. Per-device backward passes
+        2. Gradient extraction and projection
+        3. Optimizer step timing
+        """
+        return not self._use_gradient_conflict_resolution
+
+    def set_gradient_conflict_config(
+        self,
+        use_gradient_conflict_resolution: bool = False,
+        use_pcgrad: bool = True,
+        use_normalization: bool = True,
+        conflict_threshold: float = 0.0,
+        balance_method: str = "soft",
+        balance_max_ratio: float = 3.0,
+        randomize_order: bool = True,
+    ):
+        """
+        Configure gradient conflict resolution for multi-device training.
+
+        This should be called BEFORE training starts (e.g., in expes.py after creating the module).
+
+        Args:
+            use_gradient_conflict_resolution: Whether to enable PCGrad + balancing
+            use_pcgrad: Whether to apply PCGrad projection (default: True)
+            use_normalization: Whether to balance gradients (default: True)
+            conflict_threshold: Cosine threshold for conflict detection (default: 0.0)
+            balance_method: How to balance gradient magnitudes:
+                           - "none": No balancing
+                           - "soft": Reduce extreme ratios (default, recommended)
+                           - "unit": Normalize to unit length (original, may cause instability)
+            balance_max_ratio: Maximum allowed gradient norm ratio for soft balancing (default: 3.0)
+            randomize_order: Whether to randomize device order in PCGrad (default: True)
+        """
+        self._use_gradient_conflict_resolution = use_gradient_conflict_resolution
+        self._pcgrad_use_pcgrad = use_pcgrad
+        self._pcgrad_use_normalization = use_normalization
+        self._pcgrad_conflict_threshold = conflict_threshold
+        self._pcgrad_balance_method = balance_method
+        self._pcgrad_balance_max_ratio = balance_max_ratio
+        self._pcgrad_randomize_order = randomize_order
+
+    def set_gradient_isolation_config(
+        self,
+        use_gradient_isolation: bool = False,
+        backbone_training: str = "frozen",
+        isolated_devices: list = None,
+    ):
+        """
+        Configure gradient isolation for multi-device training.
+
+        This mode completely separates device heads so that gradients don't
+        interfere between devices. Each device's loss only updates its own
+        adapter and head parameters.
+
+        This should be called BEFORE training starts (e.g., in expes.py after creating the module).
+
+        Args:
+            use_gradient_isolation: Whether to enable gradient isolation mode
+            backbone_training: How to train the shared backbone:
+                - "frozen": No backbone updates (most isolated)
+                - "average": Average gradients from all devices (balanced)
+                - "anchor": Only specified anchor devices update backbone
+            isolated_devices: List of device names to isolate (their gradients
+                don't affect the backbone). If None, all devices are isolated.
+        """
+        self._use_gradient_isolation = use_gradient_isolation
+        self._isolation_backbone_training = backbone_training
+        self._isolated_devices = isolated_devices or []
+
+        # When gradient isolation is enabled, we need manual optimization
+        if use_gradient_isolation:
+            self._use_gradient_conflict_resolution = True  # Triggers manual optimization
+
+        # Identify which parameter groups belong to which device
+        # This will be populated on first training step
+        self._device_param_groups = None
+
+    def freeze_devices(self, device_names_to_freeze: list, all_device_names: list):
+        """
+        Freeze parameters for specific devices in two-stage training.
+
+        This is used for the two-stage training strategy:
+        - Phase 1: Train sparse devices only
+        - Phase 2: Load Phase 1 weights, freeze sparse devices, train all devices
+
+        Frozen parameters include:
+        - device_adapters[device_idx]
+        - Device-specific heads (PowerHead/GateHead weights for specific channels)
+        - Device-specific gate biases
+
+        Args:
+            device_names_to_freeze: List of device names to freeze (e.g., ["Kettle", "Microwave"])
+            all_device_names: List of all device names in current training (e.g., ["Fridge", "Kettle", ...])
+        """
+        import logging
+
+        # Normalize device names for comparison
+        freeze_set = {name.strip().lower() for name in device_names_to_freeze}
+        all_names_lower = [name.strip().lower() for name in all_device_names]
+
+        # Find indices of devices to freeze
+        freeze_indices = []
+        for idx, name in enumerate(all_names_lower):
+            if name in freeze_set:
+                freeze_indices.append(idx)
+                logging.info(f"[FREEZE] Will freeze device {idx}: {all_device_names[idx]}")
+
+        if not freeze_indices:
+            logging.warning("[FREEZE] No devices matched for freezing")
+            return
+
+        frozen_params = []
+
+        # Freeze device_adapters
+        if hasattr(self.model, "device_adapters"):
+            for idx in freeze_indices:
+                if idx < len(self.model.device_adapters):
+                    for param in self.model.device_adapters[idx].parameters():
+                        param.requires_grad = False
+                        frozen_params.append(f"device_adapters[{idx}]")
+
+        # Freeze type-specific heads if present
+        if hasattr(self.model, "type_power_heads") and self.model.type_power_heads is not None:
+            type_ids = getattr(self.model, "type_ids", None)
+            if type_ids is not None:
+                for idx in freeze_indices:
+                    if idx < len(type_ids):
+                        type_id = type_ids[idx]
+                        group_to_module = getattr(self.model, "type_group_to_module", None)
+                        if group_to_module is not None and type_id < len(group_to_module):
+                            module_idx = group_to_module[type_id]
+                            if module_idx >= 0:
+                                # Freeze power head
+                                if module_idx < len(self.model.type_power_heads):
+                                    for param in self.model.type_power_heads[module_idx].parameters():
+                                        param.requires_grad = False
+                                        frozen_params.append(f"type_power_heads[{module_idx}]")
+                                # Freeze gate head
+                                if hasattr(self.model, "type_gate_heads") and module_idx < len(self.model.type_gate_heads):
+                                    for param in self.model.type_gate_heads[module_idx].parameters():
+                                        param.requires_grad = False
+                                        frozen_params.append(f"type_gate_heads[{module_idx}]")
+
+        # Freeze sparse CNN heads if present
+        if hasattr(self.model, "sparse_cnn"):
+            sparse_indices = getattr(self.model, "sparse_device_indices", [])
+            for idx in freeze_indices:
+                if idx in sparse_indices:
+                    sparse_idx = sparse_indices.index(idx)
+                    if hasattr(self.model.sparse_cnn, "simple_head"):
+                        head = self.model.sparse_cnn.simple_head
+                        if sparse_idx < len(head.device_heads):
+                            for param in head.device_heads[sparse_idx].parameters():
+                                param.requires_grad = False
+                                frozen_params.append(f"sparse_cnn.device_heads[{sparse_idx}]")
+
+        # Store frozen device indices for loss computation
+        self._frozen_device_indices = freeze_indices
+
+        # Also inform the criterion to skip gradient for frozen devices
+        if hasattr(self.criterion, "set_frozen_devices"):
+            self.criterion.set_frozen_devices(freeze_indices)
+
+        logging.info(f"[FREEZE] Frozen {len(frozen_params)} parameter groups for devices: {device_names_to_freeze}")
+        logging.info(f"[FREEZE] Frozen indices: {freeze_indices}")
+
+    def setup(self, stage: str):
+        """
+        PyTorch Lightning setup hook - called before training/validation/testing starts.
+
+        This is where we initialize the gradient conflict resolver, as we need access
+        to the criterion's device information which is set up by this point.
+        """
+        if self._use_gradient_conflict_resolution and self._gradient_resolver is None:
+            from src.helpers.gradient_conflict import GradientConflictResolver
+
+            # Get device information from criterion
+            n_devices = getattr(self.criterion, "n_devices", 1)
+            device_names = getattr(self.criterion, "device_names", None)
+
+            # Only enable for multi-device training
+            if n_devices > 1:
+                balance_method = getattr(self, "_pcgrad_balance_method", "soft")
+                balance_max_ratio = getattr(self, "_pcgrad_balance_max_ratio", 3.0)
+                randomize_order = getattr(self, "_pcgrad_randomize_order", True)
+
+                self._gradient_resolver = GradientConflictResolver(
+                    n_devices=n_devices,
+                    shared_param_prefixes=self._shared_param_prefixes,
+                    device_names=device_names,
+                    use_pcgrad=getattr(self, "_pcgrad_use_pcgrad", True),
+                    use_normalization=getattr(self, "_pcgrad_use_normalization", True),
+                    conflict_threshold=getattr(self, "_pcgrad_conflict_threshold", 0.0),
+                    balance_method=balance_method,
+                    balance_max_ratio=balance_max_ratio,
+                    randomize_order=randomize_order,
+                )
+                import logging
+                logging.info(
+                    f"[PCGRAD] Initialized gradient conflict resolver for {n_devices} devices: {device_names}, "
+                    f"balance_method={balance_method}, max_ratio={balance_max_ratio}, randomize={randomize_order}"
+                )
+            else:
+                # Single device - disable PCGrad
+                self._use_gradient_conflict_resolution = False
+                import logging
+                logging.info("[PCGRAD] Disabled for single-device training")
 
     def _maybe_multi_crop(self, ts_agg, target, state):
         k = max(int(self.train_num_crops), 1)
@@ -827,6 +1853,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
 
         B, C, L = logits.shape
         total_loss = logits.new_tensor(0.0)
+        total_weight = logits.new_tensor(0.0)
 
         # Check if we have per-device parameters from criterion
         use_per_device_params = (
@@ -867,9 +1894,19 @@ class SeqToSeqLightningModule(pl.LightningModule):
             alpha_c = alpha_on * targets_c + alpha_off * (1.0 - targets_c)
             gamma = max(self.gate_focal_gamma, 0.0)
             loss_c = -alpha_c * ((1.0 - pt_c) ** gamma) * torch.log(pt_c)
-            total_loss = total_loss + loss_c.mean()
+            weight_c = 1.0
+            if use_per_device_params:
+                weight_c = float(
+                    params.get("lambda_gate_cls", params.get("gate_cls_weight", 1.0))
+                )
+            if not math.isfinite(weight_c) or weight_c < 0.0:
+                weight_c = 0.0
+            total_loss = total_loss + weight_c * loss_c.mean()
+            total_weight = total_weight + weight_c
 
-        return total_loss / max(C, 1)
+        if float(total_weight) <= 0.0:
+            return total_loss / max(C, 1)
+        return total_loss / (total_weight + 1e-6)
 
     def _apply_soft_gate(self, power, gate_logits):
         """
@@ -885,12 +1922,14 @@ class SeqToSeqLightningModule(pl.LightningModule):
         - Dishwasher/Microwave: Moderate settings
         """
         # Check if criterion has per-device gate parameters
+        # NOTE: For single-device training, use global parameters (simpler, matches bd64d01 behavior)
         use_per_device = (
             hasattr(self, "criterion")
             and isinstance(self.criterion, AdaptiveDeviceLoss)
             and hasattr(self.criterion, "gate_soft_scales")
             and hasattr(self.criterion, "gate_floors")
             and hasattr(self.criterion, "gate_biases")
+            and self.criterion.n_devices > 1  # CRITICAL: Skip per-device for single-device training
         )
 
         if use_per_device and gate_logits.dim() == 3:
@@ -902,6 +1941,29 @@ class SeqToSeqLightningModule(pl.LightningModule):
             soft_scales = self.criterion.gate_soft_scales.to(device)
             floors = self.criterion.gate_floors.to(device)
             biases = self.criterion.gate_biases.to(device)
+
+            # V7: Handle frozen gate_bias for sparse devices
+            # Frozen biases are detached to prevent gradient updates
+            if hasattr(self.criterion, "_gate_bias_frozen_mask"):
+                frozen_mask = self.criterion._gate_bias_frozen_mask
+                if len(frozen_mask) == biases.shape[0]:
+                    # Detach frozen biases to prevent gradient flow
+                    biases_list = []
+                    for i in range(biases.shape[0]):
+                        if frozen_mask[i]:
+                            biases_list.append(biases[i].detach())
+                        else:
+                            biases_list.append(biases[i])
+                    biases = torch.stack(biases_list)
+
+            # V30: Get per-device gate_logits_floor to prevent collapse
+            # For sparse devices, clamp gate_logits to prevent extreme negative values
+            gate_logits_floors = None
+            if hasattr(self.criterion, "_gate_logits_floors"):
+                gate_logits_floors = self.criterion._gate_logits_floors
+                if len(gate_logits_floors) == C:
+                    gate_logits_floors = torch.tensor(gate_logits_floors, device=device, dtype=gate_logits.dtype)
+                    gate_logits_floors = gate_logits_floors.view(1, C, 1)
 
             # Ensure correct number of devices
             if soft_scales.shape[0] != C:
@@ -915,26 +1977,47 @@ class SeqToSeqLightningModule(pl.LightningModule):
             floors = floors.view(1, C, 1)
             biases = biases.view(1, C, 1)
 
+            # LEARNABLE PARAMS CONSTRAINT: Clamp to valid ranges
+            # soft_scales: [0.5, 6.0] - controls sharpness
+            # floors: [1e-4, 0.5] - minimum activation probability
+            soft_scales = torch.clamp(soft_scales, min=0.5, max=6.0)
+            floors = torch.clamp(floors, min=1e-4, max=0.5)
+
+            # V30: Apply per-device gate_logits_floor before scaling
+            # This prevents extreme negative logits from causing collapse
+            gate_logits_clamped = gate_logits.float()
+            if gate_logits_floors is not None:
+                gate_logits_clamped = torch.maximum(gate_logits_clamped, gate_logits_floors)
+
             # Apply per-device scale and bias to gate logits
             # Formula: sigmoid(logits * scale + bias)
             # - scale controls sharpness of decision boundary
             # - bias shifts decision boundary (negative = harder to trigger ON)
             # Applying bias AFTER scale makes it a direct offset in sigmoid input space
-            gate_logits_scaled = gate_logits.float() * soft_scales
+            gate_logits_scaled = gate_logits_clamped * soft_scales
             gate_logits_adj = gate_logits_scaled + biases
             gate_prob = torch.sigmoid(gate_logits_adj)
 
-            # Apply per-device floor
-            floors = torch.clamp(floors, min=1e-4, max=1.0)
+            # Apply per-device floor (already clamped above)
             effective_prob = floors + (1.0 - floors) * gate_prob
 
             return power * effective_prob, gate_prob
         else:
-            # Global soft gating (fallback)
+            # Global soft gating (fallback) - ALSO apply gate_bias for single-device training
             gate_floor = min(max(self.gate_floor, 0.0), 1.0)
             gate_floor = max(gate_floor, 1e-4)
             soft_scale = max(self.gate_soft_scale, 0.0)
-            gate_prob = torch.sigmoid(gate_logits.float() * soft_scale)
+            # FIX: Apply gate_bias from per-device params for single-device training
+            gate_bias = 0.0
+            if (
+                hasattr(self, "criterion")
+                and isinstance(self.criterion, AdaptiveDeviceLoss)
+                and hasattr(self.criterion, "gate_biases")
+                and self.criterion.gate_biases.numel() > 0
+            ):
+                gate_bias = float(self.criterion.gate_biases[0].item())
+            gate_logits_adj = gate_logits.float() * soft_scale + gate_bias
+            gate_prob = torch.sigmoid(gate_logits_adj)
             effective_prob = gate_floor + (1.0 - gate_floor) * gate_prob
             return power * effective_prob, gate_prob
 
@@ -944,9 +2027,40 @@ class SeqToSeqLightningModule(pl.LightningModule):
         logits = logits.float()
         state = state.float()
         if state.ndim == 3:
-            state_any = (state.sum(dim=1, keepdim=False) > 0.5).float()
-        else:
-            state_any = state
+            window_label = (state.sum(dim=-1, keepdim=False) > 0.5).float()
+            pooled = logits.mean(dim=-1)
+            if pooled.dim() == 2 and window_label.dim() == 2:
+                if pooled.size(1) != window_label.size(1):
+                    min_c = min(pooled.size(1), window_label.size(1))
+                    pooled = pooled[:, :min_c]
+                    window_label = window_label[:, :min_c]
+            use_per_device_params = (
+                hasattr(self, "criterion")
+                and isinstance(self.criterion, AdaptiveDeviceLoss)
+                and hasattr(self.criterion, "device_params")
+                and pooled.dim() == 2
+                and pooled.size(1) == len(self.criterion.device_params)
+            )
+            if use_per_device_params:
+                total_loss = pooled.new_tensor(0.0)
+                total_weight = pooled.new_tensor(0.0)
+                for c in range(pooled.size(1)):
+                    params = self.criterion.device_params[c]
+                    weight_c = float(
+                        params.get("lambda_gate_cls", params.get("gate_cls_weight", 1.0))
+                    )
+                    if not math.isfinite(weight_c) or weight_c < 0.0:
+                        weight_c = 0.0
+                    loss_c = F.binary_cross_entropy_with_logits(
+                        pooled[:, c], window_label[:, c]
+                    )
+                    total_loss = total_loss + weight_c * loss_c
+                    total_weight = total_weight + weight_c
+                if float(total_weight) <= 0.0:
+                    return total_loss / max(pooled.size(1), 1)
+                return total_loss / (total_weight + 1e-6)
+            return F.binary_cross_entropy_with_logits(pooled, window_label)
+        state_any = state
         window_label = (state_any.sum(dim=-1, keepdim=True) > 0.5).float()
         pooled = logits.mean(dim=-1)
         if pooled.dim() == 3:
@@ -964,6 +2078,8 @@ class SeqToSeqLightningModule(pl.LightningModule):
             return pred.new_tensor(0.0)
         eps = 1e-6
         thr = max(float(self.loss_threshold), 0.0)
+        if pred.dim() >= 3 and pred.size(1) > 1:
+            thr = 0.0
         target = target.float()
         target_abs = target.abs()
         if thr > 0.0:
@@ -1110,13 +2226,34 @@ class SeqToSeqLightningModule(pl.LightningModule):
         thr = max(float(self.loss_threshold), 0.0)
         target = target.float().abs()
         pred = pred.float().abs()
-        if thr > 0.0:
-            on_mask = (target >= thr).float()
+        if (
+            pred.dim() >= 3
+            and isinstance(self.criterion, AdaptiveDeviceLoss)
+            and hasattr(self.criterion, "device_params")
+            and pred.size(1) == len(self.criterion.device_params)
+        ):
+            B, C, L = pred.shape
+            masks = []
+            for c in range(C):
+                thr_c = float(self.criterion.device_params[c].get("threshold", thr))
+                tgt_c = target[:, c:c+1, :]
+                if thr_c > 0.0:
+                    mask_c = (tgt_c >= thr_c).float()
+                else:
+                    k = max(1, int(tgt_c.size(-1) * 0.1))
+                    topk, _ = torch.topk(tgt_c, k, dim=-1)
+                    min_top = topk[..., -1:].detach()
+                    mask_c = (tgt_c >= min_top).float()
+                masks.append(mask_c)
+            on_mask = torch.cat(masks, dim=1)
         else:
-            k = max(1, int(target.size(-1) * 0.1))
-            topk, _ = torch.topk(target, k, dim=-1)
-            min_top = topk[..., -1:].detach()
-            on_mask = (target >= min_top).float()
+            if thr > 0.0:
+                on_mask = (target >= thr).float()
+            else:
+                k = max(1, int(target.size(-1) * 0.1))
+                topk, _ = torch.topk(target, k, dim=-1)
+                min_top = topk[..., -1:].detach()
+                on_mask = (target >= min_top).float()
 
         # Part 1: Energy ratio penalty
         energy_pred = (pred * on_mask).sum(dim=-1)
@@ -1154,9 +2291,8 @@ class SeqToSeqLightningModule(pl.LightningModule):
                     energy_target_c = (target_c * on_mask_c).sum()
                     if energy_target_c > eps:
                         ratio_c = energy_pred_c / (energy_target_c + eps)
-                        # Strong penalty if any channel collapses
-                        if ratio_c < 0.2:
-                            channel_penalties.append(torch.relu(0.2 - ratio_c) * 5.0)
+                        if ratio_c < 0.3:
+                            channel_penalties.append(torch.relu(0.3 - ratio_c) * 10.0)
                 if channel_penalties:
                     per_channel_penalty = sum(channel_penalties) / len(channel_penalties)
                 else:
@@ -1194,6 +2330,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
         return penalties
 
     def training_step(self, batch, batch_idx):
+        # Parse batch
         if isinstance(batch, (list, tuple)) and len(batch) >= 3:
             ts_agg, appl, state = batch[0], batch[1], batch[2]
         else:
@@ -1204,6 +2341,15 @@ class SeqToSeqLightningModule(pl.LightningModule):
         if state is not None:
             state = torch.nan_to_num(state.float(), nan=0.0, posinf=0.0, neginf=0.0)
         ts_agg, target, state, _ = self._maybe_multi_crop(ts_agg, target, state)
+
+        # Dispatch to gradient isolation training step if enabled (highest priority)
+        if self._use_gradient_isolation:
+            return self._training_step_with_gradient_isolation(ts_agg, target, state, batch_idx)
+
+        # Dispatch to PCGrad training step if enabled
+        if not self.automatic_optimization and self._gradient_resolver is not None:
+            return self._training_step_with_pcgrad(ts_agg, target, state, batch_idx)
+
         if isinstance(
             self.criterion,
             (AdaptiveDeviceLoss,),
@@ -1217,9 +2363,37 @@ class SeqToSeqLightningModule(pl.LightningModule):
             gate_cls_loss = self._gate_focal_bce(gate, state) if state is not None else pred.new_tensor(0.0)
             gate_window_loss = self._gate_window_bce(gate, state) if state is not None else pred.new_tensor(0.0)
             if self.gate_duty_weight > 0.0 and state is not None:
-                target_duty = torch.clamp(state.float().mean(), 0.0, 1.0)
-                pred_duty = torch.clamp(gate_prob.mean(), 0.0, 1.0)
-                gate_duty_loss = F.mse_loss(pred_duty, target_duty)
+                if gate_prob.dim() == 3 and state.dim() == 3:
+                    use_per_device_params = (
+                        hasattr(self, "criterion")
+                        and isinstance(self.criterion, AdaptiveDeviceLoss)
+                        and hasattr(self.criterion, "device_params")
+                        and gate_prob.size(1) == len(self.criterion.device_params)
+                    )
+                    total_loss = gate_prob.new_tensor(0.0)
+                    total_weight = gate_prob.new_tensor(0.0)
+                    for c in range(gate_prob.size(1)):
+                        target_duty = torch.clamp(state[:, c, :].float().mean(), 0.0, 1.0)
+                        pred_duty = torch.clamp(gate_prob[:, c, :].mean(), 0.0, 1.0)
+                        loss_c = F.mse_loss(pred_duty, target_duty)
+                        weight_c = 1.0
+                        if use_per_device_params:
+                            params = self.criterion.device_params[c]
+                            weight_c = float(
+                                params.get("lambda_gate_cls", params.get("gate_cls_weight", 1.0))
+                            )
+                        if not math.isfinite(weight_c) or weight_c < 0.0:
+                            weight_c = 0.0
+                        total_loss = total_loss + weight_c * loss_c
+                        total_weight = total_weight + weight_c
+                    if float(total_weight) <= 0.0:
+                        gate_duty_loss = total_loss / max(gate_prob.size(1), 1)
+                    else:
+                        gate_duty_loss = total_loss / (total_weight + 1e-6)
+                else:
+                    target_duty = torch.clamp(state.float().mean(), 0.0, 1.0)
+                    pred_duty = torch.clamp(gate_prob.mean(), 0.0, 1.0)
+                    gate_duty_loss = F.mse_loss(pred_duty, target_duty)
             else:
                 gate_duty_loss = pred.new_tensor(0.0)
         else:
@@ -1232,6 +2406,16 @@ class SeqToSeqLightningModule(pl.LightningModule):
         loss_main = torch.nan_to_num(loss_main, nan=0.0, posinf=1e4, neginf=-1e4)
         penalties = self._compute_all_penalties(pred, target, state, ts_agg)
         anti_scale = self._compute_anti_collapse_scale(self.current_epoch)
+        gate_cls_scale = self.gate_cls_weight
+        gate_window_scale = self.gate_window_weight
+        if (
+            isinstance(self.criterion, AdaptiveDeviceLoss)
+            and getattr(self.criterion, "n_devices", 1) > 1
+        ):
+            if gate_cls_scale > 0.0:
+                gate_cls_scale = 1.0
+            if gate_window_scale > 0.0:
+                gate_window_scale = 1.0
         loss = (
             loss_main
             + penalties["zero_run"]
@@ -1239,14 +2423,365 @@ class SeqToSeqLightningModule(pl.LightningModule):
             + penalties["off_state_long"]
             + penalties["off_state"]
             + self.neg_penalty_weight * penalties["neg"]
-            + self.gate_cls_weight * gate_cls_loss
-            + self.gate_window_weight * gate_window_loss
+            + gate_cls_scale * gate_cls_loss
+            + gate_window_scale * gate_window_loss
             + self.gate_duty_weight * gate_duty_loss
             + self.anti_collapse_weight * anti_scale * penalties["anti_collapse"]
         )
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
+
+    def _training_step_with_pcgrad(self, ts_agg, target, state, batch_idx):
+        """
+        Training step with PCGrad gradient conflict resolution.
+
+        This method implements manual optimization with:
+        1. Per-device forward and backward passes
+        2. Gradient extraction for shared encoder parameters
+        3. PCGrad conflict resolution (normalization + projection)
+        4. Manual optimizer step
+
+        This solves the gradient conflict problem where different devices
+        have opposing gradient directions (e.g., sparse devices want recall UP,
+        dense devices want precision UP), causing some devices to collapse.
+        """
+        opt = self.optimizers()
+
+        # Forward pass
+        power, gate = self.model.forward_with_gate(ts_agg)
+        power = torch.nan_to_num(power, nan=0.0, posinf=1e4, neginf=-1e4)
+        gate = torch.nan_to_num(gate, nan=0.0, posinf=1e4, neginf=-1e4)
+        pred, gate_prob = self._apply_soft_gate(power, gate)
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        # Apply output_ratio center cropping (seq2subseq) - MUST match AdaptiveDeviceLoss.forward
+        output_ratio = getattr(self.criterion, 'output_ratio', 1.0)
+        if output_ratio < 1.0:
+            pred = self.criterion._crop_center(pred, output_ratio)
+            target = self.criterion._crop_center(target, output_ratio)
+
+        # Compute per-device losses
+        n_devices = pred.shape[1]
+        per_device_losses = []
+
+        for c in range(n_devices):
+            p_c = pred[:, c:c+1, :]
+            t_c = target[:, c:c+1, :]
+
+            # Get device-specific parameters
+            params = self.criterion.device_params[c]
+            device_name = self.criterion.device_names[c]
+
+            # Apply epoch-adjusted parameters
+            adjusted_params = self.criterion._get_epoch_adjusted_params(
+                params, self.current_epoch, device_name=device_name
+            )
+
+            # Compute device-specific loss using the cycling loss
+            loss_c = self.criterion._compute_cycling_loss(
+                p_c, t_c, adjusted_params, device_name=device_name, device_idx=c
+            )
+
+            # Numerical stability (match AdaptiveDeviceLoss.forward)
+            loss_c = torch.nan_to_num(loss_c, nan=1.0, posinf=10.0, neginf=0.0)
+
+            # Apply device weight
+            weight = self.criterion.device_weights[c]
+            per_device_losses.append(weight * loss_c)
+
+        # Add gate classification loss (shared across devices, not per-device)
+        gate_cls_loss = self._gate_focal_bce(gate, state) if state is not None else pred.new_tensor(0.0)
+        gate_window_loss = self._gate_window_bce(gate, state) if state is not None else pred.new_tensor(0.0)
+
+        # Compute penalties (these apply to all predictions collectively)
+        penalties = self._compute_all_penalties(pred, target, state, ts_agg)
+        anti_scale = self._compute_anti_collapse_scale(self.current_epoch)
+
+        # Aggregate auxiliary losses (not per-device)
+        aux_loss = (
+            penalties["zero_run"]
+            + penalties["off_high_agg"]
+            + penalties["off_state_long"]
+            + penalties["off_state"]
+            + self.neg_penalty_weight * penalties["neg"]
+            + self.gate_cls_weight * gate_cls_loss
+            + self.gate_window_weight * gate_window_loss
+            + self.anti_collapse_weight * anti_scale * penalties["anti_collapse"]
+        )
+
+        # Distribute auxiliary loss equally across devices
+        aux_per_device = aux_loss / max(n_devices, 1)
+        for i in range(len(per_device_losses)):
+            per_device_losses[i] = per_device_losses[i] + aux_per_device
+
+        # PCGrad: Compute per-device gradients and resolve conflicts
+        device_grads = self._gradient_resolver.compute_per_device_gradients(
+            self.model, per_device_losses
+        )
+        resolved_grads = self._gradient_resolver.resolve_conflicts(device_grads)
+        self._gradient_resolver.apply_gradients(self.model, resolved_grads)
+
+        # Manual gradient clipping (since automatic clipping is disabled for manual optimization)
+        # Use max_norm=1.0 as safety net
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+        # Manual optimizer step
+        opt.step()
+        opt.zero_grad()
+
+        # Update learning rate scheduler if needed
+        sch = self.lr_schedulers()
+        if sch is not None and self.trainer.is_last_batch:
+            if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                pass  # Will be stepped in on_validation_end
+            else:
+                sch.step()
+
+        # Compute total loss for logging (sum of per-device losses)
+        total_loss = sum(l.detach() for l in per_device_losses)
+        self.log("train_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True)
+
+        # Log PCGrad statistics periodically
+        if batch_idx % 100 == 0:
+            stats = self._gradient_resolver.get_stats()
+            for k, v in stats.items():
+                self.log(k, v, on_step=True, on_epoch=False)
+
+            # Log per-device losses for debugging
+            for i, loss_i in enumerate(per_device_losses):
+                device_name = self.criterion.device_names[i]
+                self.log(f"train_loss/{device_name}", loss_i.detach(), on_step=True, on_epoch=False)
+
+        return total_loss
+
+    def _get_device_param_groups(self):
+        """
+        Identify parameter groups for each device.
+
+        Returns dict mapping:
+        - "shared": Parameters shared across all devices (backbone)
+        - "device_0", "device_1", ...: Device-specific parameters
+        """
+        if self._device_param_groups is not None:
+            return self._device_param_groups
+
+        self._device_param_groups = {"shared": []}
+        n_devices = getattr(self.criterion, "n_devices", 1)
+        for i in range(n_devices):
+            self._device_param_groups[f"device_{i}"] = []
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            # Check if parameter belongs to a specific device
+            device_idx = None
+
+            # Device adapters: model.device_adapters.0, model.device_adapters.1, ...
+            if "device_adapters" in name:
+                for i in range(n_devices):
+                    if f"device_adapters.{i}" in name:
+                        device_idx = i
+                        break
+
+            # Type power heads: model.type_power_heads.X where X maps to device groups
+            elif "type_power_heads" in name or "type_gate_heads" in name:
+                # These are grouped by device type, but for isolation we treat each output as separate
+                # For simplicity, we'll consider these as shared (updated by all devices)
+                # A more advanced approach would map type groups to device indices
+                device_idx = None  # Treat as shared for now
+
+            # Sparse CNN device heads: model.sparse_cnn.device_heads.X
+            elif "sparse_cnn" in name and "device_heads" in name:
+                for i in range(n_devices):
+                    if f"device_heads.{i}" in name:
+                        device_idx = i
+                        break
+
+            if device_idx is not None:
+                self._device_param_groups[f"device_{device_idx}"].append(param)
+            else:
+                self._device_param_groups["shared"].append(param)
+
+        return self._device_param_groups
+
+    def _training_step_with_gradient_isolation(self, ts_agg, target, state, batch_idx):
+        """
+        Training step with complete gradient isolation between devices.
+
+        This method ensures that each device's loss ONLY affects its own parameters.
+        The shared backbone can be:
+        - "frozen": No gradient updates (most isolated)
+        - "average": Receives averaged gradients from all devices
+        - "anchor": Only anchor devices (non-isolated) update the backbone
+
+        This solves the gradient conflict problem by preventing one device's
+        optimization from harming another device's performance.
+        """
+        opt = self.optimizers()
+
+        # Get device parameter groups
+        param_groups = self._get_device_param_groups()
+
+        # Forward pass
+        power, gate = self.model.forward_with_gate(ts_agg)
+        power = torch.nan_to_num(power, nan=0.0, posinf=1e4, neginf=-1e4)
+        gate = torch.nan_to_num(gate, nan=0.0, posinf=1e4, neginf=-1e4)
+        pred, gate_prob = self._apply_soft_gate(power, gate)
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        # Apply output_ratio center cropping (seq2subseq)
+        output_ratio = getattr(self.criterion, 'output_ratio', 1.0)
+        if output_ratio < 1.0:
+            pred = self.criterion._crop_center(pred, output_ratio)
+            target = self.criterion._crop_center(target, output_ratio)
+
+        # Compute per-device losses
+        n_devices = pred.shape[1]
+        per_device_losses = []
+
+        for c in range(n_devices):
+            p_c = pred[:, c:c+1, :]
+            t_c = target[:, c:c+1, :]
+
+            # Get device-specific parameters
+            params = self.criterion.device_params[c]
+            device_name = self.criterion.device_names[c]
+
+            # Apply epoch-adjusted parameters
+            adjusted_params = self.criterion._get_epoch_adjusted_params(
+                params, self.current_epoch, device_name=device_name
+            )
+
+            # Compute device-specific loss using the cycling loss
+            loss_c = self.criterion._compute_cycling_loss(
+                p_c, t_c, adjusted_params, device_name=device_name, device_idx=c
+            )
+
+            # Numerical stability
+            loss_c = torch.nan_to_num(loss_c, nan=1.0, posinf=10.0, neginf=0.0)
+
+            # Apply device weight
+            weight = self.criterion.device_weights[c]
+            per_device_losses.append(weight * loss_c)
+
+        # Add gate classification loss (shared across devices)
+        gate_cls_loss = self._gate_focal_bce(gate, state) if state is not None else pred.new_tensor(0.0)
+        gate_window_loss = self._gate_window_bce(gate, state) if state is not None else pred.new_tensor(0.0)
+
+        # Compute penalties
+        penalties = self._compute_all_penalties(pred, target, state, ts_agg)
+        anti_scale = self._compute_anti_collapse_scale(self.current_epoch)
+
+        # Aggregate auxiliary losses
+        aux_loss = (
+            penalties["zero_run"]
+            + penalties["off_high_agg"]
+            + penalties["off_state_long"]
+            + penalties["off_state"]
+            + self.neg_penalty_weight * penalties["neg"]
+            + self.gate_cls_weight * gate_cls_loss
+            + self.gate_window_weight * gate_window_loss
+            + self.anti_collapse_weight * anti_scale * penalties["anti_collapse"]
+        )
+
+        # === GRADIENT ISOLATION: Per-device backward passes ===
+        # Each device's loss only updates its own parameters
+        opt.zero_grad()
+
+        # Determine which devices update the backbone
+        isolated_device_names = [n.lower() for n in self._isolated_devices]
+        backbone_training = self._isolation_backbone_training
+
+        # Collect gradients for shared parameters (for averaging mode)
+        shared_grads_accum = None
+        n_contributing_devices = 0
+
+        for c in range(n_devices):
+            device_name = self.criterion.device_names[c].lower()
+            device_loss = per_device_losses[c] + aux_loss / n_devices
+
+            # Check if this device is isolated
+            is_isolated = (
+                len(isolated_device_names) == 0 or  # All devices isolated if list empty
+                device_name in isolated_device_names
+            )
+
+            if is_isolated and backbone_training == "frozen":
+                # Only update device-specific parameters
+                # Zero out shared parameter gradients after backward
+                device_loss.backward(retain_graph=(c < n_devices - 1))
+
+                # Zero shared gradients immediately
+                for param in param_groups["shared"]:
+                    if param.grad is not None:
+                        param.grad.zero_()
+
+            elif is_isolated and backbone_training == "average":
+                # Backward through all parameters
+                device_loss.backward(retain_graph=(c < n_devices - 1))
+
+                # Accumulate shared gradients for averaging
+                if shared_grads_accum is None:
+                    shared_grads_accum = {}
+                    for param in param_groups["shared"]:
+                        if param.grad is not None:
+                            shared_grads_accum[param] = param.grad.clone()
+                else:
+                    for param in param_groups["shared"]:
+                        if param.grad is not None:
+                            if param in shared_grads_accum:
+                                shared_grads_accum[param] += param.grad
+                            else:
+                                shared_grads_accum[param] = param.grad.clone()
+
+                # Zero shared grads to prevent accumulation in optimizer
+                for param in param_groups["shared"]:
+                    if param.grad is not None:
+                        param.grad.zero_()
+
+                n_contributing_devices += 1
+
+            else:
+                # Non-isolated device: normal backward (updates backbone)
+                device_loss.backward(retain_graph=(c < n_devices - 1))
+                n_contributing_devices += 1
+
+        # Apply averaged shared gradients if using "average" mode
+        if backbone_training == "average" and shared_grads_accum is not None and n_contributing_devices > 0:
+            for param, grad_sum in shared_grads_accum.items():
+                param.grad = grad_sum / n_contributing_devices
+
+        # Manual gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+        # Optimizer step
+        opt.step()
+
+        # Update learning rate scheduler if needed
+        sch = self.lr_schedulers()
+        if sch is not None and self.trainer.is_last_batch:
+            if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                pass  # Will be stepped in on_validation_end
+            else:
+                sch.step()
+
+        # Compute total loss for logging
+        total_loss = sum(l.detach() for l in per_device_losses)
+        self.log("train_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True)
+
+        # Log per-device losses periodically
+        if batch_idx % 100 == 0:
+            for i, loss_i in enumerate(per_device_losses):
+                device_name = self.criterion.device_names[i]
+                self.log(f"train_loss/{device_name}", loss_i.detach(), on_step=True, on_epoch=False)
+
+            # Log isolation mode info
+            self.log("isolation/backbone_training", float(backbone_training == "frozen"), on_step=True, on_epoch=False)
+            self.log("isolation/n_isolated_devices", float(len(isolated_device_names) if isolated_device_names else n_devices), on_step=True, on_epoch=False)
+
+        return total_loss
 
     def validation_step(self, batch, batch_idx):
         if isinstance(batch, (list, tuple)) and len(batch) >= 3:
@@ -1305,8 +2840,20 @@ class SeqToSeqLightningModule(pl.LightningModule):
         # Ensure weight_decay is not zero for regularization
         effective_wd = self.weight_decay if self.weight_decay > 0 else 0.01
 
+        # Collect all learnable parameters:
+        # 1. Model parameters (main network)
+        # 2. Criterion parameters (e.g., learnable gate_biases in AdaptiveDeviceLoss)
+        all_params = list(self.model.parameters())
+        if hasattr(self.criterion, 'parameters'):
+            # Include criterion's learnable parameters (e.g., gate_biases)
+            criterion_params = list(self.criterion.parameters())
+            if criterion_params:
+                all_params.extend(criterion_params)
+                import logging
+                logging.info(f"[OPTIMIZER] Including {len(criterion_params)} learnable criterion params")
+
         optimizer = optim.AdamW(
-            self.model.parameters(),
+            all_params,
             lr=self.learning_rate,
             weight_decay=effective_wd,
             betas=(0.9, 0.999),  # Standard betas
@@ -1434,6 +2981,73 @@ class SeqToSeqLightningModule(pl.LightningModule):
         metrics = self.trainer.callback_metrics
         if "train_loss" in metrics:
             self.loss_train_history.append(float(metrics["train_loss"]))
+
+        # Log learned parameters for monitoring (only in SeqToSeqLightningModule)
+        if (
+            hasattr(self, "criterion")
+            and isinstance(self.criterion, AdaptiveDeviceLoss)
+        ):
+            import logging
+            criterion = self.criterion
+            names = criterion.device_names if hasattr(criterion, "device_names") else []
+
+            # Log gate_biases
+            if hasattr(criterion, "gate_biases") and isinstance(criterion.gate_biases, nn.Parameter):
+                biases = criterion.gate_biases.detach().cpu().numpy()
+                bias_str = ", ".join(
+                    f"{names[i] if i < len(names) else f'dev{i}'}={biases[i]:.3f}"
+                    for i in range(len(biases))
+                )
+                logging.info(f"[LEARNABLE_GATE] Epoch {self.current_epoch} gate_biases: {bias_str}")
+
+            # Log gate_soft_scales (every 5 epochs to reduce noise)
+            if self.current_epoch % 5 == 0:
+                if hasattr(criterion, "gate_soft_scales") and isinstance(criterion.gate_soft_scales, nn.Parameter):
+                    scales = criterion.gate_soft_scales.detach().cpu().numpy()
+                    scales_str = ", ".join(
+                        f"{names[i] if i < len(names) else f'dev{i}'}={scales[i]:.3f}"
+                        for i in range(len(scales))
+                    )
+                    logging.info(f"[LEARNABLE_GATE] Epoch {self.current_epoch} gate_soft_scales: {scales_str}")
+
+                if hasattr(criterion, "gate_floors") and isinstance(criterion.gate_floors, nn.Parameter):
+                    floors = criterion.gate_floors.detach().cpu().numpy()
+                    floors_str = ", ".join(
+                        f"{names[i] if i < len(names) else f'dev{i}'}={floors[i]:.5f}"
+                        for i in range(len(floors))
+                    )
+                    logging.info(f"[LEARNABLE_GATE] Epoch {self.current_epoch} gate_floors: {floors_str}")
+
+                # Log alpha and threshold
+                if hasattr(criterion, "alpha_on_log") and hasattr(criterion, "alpha_off_log"):
+                    import torch
+                    alpha_on = torch.exp(criterion.alpha_on_log).detach().cpu().numpy()
+                    alpha_off = torch.exp(criterion.alpha_off_log).detach().cpu().numpy()
+                    alpha_str = ", ".join(
+                        f"{names[i] if i < len(names) else f'dev{i}'}=(on={alpha_on[i]:.2f},off={alpha_off[i]:.2f})"
+                        for i in range(len(alpha_on))
+                    )
+                    logging.info(f"[LEARNABLE_ALPHA] Epoch {self.current_epoch} alpha: {alpha_str}")
+
+                if hasattr(criterion, "threshold_logit"):
+                    import torch
+                    thresholds = (0.005 + 0.045 * torch.sigmoid(criterion.threshold_logit)).detach().cpu().numpy()
+                    thresh_str = ", ".join(
+                        f"{names[i] if i < len(names) else f'dev{i}'}={thresholds[i]:.4f}"
+                        for i in range(len(thresholds))
+                    )
+                    logging.info(f"[LEARNABLE_THRESHOLD] Epoch {self.current_epoch} threshold: {thresh_str}")
+
+                # Log learnable focal parameters
+                if hasattr(criterion, "focal_gamma_log") and hasattr(criterion, "focal_alpha_logit"):
+                    import torch
+                    focal_gamma = torch.exp(criterion.focal_gamma_log).clamp(0.0, 5.0).detach().cpu().numpy()
+                    focal_alpha = (0.1 + 0.85 * torch.sigmoid(criterion.focal_alpha_logit)).detach().cpu().numpy()
+                    focal_str = ", ".join(
+                        f"{names[i] if i < len(names) else f'dev{i}'}=(γ={focal_gamma[i]:.2f},α={focal_alpha[i]:.2f})"
+                        for i in range(len(focal_gamma))
+                    )
+                    logging.info(f"[LEARNABLE_FOCAL] Epoch {self.current_epoch} focal: {focal_str}")
 
     def on_validation_epoch_end(self):
         metrics = self.trainer.callback_metrics

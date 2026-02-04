@@ -864,7 +864,7 @@ class UKDALE_DataBuilder(object):
                 house_data[appliance] = house_data[appliance].replace(-1, np.nan)
 
         if self.sampling_rate != "10s":
-            house_data = house_data.resample(self.sampling_rate).mean()
+            house_data = house_data.resample(self.sampling_rate).mean().ffill(limit=6)
 
         for appliance in self.mask_app[1:]:
             if appliance in house_data:
@@ -1268,7 +1268,7 @@ class REFIT_DataBuilder(object):
                 house_data[appliance] = house_data[appliance].replace(-1, np.nan)
 
         if self.sampling_rate != "10s":
-            house_data = house_data.resample(self.sampling_rate).mean()
+            house_data = house_data.resample(self.sampling_rate).mean().ffill(limit=6)
 
         tmp_list = ["Aggregate"]
         for appliance in self.mask_app[1:]:

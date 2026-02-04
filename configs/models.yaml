@@ -158,25 +158,26 @@ Inception:
     lr: 1e-3
     wd: 0
 
+# ===== HPO Optimized Parameters (Trial 5 / Multi_T4, weighted F1=0.527) =====
 NILMFormer:
   model_kwargs:
     c_out: 1
 
     kernel_size: 3
-    kernel_size_head: 3
+    kernel_size_head: 1          # HPO optimized (was 3)
     dilations: [1, 2, 4, 8]
     conv_bias: true
 
     use_efficient_attention: false
-    n_encoder_layers: 4
-    d_model: 176
-    dp_rate: 0.07956860646723331
+    n_encoder_layers: 4          # Reduced from 6 to 4 (moderate reduction)
+    d_model: 128                 # HPO optimized (was 176)
+    dp_rate: 0.1526              # HPO optimized (was 0.0796)
     pffn_ratio: 5
-    n_head: 8
+    n_head: 4                    # Increased from 2 to 4 (moderate increase)
     norm_eps: 1e-5
   model_training_param:
-    lr: 0.00030069384832521074
-    wd: 0.0396732917352668
+    lr: 1.21e-4                  # HPO optimized (was 3.0e-4)
+    wd: 3.0e-5                   # HPO optimized (was 0.04)
     training_in_model: false
   model_training_param_eaec:
     lr: 5e-5

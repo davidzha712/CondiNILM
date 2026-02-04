@@ -1,7 +1,10 @@
+# ============================================================
+# NILMFormer 完整搜索空间 (多设备通用) - 含5min采样率
+# ============================================================
 NILMFormer:
   sampling_rate:
     type: categorical
-    choices: ["30s", "1min"]
+    choices: ["1min", "5min"]
   window_size:
     type: categorical
     choices: [64, 128, 256]
@@ -53,15 +56,15 @@ NILMFormer:
     high: 5.0
   loss_alpha_on:
     type: loguniform
-    low: 1.0
-    high: 15.0
+    low: 2.0
+    high: 12.0
   loss_alpha_off:
     type: loguniform
-    low: 0.1
-    high: 2.0
+    low: 0.05
+    high: 1.2
   loss_lambda_on_recall:
     type: loguniform
-    low: 0.1
+    low: 1.0
     high: 8.0
   loss_on_recall_margin:
     type: uniform
@@ -73,17 +76,239 @@ NILMFormer:
     high: 0.8
   gate_soft_scale:
     type: uniform
-    low: 0.8
-    high: 3.5
+    low: 0.6
+    high: 2.4
   gate_floor:
     type: loguniform
-    low: 0.001
-    high: 0.08
+    low: 0.01
+    high: 0.06
   loss_lambda_sparse:
     type: loguniform
-    low: 0.0002
-    high: 0.02
+    low: 0.0005
+    high: 0.01
   loss_lambda_off_hard:
     type: loguniform
     low: 0.003
-    high: 0.15
+    high: 0.05
+
+# ============================================================
+# NILMFormer_Sparse: 专为稀疏高功率设备优化 (Microwave, Kettle)
+# 特点: 更高的alpha_on，更低的alpha_off，更高的gate_floor
+# ============================================================
+NILMFormer_Sparse:
+  # 采样率和窗口 - 稀疏设备可能需要更细的采样
+  sampling_rate:
+    type: categorical
+    choices: ["30s", "1min"]
+  window_size:
+    type: categorical
+    choices: [64, 128]
+  # 学习率
+  lr:
+    type: loguniform
+    low: 5e-5
+    high: 3e-4
+  wd:
+    type: loguniform
+    low: 1e-5
+    high: 1e-2
+  # 模型架构 - 稀疏设备不需要太大模型
+  d_model:
+    type: int
+    low: 64
+    high: 128
+    step: 32
+  n_encoder_layers:
+    type: int
+    low: 2
+    high: 4
+    step: 1
+  n_head:
+    type: int
+    low: 2
+    high: 4
+    step: 2
+  dp_rate:
+    type: uniform
+    low: 0.1
+    high: 0.3
+  pffn_ratio:
+    type: int
+    low: 2
+    high: 4
+    step: 1
+  kernel_size:
+    type: int
+    low: 3
+    high: 7
+    step: 2
+  kernel_size_head:
+    type: int
+    low: 1
+    high: 3
+    step: 2
+  # ===== 关键损失参数 - 针对稀疏设备优化 =====
+  # ON状态权重 - 大幅提高以检测稀疏事件
+  loss_alpha_on:
+    type: loguniform
+    low: 6.0
+    high: 18.0
+  # OFF状态权重 - 大幅降低以减少过度惩罚
+  loss_alpha_off:
+    type: loguniform
+    low: 0.05
+    high: 0.5
+  # 召回权重 - 提高以减少漏检
+  loss_lambda_on_recall:
+    type: loguniform
+    low: 2.0
+    high: 8.0
+  loss_on_recall_margin:
+    type: uniform
+    low: 0.85
+    high: 0.98
+  # 能量回归
+  loss_lambda_energy:
+    type: loguniform
+    low: 0.05
+    high: 0.5
+  # 稀疏惩罚 - 降低以允许更多激活
+  loss_lambda_sparse:
+    type: loguniform
+    low: 0.0001
+    high: 0.003
+  # OFF硬约束 - 降低
+  loss_lambda_off_hard:
+    type: loguniform
+    low: 0.001
+    high: 0.02
+  # ===== Gate参数 - 关键! =====
+  # Gate锐度
+  gate_soft_scale:
+    type: uniform
+    low: 1.5
+    high: 4.0
+  # Gate下限 - 提高以允许更多检测
+  gate_floor:
+    type: loguniform
+    low: 0.015
+    high: 0.1
+  # 输出比例
+  output_ratio:
+    type: uniform
+    low: 0.5
+    high: 0.75
+
+# ============================================================
+# NILMFormer_Precision: 专为提高Precision优化 (减少假阳性)
+# 适用于: Microwave (当前Precision=0.075, 需要大幅提升)
+# 策略: 增强OFF惩罚，收紧gate控制，降低过度检测
+# ============================================================
+NILMFormer_Precision:
+  sampling_rate:
+    type: categorical
+    choices: ["1min"]
+  window_size:
+    type: categorical
+    choices: [128]
+  lr:
+    type: loguniform
+    low: 3e-5
+    high: 2e-4
+  wd:
+    type: loguniform
+    low: 1e-5
+    high: 5e-3
+  d_model:
+    type: int
+    low: 64
+    high: 128
+    step: 32
+  n_encoder_layers:
+    type: int
+    low: 2
+    high: 4
+    step: 1
+  n_head:
+    type: int
+    low: 2
+    high: 4
+    step: 2
+  dp_rate:
+    type: uniform
+    low: 0.1
+    high: 0.25
+  pffn_ratio:
+    type: int
+    low: 2
+    high: 4
+    step: 1
+  kernel_size:
+    type: int
+    low: 3
+    high: 7
+    step: 2
+  kernel_size_head:
+    type: int
+    low: 1
+    high: 3
+    step: 2
+  # ===== 关键: 提高Precision的参数 =====
+  # ON权重 - 中等即可，不要太高
+  loss_alpha_on:
+    type: loguniform
+    low: 4.0
+    high: 10.0
+  # OFF权重 - 大幅提高以惩罚假阳性!
+  loss_alpha_off:
+    type: loguniform
+    low: 0.3
+    high: 2.0
+  # 召回权重 - 适中
+  loss_lambda_on_recall:
+    type: loguniform
+    low: 1.0
+    high: 4.0
+  loss_on_recall_margin:
+    type: uniform
+    low: 0.7
+    high: 0.95
+  # OFF硬约束 - 大幅提高!
+  loss_lambda_off_hard:
+    type: loguniform
+    low: 0.02
+    high: 0.2
+  # 稀疏惩罚 - 提高以减少过度激活
+  loss_lambda_sparse:
+    type: loguniform
+    low: 0.001
+    high: 0.02
+  # 能量回归
+  loss_lambda_energy:
+    type: loguniform
+    low: 0.1
+    high: 0.5
+  # Gate锐度 - 提高以更清晰区分ON/OFF
+  gate_soft_scale:
+    type: uniform
+    low: 2.0
+    high: 5.0
+  # Gate下限 - 降低以减少OFF时的泄漏!
+  gate_floor:
+    type: loguniform
+    low: 0.005
+    high: 0.04
+  output_ratio:
+    type: uniform
+    low: 0.5
+    high: 0.7
+  # 零惩罚 - 提高以惩罚OFF时的非零输出
+  state_zero_penalty_weight:
+    type: loguniform
+    low: 0.05
+    high: 0.3
+  # OFF惩罚权重
+  off_high_agg_penalty_weight:
+    type: loguniform
+    low: 0.1
+    high: 0.5

@@ -15,7 +15,7 @@ import json
 import pandas as pd
 import pytorch_lightning as pl
 from tqdm import tqdm
-from collections.abc import Sequence
+from collections.abc import Sequence, Mapping
 
 import torch.nn as nn
 import torch.nn.functional as F
@@ -558,7 +558,10 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
                     per_device_cfg = getattr(expes_config, "postprocess_per_device", None)
                 except Exception:
                     per_device_cfg = None
-                if isinstance(per_device_cfg, dict) and per_device_cfg:
+                if isinstance(per_device_cfg, Mapping) and per_device_cfg:
+                    per_device_cfg_norm = {
+                        str(k).strip().lower(): v for k, v in per_device_cfg.items()
+                    }
                     n_app = int(pred_inv.size(1))
                     device_names = _coerce_appliance_names(
                         expes_config, n_app, appliance_name
@@ -567,10 +570,10 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
                         name_j = (
                             device_names[j] if j < len(device_names) else str(j)
                         )
-                        cfg_j = per_device_cfg.get(str(name_j))
+                        cfg_j = per_device_cfg_norm.get(str(name_j).strip().lower())
                         thr_j = float(threshold_postprocess)
                         min_on_j = int(min_on_steps)
-                        if isinstance(cfg_j, dict):
+                        if isinstance(cfg_j, Mapping):
                             thr_j = float(
                                 cfg_j.get("postprocess_threshold", thr_j)
                             )
@@ -1115,6 +1118,31 @@ class ValidationNILMMetricCallback(pl.Callback):
             getattr(self.expes_config, "postprocess_threshold", threshold_small_values)
         )
         min_on_steps = int(getattr(self.expes_config, "postprocess_min_on_steps", 0))
+        per_device_cfg = None
+        try:
+            per_device_cfg = getattr(self.expes_config, "postprocess_per_device", None)
+        except Exception:
+            per_device_cfg = None
+        if isinstance(per_device_cfg, Mapping) and per_device_cfg:
+            per_device_cfg_norm = {
+                str(k).strip().lower(): v for k, v in per_device_cfg.items()
+            }
+            app_name = getattr(self.expes_config, "appliance", None)
+            if app_name is None:
+                app_name = getattr(self.expes_config, "app", None)
+            is_multi = isinstance(app_name, (list, tuple)) and len(app_name) > 1
+            if not is_multi:
+                if isinstance(app_name, (list, tuple)) and app_name:
+                    app_name = app_name[0]
+                if app_name is not None:
+                    cfg_single = per_device_cfg_norm.get(str(app_name).strip().lower())
+                    if isinstance(cfg_single, Mapping):
+                        threshold_postprocess = float(
+                            cfg_single.get("postprocess_threshold", threshold_postprocess)
+                        )
+                        min_on_steps = int(
+                            cfg_single.get("postprocess_min_on_steps", min_on_steps)
+                        )
         off_run_min_len = int(
             getattr(self.expes_config, "state_zero_kernel", max(min_on_steps, 0))
         )
@@ -1123,7 +1151,9 @@ class ValidationNILMMetricCallback(pl.Callback):
         y_win = np.array([], dtype=np.float32)
         y_hat_win = np.array([], dtype=np.float32)
         y_state = np.array([], dtype=np.int8)
+        y_hat_state = np.array([], dtype=np.int8)
         per_device_data = None
+        per_device_stats = None
         stats = {
             "pred_scaled_sum": 0.0,
             "pred_scaled_sumsq": 0.0,
@@ -1218,6 +1248,9 @@ class ValidationNILMMetricCallback(pl.Callback):
                     except Exception:
                         per_device_cfg = None
                     if isinstance(per_device_cfg, dict) and per_device_cfg:
+                        per_device_cfg_norm = {
+                            str(k).strip().lower(): v for k, v in per_device_cfg.items()
+                        }
                         n_app = int(pred_inv.size(1))
                         device_names = _coerce_appliance_names(
                             self.expes_config,
@@ -1228,7 +1261,7 @@ class ValidationNILMMetricCallback(pl.Callback):
                             name_j = (
                                 device_names[j] if j < len(device_names) else str(j)
                             )
-                            cfg_j = per_device_cfg.get(str(name_j))
+                            cfg_j = per_device_cfg_norm.get(str(name_j).strip().lower())
                             thr_j = float(threshold_postprocess)
                             min_on_j = int(min_on_steps)
                             if isinstance(cfg_j, dict):
@@ -1262,22 +1295,57 @@ class ValidationNILMMetricCallback(pl.Callback):
                 if hasattr(pl_module, "model") and hasattr(pl_module.model, "forward_with_gate"):
                     try:
                         _power_raw, gate_logits = pl_module.model.forward_with_gate(ts_agg_t)
-                        soft_scale = float(getattr(pl_module, "gate_soft_scale", 1.0))
-                        post_scale = float(
-                            getattr(
-                                self.expes_config,
-                                "postprocess_gate_soft_scale",
-                                max(float(getattr(pl_module, "gate_soft_scale", 1.0)), 1.0) * 3.0,
-                            )
-                        )
-                        if not np.isfinite(post_scale) or post_scale <= 0.0:
-                            post_scale = 1.0
                         gate_logits = torch.nan_to_num(
                             gate_logits.float(), nan=0.0, posinf=0.0, neginf=0.0
                         )
-                        gate_prob_stats = torch.sigmoid(
-                            torch.clamp(gate_logits * soft_scale, min=-50.0, max=50.0)
-                        )
+                        use_per_device_gate = False
+                        soft_scales = None
+                        biases = None
+                        if hasattr(pl_module, "criterion") and gate_logits.dim() == 3:
+                            crit = pl_module.criterion
+                            if hasattr(crit, "gate_soft_scales") and hasattr(crit, "gate_biases"):
+                                soft_scales = crit.gate_soft_scales.to(gate_logits.device)
+                                biases = crit.gate_biases.to(gate_logits.device)
+                                if soft_scales.numel() == gate_logits.size(1) and biases.numel() == gate_logits.size(1):
+                                    use_per_device_gate = True
+                                    soft_scales = soft_scales.view(1, -1, 1)
+                                    biases = biases.view(1, -1, 1)
+                        if use_per_device_gate:
+                            gate_logits_stats = gate_logits * soft_scales + biases
+                            gate_prob_stats = torch.sigmoid(
+                                torch.clamp(gate_logits_stats, min=-50.0, max=50.0)
+                            )
+                            post_scale_cfg = getattr(self.expes_config, "postprocess_gate_soft_scale", None)
+                            post_scale = None
+                            try:
+                                post_scale = float(post_scale_cfg)
+                            except Exception:
+                                post_scale = None
+                            if post_scale is None or not np.isfinite(post_scale) or post_scale <= 0.0:
+                                post_scales = torch.clamp(soft_scales, min=1.0) * 3.0
+                            else:
+                                post_scales = torch.full_like(soft_scales, post_scale)
+                            gate_logits_sharp = gate_logits * post_scales + biases
+                            gate_prob_sharp = torch.sigmoid(
+                                torch.clamp(gate_logits_sharp, min=-50.0, max=50.0)
+                            )
+                        else:
+                            soft_scale = float(getattr(pl_module, "gate_soft_scale", 1.0))
+                            post_scale = float(
+                                getattr(
+                                    self.expes_config,
+                                    "postprocess_gate_soft_scale",
+                                    max(float(getattr(pl_module, "gate_soft_scale", 1.0)), 1.0) * 3.0,
+                                )
+                            )
+                            if not np.isfinite(post_scale) or post_scale <= 0.0:
+                                post_scale = 1.0
+                            gate_prob_stats = torch.sigmoid(
+                                torch.clamp(gate_logits * soft_scale, min=-50.0, max=50.0)
+                            )
+                            gate_prob_sharp = torch.sigmoid(
+                                torch.clamp(gate_logits * post_scale, min=-50.0, max=50.0)
+                            )
                         gate_prob_np = torch.flatten(gate_prob_stats).detach().cpu().numpy()
                         gate_prob_np = np.nan_to_num(
                             gate_prob_np.astype(np.float64),
@@ -1288,9 +1356,6 @@ class ValidationNILMMetricCallback(pl.Callback):
                         stats["gate_prob_sum"] += float(gate_prob_np.sum())
                         stats["gate_prob_sumsq"] += float((gate_prob_np**2).sum())
                         stats["gate_prob_n"] += int(gate_prob_np.size)
-                        gate_prob_sharp = torch.sigmoid(
-                            torch.clamp(gate_logits * post_scale, min=-50.0, max=50.0)
-                        )
                         use_gate_pp = bool(
                             getattr(self.expes_config, "postprocess_use_gate", True)
                         )
@@ -1368,6 +1433,51 @@ class ValidationNILMMetricCallback(pl.Callback):
                 pred_raw_3d = np.nan_to_num(
                     pred_raw_3d.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
                 )
+                if pred_post_3d.ndim == 3 and target_3d.ndim == 3:
+                    n_app = int(pred_post_3d.shape[1])
+                    if per_device_stats is None:
+                        per_device_stats = [
+                            {
+                                "pred_scaled_max": 0.0,
+                                "pred_raw_max": 0.0,
+                                "target_max": 0.0,
+                                "pred_post_sum": 0.0,
+                                "pred_post_n": 0,
+                                "pred_post_zero_n": 0,
+                                "target_sum": 0.0,
+                            }
+                            for _ in range(n_app)
+                        ]
+                    pred_scaled_3d = pred_scaled.detach().cpu().numpy()
+                    pred_scaled_3d = np.nan_to_num(
+                        pred_scaled_3d.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0
+                    )
+                    for j in range(n_app):
+                        pred_scaled_ch = pred_scaled_3d[:, j, :].reshape(-1)
+                        pred_raw_ch = pred_raw_3d[:, j, :].reshape(-1)
+                        pred_post_ch = pred_post_3d[:, j, :].reshape(-1)
+                        target_ch = target_3d[:, j, :].reshape(-1)
+                        stats_j = per_device_stats[j]
+                        pred_scaled_max = (
+                            float(pred_scaled_ch.max()) if pred_scaled_ch.size else 0.0
+                        )
+                        pred_raw_max = (
+                            float(pred_raw_ch.max()) if pred_raw_ch.size else 0.0
+                        )
+                        target_max = float(target_ch.max()) if target_ch.size else 0.0
+                        stats_j["pred_scaled_max"] = max(
+                            stats_j["pred_scaled_max"], pred_scaled_max
+                        )
+                        stats_j["pred_raw_max"] = max(
+                            stats_j["pred_raw_max"], pred_raw_max
+                        )
+                        stats_j["target_max"] = max(stats_j["target_max"], target_max)
+                        stats_j["pred_post_sum"] += float(pred_post_ch.sum())
+                        stats_j["pred_post_n"] += int(pred_post_ch.size)
+                        stats_j["pred_post_zero_n"] += int(
+                            (pred_post_ch <= 0.0).sum()
+                        )
+                        stats_j["target_sum"] += float(target_ch.sum())
                 off_s = _off_run_stats(
                     target_3d,
                     pred_post_3d,
@@ -1429,6 +1539,29 @@ class ValidationNILMMetricCallback(pl.Callback):
                 pred_flat = pred_np_all.reshape(-1)
                 target_win_flat = target_win_np_all.reshape(-1)
                 pred_win_flat = pred_win_np_all.reshape(-1)
+                y_hat_state_flat = np.array([], dtype=np.int8)
+                if state is not None:
+                    if pred_np_all.ndim == 3 and isinstance(per_device_cfg, dict) and per_device_cfg:
+                        per_device_cfg_norm = {
+                            str(k).strip().lower(): v for k, v in per_device_cfg.items()
+                        }
+                        n_app = int(pred_np_all.shape[1])
+                        device_names = _coerce_appliance_names(
+                            self.expes_config,
+                            n_app,
+                            getattr(self.expes_config, "appliance", None),
+                        )
+                        y_hat_state_np_all = np.zeros_like(pred_np_all, dtype=np.int8)
+                        for j in range(n_app):
+                            name_j = device_names[j] if j < len(device_names) else str(j)
+                            cfg_j = per_device_cfg_norm.get(str(name_j).strip().lower())
+                            thr_j = float(threshold_postprocess)
+                            if isinstance(cfg_j, dict):
+                                thr_j = float(cfg_j.get("postprocess_threshold", thr_j))
+                            y_hat_state_np_all[:, j, :] = (pred_np_all[:, j, :] > thr_j).astype(np.int8)
+                        y_hat_state_flat = y_hat_state_np_all.reshape(-1)
+                    else:
+                        y_hat_state_flat = (pred_np_all > threshold_postprocess).astype(np.int8).reshape(-1)
                 state_np_all = None
                 state_flat = np.array([], dtype=np.int8)
                 if state is not None:
@@ -1439,6 +1572,12 @@ class ValidationNILMMetricCallback(pl.Callback):
                 y_win = np.concatenate((y_win, target_win_flat)) if y_win.size else target_win_flat
                 y_hat_win = np.concatenate((y_hat_win, pred_win_flat)) if y_hat_win.size else pred_win_flat
                 y_state = np.concatenate((y_state, state_flat)) if y_state.size else state_flat
+                if y_hat_state_flat.size:
+                    y_hat_state = (
+                        np.concatenate((y_hat_state, y_hat_state_flat))
+                        if y_hat_state.size
+                        else y_hat_state_flat
+                    )
                 if state_np_all is not None and target_np_all.ndim == 3:
                     if per_device_data is None:
                         n_app = target_np_all.shape[1]
@@ -1477,11 +1616,7 @@ class ValidationNILMMetricCallback(pl.Callback):
                             )
         if not y.size:
             return
-        y_hat_state = (
-            (y_hat > threshold_postprocess).astype(int)
-            if y_state.size
-            else None
-        )
+        y_hat_state = y_hat_state if y_state.size else None
         metrics_timestamp = self.metrics(
             y=y,
             y_hat=y_hat,
@@ -1491,8 +1626,18 @@ class ValidationNILMMetricCallback(pl.Callback):
         metrics_win = self.metrics(y=y_win, y_hat=y_hat_win)
         metrics_timestamp_per_device = {}
         metrics_win_per_device = {}
+        device_names = None
         if per_device_data is not None:
             n_app = len(per_device_data["y"])
+            per_device_cfg_norm = {}
+            try:
+                per_device_cfg = getattr(self.expes_config, "postprocess_per_device", None)
+            except Exception:
+                per_device_cfg = None
+            if isinstance(per_device_cfg, Mapping) and per_device_cfg:
+                per_device_cfg_norm = {
+                    str(k).strip().lower(): v for k, v in per_device_cfg.items()
+                }
             device_names = _coerce_appliance_names(
                 self.expes_config, n_app, getattr(self.expes_config, "appliance", None)
             )
@@ -1500,14 +1645,21 @@ class ValidationNILMMetricCallback(pl.Callback):
                 y_j = per_device_data["y"][j]
                 y_hat_j = per_device_data["y_hat"][j]
                 if y_j.size and y_hat_j.size:
-                    y_state_j = per_device_data["y_state"][j]
-                    y_hat_state_j = (
-                        (y_hat_j > threshold_postprocess).astype(int) if y_state_j.size else None
-                    )
+                    name_j = device_names[j] if j < len(device_names) else str(j)
+                    cfg_j = per_device_cfg_norm.get(str(name_j).strip().lower())
+                    thr_j = float(threshold_postprocess)
+                    if isinstance(cfg_j, Mapping):
+                        thr_j = float(cfg_j.get("postprocess_threshold", thr_j))
+                    # FIX: Use SAME threshold for BOTH y_state and y_hat_state
+                    # This ensures consistent ON/OFF determination for metrics
+                    # Previously y_state used dataset labels (high threshold like 2000W)
+                    # while y_hat_state used postprocess threshold (low like 20W)
+                    y_state_j = (y_j > thr_j).astype(int)
+                    y_hat_state_j = (y_hat_j > thr_j).astype(int)
                     metrics_timestamp_per_device[str(device_names[j])] = self.metrics(
                         y=y_j,
                         y_hat=y_hat_j,
-                        y_state=y_state_j if y_state_j.size else None,
+                        y_state=y_state_j,
                         y_hat_state=y_hat_state_j,
                     )
                 y_win_j = per_device_data["y_win"][j]
@@ -1577,6 +1729,37 @@ class ValidationNILMMetricCallback(pl.Callback):
         if appliance_name is not None:
             group_dir = os.path.join(group_dir, str(appliance_name))
         os.makedirs(group_dir, exist_ok=True)
+        per_device_records = {}
+        if per_device_stats:
+            if device_names is None:
+                device_names = _coerce_appliance_names(
+                    self.expes_config,
+                    len(per_device_stats),
+                    getattr(self.expes_config, "appliance", None),
+                )
+            for j, name in enumerate(device_names):
+                if j >= len(per_device_stats):
+                    break
+                stats_j = per_device_stats[j]
+                pred_post_n_j = int(stats_j.get("pred_post_n", 0))
+                pred_post_zero_n_j = int(stats_j.get("pred_post_zero_n", 0))
+                pred_post_zero_rate_j = (
+                    float(pred_post_zero_n_j) / float(max(pred_post_n_j, 1))
+                )
+                target_sum_j = float(stats_j.get("target_sum", 0.0))
+                pred_post_sum_j = float(stats_j.get("pred_post_sum", 0.0))
+                energy_ratio_j = pred_post_sum_j / float(max(target_sum_j, 1e-6))
+                collapse_flag_j = bool(
+                    pred_post_zero_rate_j >= 0.995 or energy_ratio_j <= 0.02
+                )
+                per_device_records[str(name)] = {
+                    "pred_scaled_max": float(stats_j.get("pred_scaled_max", 0.0)),
+                    "pred_raw_max": float(stats_j.get("pred_raw_max", 0.0)),
+                    "target_max": float(stats_j.get("target_max", 0.0)),
+                    "pred_post_zero_rate": float(pred_post_zero_rate_j),
+                    "energy_ratio": float(energy_ratio_j),
+                    "collapse_flag": bool(collapse_flag_j),
+                }
         record = {
             "epoch": int(trainer.current_epoch),
             "model": str(self.expes_config.name_model),
@@ -1613,6 +1796,12 @@ class ValidationNILMMetricCallback(pl.Callback):
             "off_long_run_total_len": int(off_stats["off_long_run_total_len"]),
             "gate_prob_mean": gate_prob_mean,
             "collapse_flag": collapse_flag,
+            "collapse_flag_per_device": {
+                k: bool(v.get("collapse_flag", False))
+                for k, v in per_device_records.items()
+            }
+            if per_device_records
+            else {},
         }
         _append_jsonl(os.path.join(group_dir, "val_report.jsonl"), record)
         logging.info("VAL_REPORT_JSON: %s", json.dumps(_to_jsonable(record), ensure_ascii=False))
@@ -1621,17 +1810,36 @@ class ValidationNILMMetricCallback(pl.Callback):
         try:
             device_type = str(getattr(self.expes_config, "device_type", "") or "")
             appliance_name = str(getattr(self.expes_config, "appliance", "") or "")
-
-            # Handle early collapse
-            self.adaptive_tuner.handle_early_collapse(
-                pl_module, record, device_type, appliance_name, int(trainer.current_epoch)
-            )
-
-            # Tune from metrics if not collapsed
-            if not bool(record.get("collapse_flag", False)):
-                self.adaptive_tuner.tune_from_metrics(
-                    pl_module, record, metrics_timestamp, device_type, appliance_name
+            is_multi = False
+            try:
+                crit = getattr(pl_module, "criterion", None)
+                if crit is not None and hasattr(crit, "n_devices"):
+                    is_multi = int(getattr(crit, "n_devices", 1) or 1) > 1
+            except Exception:
+                is_multi = False
+            if not is_multi:
+                self.adaptive_tuner.handle_early_collapse(
+                    pl_module, record, device_type, appliance_name, int(trainer.current_epoch)
                 )
+                if not bool(record.get("collapse_flag", False)):
+                    self.adaptive_tuner.tune_from_metrics(
+                        pl_module, record, metrics_timestamp, device_type, appliance_name
+                    )
+            else:
+                per_device_types = getattr(self.expes_config, "device_type_per_device", None)
+                for name, rec in per_device_records.items():
+                    dev_type = ""
+                    if isinstance(per_device_types, Mapping):
+                        dev_type = str(per_device_types.get(name, "") or "")
+                    name_l = str(name).lower()
+                    if dev_type == "sparse_high_power" or name_l in ("kettle", "microwave"):
+                        self.adaptive_tuner.handle_early_collapse(
+                            pl_module,
+                            rec,
+                            dev_type,
+                            str(name),
+                            int(trainer.current_epoch),
+                        )
         except Exception:
             pass
 
@@ -1885,11 +2093,39 @@ def evaluate_nilm_split(
             target_inv = scaler.inverse_transform_appliance(target)
             pred_inv = scaler.inverse_transform_appliance(pred)
             pred_inv = torch.clamp(pred_inv, min=0.0)
-            pred_inv[pred_inv < threshold_postprocess] = 0
-            if min_on_duration_steps and min_on_duration_steps > 1:
-                pred_inv = suppress_short_activations(
-                    pred_inv, threshold_postprocess, min_on_duration_steps
+            per_device_cfg = None
+            if expes_config is not None:
+                try:
+                    per_device_cfg = getattr(expes_config, "postprocess_per_device", None)
+                except Exception:
+                    per_device_cfg = None
+            if pred_inv.dim() == 3 and isinstance(per_device_cfg, Mapping) and per_device_cfg:
+                per_device_cfg_norm = {
+                    str(k).strip().lower(): v for k, v in per_device_cfg.items()
+                }
+                n_app = int(pred_inv.size(1))
+                device_names = _coerce_appliance_names(
+                    expes_config, n_app, getattr(expes_config, "appliance", None) if expes_config is not None else None
                 )
+                for j in range(n_app):
+                    name_j = device_names[j] if j < len(device_names) else str(j)
+                    cfg_j = per_device_cfg_norm.get(str(name_j).strip().lower())
+                    thr_j = float(threshold_postprocess)
+                    min_on_j = int(min_on_duration_steps or 0)
+                    if isinstance(cfg_j, Mapping):
+                        thr_j = float(cfg_j.get("postprocess_threshold", thr_j))
+                        min_on_j = int(cfg_j.get("postprocess_min_on_steps", min_on_j))
+                    ch = pred_inv[:, j : j + 1, :]
+                    ch[ch < thr_j] = 0.0
+                    if min_on_j > 1:
+                        ch = suppress_short_activations(ch, thr_j, min_on_j)
+                    pred_inv[:, j : j + 1, :] = ch
+            else:
+                pred_inv[pred_inv < threshold_postprocess] = 0
+                if min_on_duration_steps and min_on_duration_steps > 1:
+                    pred_inv = suppress_short_activations(
+                        pred_inv, threshold_postprocess, min_on_duration_steps
+                    )
             if (
                 postprocess_use_gate
                 and gate_logits is not None
@@ -1993,9 +2229,10 @@ def evaluate_nilm_split(
         else:
             # y_state shorter than y_hat - this shouldn't happen, but handle gracefully
             y_state = np.array([])
-    y_hat_state = (
-        (y_hat > threshold_postprocess).astype(int) if y_state.size else None
-    )
+    # FIX: Use threshold_postprocess instead of 0 for consistent state determination
+    # The postprocessing already set values < threshold to 0, so any remaining > 0 values
+    # are above threshold. Using a small epsilon (0.01) to handle floating point noise.
+    y_hat_state = (y_hat > 0.01).astype(int) if y_state.size else None
     metrics_timestamp = metrics_helper(
         y=y,
         y_hat=y_hat,
@@ -2005,6 +2242,22 @@ def evaluate_nilm_split(
     metrics_win = metrics_helper(y=y_win, y_hat=y_hat_win)
     metrics_timestamp_per_device = {}
     metrics_win_per_device = {}
+
+    # Build per-device threshold map for state calculation
+    per_device_thr_map = {}
+    if expes_config is not None:
+        try:
+            per_device_cfg = getattr(expes_config, "postprocess_per_device", None)
+            if isinstance(per_device_cfg, Mapping):
+                per_device_cfg_norm = {str(k).strip().lower(): v for k, v in per_device_cfg.items()}
+                per_device_thr_map = {
+                    k: float(v.get("postprocess_threshold", threshold_postprocess))
+                    if isinstance(v, Mapping) else threshold_postprocess
+                    for k, v in per_device_cfg_norm.items()
+                }
+        except Exception:
+            pass
+
     if per_device_data is not None:
         n_app = len(per_device_data["y"])
         device_names = _coerce_appliance_names(
@@ -2023,9 +2276,11 @@ def evaluate_nilm_split(
                         y_state_j = y_state_j[start:start + crop_len]
                     else:
                         y_state_j = np.array([])
-                y_hat_state_j = (
-                    (y_hat_j > threshold_postprocess).astype(int) if y_state_j.size else None
-                )
+                # FIX: Use device-specific threshold for state calculation
+                name_j = device_names[j] if j < len(device_names) else str(j)
+                thr_j = per_device_thr_map.get(str(name_j).strip().lower(), threshold_postprocess)
+                # Use small epsilon after postprocessing (values already thresholded)
+                y_hat_state_j = (y_hat_j > 0.01).astype(int) if y_state_j.size else None
                 metrics_timestamp_per_device[str(device_names[j])] = metrics_helper(
                     y=y_j,
                     y_hat=y_hat_j,
@@ -2120,43 +2375,150 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         and loss_type == "multi_nilm"
     ):
         try:
-            train_states = tuple_data[0][:, 1, 1, :]
-            on_window_mask = (train_states.sum(axis=-1) > 0).astype(np.float32)
-            on_window_frac = float(on_window_mask.mean()) if on_window_mask.size else 0.0
-            sparse_threshold = float(
-                getattr(expes_config, "balance_window_on_frac_threshold", 0.25)
-            )
-            if 0.0 < on_window_frac < sparse_threshold:
-                target_on_frac = float(
-                    getattr(expes_config, "balance_window_target_on_frac", 0.5)
+            train_states = tuple_data[0][:, 1:, 1, :]
+            if train_states.ndim == 2:
+                on_window_mask = (train_states.sum(axis=-1) > 0).astype(np.float32)
+                on_window_frac = float(on_window_mask.mean()) if on_window_mask.size else 0.0
+                sparse_threshold = float(
+                    getattr(expes_config, "balance_window_on_frac_threshold", 0.25)
                 )
-                target_on_frac = min(max(target_on_frac, 0.05), 0.95)
-                w_on = target_on_frac / float(max(on_window_frac, 1e-6))
-                w_off = (1.0 - target_on_frac) / float(max(1.0 - on_window_frac, 1e-6))
-                max_ratio = float(getattr(expes_config, "balance_window_max_ratio", 100.0))
-                max_ratio = max(max_ratio, 1.0)
-                ratio = float(w_on) / float(max(w_off, 1e-12))
-                if ratio > max_ratio:
-                    w_on = w_off * max_ratio
-                weights_np = np.where(on_window_mask > 0.5, w_on, w_off).astype(
-                    np.float32
-                )
-                weights = torch.from_numpy(weights_np)
-                train_sampler = torch.utils.data.WeightedRandomSampler(
-                    weights=weights,
-                    num_samples=int(weights.numel()),
-                    replacement=True,
-                )
-                logging.info(
-                    "Enable balanced window sampling: on_window_frac=%.4f target_on_frac=%.2f",
-                    on_window_frac,
-                    target_on_frac,
-                )
+                if 0.0 < on_window_frac < sparse_threshold:
+                    target_on_frac = float(
+                        getattr(expes_config, "balance_window_target_on_frac", 0.5)
+                    )
+                    target_on_frac = min(max(target_on_frac, 0.05), 0.95)
+                    w_on = target_on_frac / float(max(on_window_frac, 1e-6))
+                    w_off = (1.0 - target_on_frac) / float(max(1.0 - on_window_frac, 1e-6))
+                    max_ratio = float(getattr(expes_config, "balance_window_max_ratio", 100.0))
+                    max_ratio = max(max_ratio, 1.0)
+                    ratio = float(w_on) / float(max(w_off, 1e-12))
+                    if ratio > max_ratio:
+                        w_on = w_off * max_ratio
+                    weights_np = np.where(on_window_mask > 0.5, w_on, w_off).astype(
+                        np.float32
+                    )
+                    weights = torch.from_numpy(weights_np)
+                    train_sampler = torch.utils.data.WeightedRandomSampler(
+                        weights=weights,
+                        num_samples=int(weights.numel()),
+                        replacement=True,
+                    )
+                    logging.info(
+                        "Enable balanced window sampling: on_window_frac=%.4f target_on_frac=%.2f",
+                        on_window_frac,
+                        target_on_frac,
+                    )
+                else:
+                    logging.info(
+                        "Skip balanced window sampling: on_window_frac=%.4f",
+                        on_window_frac,
+                    )
             else:
-                logging.info(
-                    "Skip balanced window sampling: on_window_frac=%.4f",
-                    on_window_frac,
+                on_per_device = (train_states.sum(axis=-1) > 0).astype(np.float32)
+                on_window_mask = (on_per_device.sum(axis=1) > 0).astype(np.float32)
+                on_window_frac = float(on_window_mask.mean()) if on_window_mask.size else 0.0
+                sparse_threshold = float(
+                    getattr(expes_config, "balance_window_on_frac_threshold", 0.25)
                 )
+                per_device_on_frac = on_per_device.mean(axis=0) if on_per_device.size else []
+                sparse_trigger = False
+                if 0.0 < on_window_frac < sparse_threshold:
+                    sparse_trigger = True
+                if not sparse_trigger and len(per_device_on_frac) > 0:
+                    sparse_trigger = bool(
+                        np.any(
+                            (np.array(per_device_on_frac) > 0.0)
+                            & (np.array(per_device_on_frac) < sparse_threshold)
+                        )
+                    )
+                if sparse_trigger:
+                    base_target_on_frac = float(
+                        getattr(expes_config, "balance_window_target_on_frac", 0.5)
+                    )
+                    base_target_on_frac = min(max(base_target_on_frac, 0.05), 0.95)
+                    # ENHANCED: Stronger oversampling for sparse devices
+                    # - sparse_target_boost: 0.2 -> 0.4 (more aggressive ON sampling)
+                    # - sparse_duty_threshold: 0.05 -> 0.02 (catch ultra-sparse like microwave)
+                    # - max_ratio: 100 -> 200 (allow higher sampling weight)
+                    sparse_target_boost = float(
+                        getattr(expes_config, "balance_window_sparse_target_boost", 0.4)
+                    )
+                    sparse_duty_threshold = float(
+                        getattr(expes_config, "balance_window_sparse_duty_threshold", 0.02)
+                    )
+                    # NEW: Ultra-sparse threshold for duty < 1% (microwave, kettle)
+                    ultra_sparse_threshold = float(
+                        getattr(expes_config, "balance_window_ultra_sparse_threshold", 0.01)
+                    )
+                    ultra_sparse_boost = float(
+                        getattr(expes_config, "balance_window_ultra_sparse_boost", 0.35)
+                    )
+                    max_ratio = float(getattr(expes_config, "balance_window_max_ratio", 200.0))
+                    max_ratio = max(max_ratio, 1.0)
+                    stats_list = None
+                    try:
+                        if hasattr(expes_config, "get"):
+                            stats_list = expes_config.get("device_stats_for_loss")
+                        else:
+                            stats_list = getattr(expes_config, "device_stats_for_loss", None)
+                    except Exception:
+                        stats_list = None
+                    if not isinstance(stats_list, (list, tuple)) or len(stats_list) != on_per_device.shape[1]:
+                        stats_list = None
+                    weight_matrix = np.zeros_like(on_per_device, dtype=np.float32)
+                    for idx in range(on_per_device.shape[1]):
+                        frac = float(per_device_on_frac[idx])
+                        target_on_frac = base_target_on_frac
+                        if stats_list is not None:
+                            ds = stats_list[idx] if idx < len(stats_list) else {}
+                            dev_type = str(ds.get("device_type", "") or "").lower()
+                            duty_cycle = float(ds.get("duty_cycle", 0.0) or 0.0)
+                            if duty_cycle < sparse_duty_threshold or dev_type in (
+                                "sparse_high_power",
+                                "sparse_medium_power",
+                            ):
+                                # ULTRA-SPARSE: duty < 1% (microwave, kettle) gets maximum boost
+                                if duty_cycle < ultra_sparse_threshold:
+                                    boost = sparse_target_boost + ultra_sparse_boost
+                                    logging.debug(
+                                        "Ultra-sparse device idx=%d duty=%.3f%% using boost=%.2f",
+                                        idx, duty_cycle * 100, boost
+                                    )
+                                else:
+                                    boost = sparse_target_boost
+                                target_on_frac = min(
+                                    max(base_target_on_frac + boost, 0.05),
+                                    0.95,
+                                )
+                        if frac <= 0.0 or frac >= 1.0:
+                            w_on = 1.0
+                            w_off = 1.0
+                        else:
+                            w_on = target_on_frac / float(max(frac, 1e-6))
+                            w_off = (1.0 - target_on_frac) / float(max(1.0 - frac, 1e-6))
+                            ratio = float(w_on) / float(max(w_off, 1e-12))
+                            if ratio > max_ratio:
+                                w_on = w_off * max_ratio
+                        weight_matrix[:, idx] = np.where(
+                            on_per_device[:, idx] > 0.5, w_on, w_off
+                        )
+                    weights_np = weight_matrix.max(axis=1)
+                    weights = torch.from_numpy(weights_np)
+                    train_sampler = torch.utils.data.WeightedRandomSampler(
+                        weights=weights,
+                        num_samples=int(weights.numel()),
+                        replacement=True,
+                    )
+                    logging.info(
+                        "Enable balanced window sampling (multi-device union): on_window_frac=%.4f target_on_frac=%.2f",
+                        on_window_frac,
+                        target_on_frac,
+                    )
+                else:
+                    logging.info(
+                        "Skip balanced window sampling: on_window_frac=%.4f",
+                        on_window_frac,
+                    )
         except Exception as e:
             logging.warning("Could not build balanced sampler: %s", e)
 
@@ -2297,6 +2659,8 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                     n_app = 1
             if n_app < 1:
                 n_app = 1
+            if n_app > 1:
+                threshold_loss = 0.0
 
             # Get device stats (support dict, DictConfig, and object access)
             device_stats_cfg = None
@@ -2323,37 +2687,52 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                                 i, ds.get("duty_cycle", 0), ds.get("peak_power", 0),
                                 ds.get("mean_event_duration", 0))
             else:
-                # Default stats if not provided - will be auto-classified
                 device_stats = [
                     {"duty_cycle": 0.1, "peak_power": 1000.0, "mean_on": 500.0}
                     for _ in range(n_app)
                 ]
                 logging.info("Using DEFAULT device stats (config type: %s)", type(expes_config).__name__)
 
+            per_device_params_cfg = getattr(expes_config, "loss_params_per_device", None)
+            if isinstance(per_device_params_cfg, Mapping) and per_device_params_cfg:
+                per_device_params_norm = {
+                    str(k).strip().lower(): v for k, v in per_device_params_cfg.items()
+                }
+                device_names = _coerce_appliance_names(
+                    expes_config, n_app, getattr(expes_config, "appliance", None)
+                )
+                for j in range(n_app):
+                    name_j = device_names[j] if j < len(device_names) else str(j)
+                    cfg_j = per_device_params_norm.get(str(name_j).strip().lower())
+                    if not isinstance(cfg_j, Mapping):
+                        continue
+                    if j >= len(device_stats):
+                        device_stats.append({})
+                    ds = device_stats[j]
+                    if not isinstance(ds, dict):
+                        ds = dict(ds) if hasattr(ds, "items") else {}
+                    if "name" not in ds:
+                        ds["name"] = name_j
+                    ds["loss_params"] = dict(cfg_j)
+                    device_stats[j] = ds
+
             warmup_epochs = int(getattr(expes_config, "n_warmup_epochs", 2))
             output_ratio = float(getattr(expes_config, "output_ratio", 1.0))
 
-            # Build config overrides from YAML config for loss function scaling
-            # These scale the internal parameters of AdaptiveDeviceLoss
             config_overrides = {}
-            # loss_lambda_energy scales the w_energy weight
-            # New defaults are ~0.17-0.22, so scale is relative to 0.20
-            lambda_energy = float(getattr(expes_config, "loss_lambda_energy", 1.0))
-            if lambda_energy > 1.0:  # Only scale if explicitly set higher
-                config_overrides["energy_weight_scale"] = lambda_energy  # Direct multiplier
-            # loss_alpha_on scales alpha_on (default ~1.5-2.6 depending on device)
-            alpha_on = float(getattr(expes_config, "loss_alpha_on", 1.0))
-            if alpha_on > 2.0:  # Only scale if significantly higher
-                config_overrides["alpha_on_scale"] = alpha_on / 2.0  # 2.0 is approx base
-            # loss_alpha_off scales alpha_off
-            alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
-            if alpha_off != 1.0:
-                config_overrides["alpha_off_scale"] = alpha_off
-            # loss_lambda_on_recall scales recall weight
-            lambda_recall = float(getattr(expes_config, "loss_lambda_on_recall", 1.0))
-            if lambda_recall > 1.0:
-                config_overrides["recall_weight_scale"] = lambda_recall
-
+            if n_app == 1:
+                lambda_energy = float(getattr(expes_config, "loss_lambda_energy", 1.0))
+                if lambda_energy > 0.0:
+                    config_overrides["energy_weight_scale"] = lambda_energy
+                alpha_on = float(getattr(expes_config, "loss_alpha_on", 1.0))
+                if alpha_on > 0.0:
+                    config_overrides["alpha_on_scale"] = alpha_on / 2.0
+                alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
+                if alpha_off > 0.0:
+                    config_overrides["alpha_off_scale"] = alpha_off
+                lambda_recall = float(getattr(expes_config, "loss_lambda_on_recall", 1.0))
+                if lambda_recall > 0.0:
+                    config_overrides["recall_weight_scale"] = lambda_recall
             if config_overrides:
                 logging.info("AdaptiveDeviceLoss config overrides: %s", config_overrides)
 
@@ -2418,6 +2797,28 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             off_state_long_margin = float(
                 getattr(expes_config, "off_state_long_margin", off_state_margin)
             )
+
+        # Configure sparse device CNN bypass for NILMFormer
+        if expes_config.name_model == "NILMFormer" and hasattr(inst_model, "set_sparse_device_indices"):
+            try:
+                # Extract device names from device_stats
+                device_names_for_sparse = []
+                if device_stats:
+                    for ds in device_stats:
+                        name = str(ds.get("name", "")).lower()
+                        device_names_for_sparse.append(name)
+                if device_names_for_sparse:
+                    inst_model.set_sparse_device_indices(
+                        device_names_for_sparse, device_stats=device_stats
+                    )
+                    sparse_indices = getattr(inst_model, "sparse_device_indices", [])
+                    if sparse_indices:
+                        logging.info("NILMFormer: CNN bypass enabled for sparse devices %s (indices: %s)",
+                                    [device_names_for_sparse[i] for i in sparse_indices if i < len(device_names_for_sparse)],
+                                    sparse_indices)
+            except Exception as e:
+                logging.warning("Could not configure sparse device CNN bypass: %s", e)
+
         lightning_module = SeqToSeqLightningModule(
             inst_model,
             learning_rate=float(expes_config.model_training_param.lr),
@@ -2472,6 +2873,90 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             scheduler_type=str(getattr(expes_config, "scheduler_type", "cosine_warmup")),
             total_epochs=int(expes_config.epochs),
         )
+
+        # Configure gradient conflict resolution for multi-device training
+        use_gcr = bool(getattr(expes_config, "use_gradient_conflict_resolution", False))
+        n_devices_for_gcr = getattr(criterion, "n_devices", 1) if criterion is not None else 1
+        if use_gcr and n_devices_for_gcr > 1:
+            # Get balance method - default to "soft" for better stability
+            balance_method = str(getattr(expes_config, "gradient_conflict_balance_method", "soft"))
+            balance_max_ratio = float(getattr(expes_config, "gradient_conflict_balance_max_ratio", 3.0))
+            randomize_order = bool(getattr(expes_config, "gradient_conflict_randomize_order", True))
+
+            lightning_module.set_gradient_conflict_config(
+                use_gradient_conflict_resolution=True,
+                use_pcgrad=bool(getattr(expes_config, "gradient_conflict_use_pcgrad", True)),
+                use_normalization=bool(getattr(expes_config, "gradient_conflict_use_normalization", True)),
+                conflict_threshold=float(getattr(expes_config, "gradient_conflict_threshold", 0.0)),
+                balance_method=balance_method,
+                balance_max_ratio=balance_max_ratio,
+                randomize_order=randomize_order,
+            )
+            logging.info(
+                "[PCGRAD] Gradient conflict resolution enabled for %d devices (balance=%s, max_ratio=%.1f)",
+                n_devices_for_gcr,
+                balance_method,
+                balance_max_ratio,
+            )
+        elif use_gcr and n_devices_for_gcr <= 1:
+            logging.info("[PCGRAD] Disabled: single-device training does not need gradient conflict resolution")
+
+        # Configure gradient isolation for multi-device training
+        # This completely separates device heads so gradients don't interfere
+        use_isolation = bool(getattr(expes_config, "use_gradient_isolation", False))
+        if use_isolation and n_devices_for_gcr > 1:
+            backbone_training = str(getattr(expes_config, "gradient_isolation_backbone", "frozen"))
+            isolated_devices_str = getattr(expes_config, "gradient_isolation_devices", "")
+            isolated_devices = [d.strip() for d in isolated_devices_str.split(",") if d.strip()] if isolated_devices_str else []
+
+            lightning_module.set_gradient_isolation_config(
+                use_gradient_isolation=True,
+                backbone_training=backbone_training,
+                isolated_devices=isolated_devices,
+            )
+            logging.info(
+                "[ISOLATION] Gradient isolation enabled: backbone=%s, isolated_devices=%s",
+                backbone_training,
+                isolated_devices if isolated_devices else "ALL",
+            )
+        elif use_isolation and n_devices_for_gcr <= 1:
+            logging.info("[ISOLATION] Disabled: single-device training does not need gradient isolation")
+
+    # ============== Two-Stage Training Support ==============
+    # Stage 1: Pretrain sparse devices (Kettle, Microwave) alone
+    # Stage 2: Load pretrained weights and freeze sparse devices, train frequent devices
+    load_pretrained_path = getattr(expes_config, "load_pretrained", None)
+    freeze_devices_str = getattr(expes_config, "freeze_devices", None)
+
+    if load_pretrained_path and os.path.isfile(load_pretrained_path):
+        # Load pretrained weights (only model weights, not optimizer state)
+        logging.info("[TWO-STAGE] Loading pretrained weights from: %s", load_pretrained_path)
+        try:
+            checkpoint = torch.load(load_pretrained_path, map_location="cpu")
+            state_dict = checkpoint.get("state_dict", checkpoint)
+            # Filter out incompatible keys if any
+            model_state = lightning_module.state_dict()
+            filtered_state = {k: v for k, v in state_dict.items() if k in model_state and v.shape == model_state[k].shape}
+            missing_keys = set(model_state.keys()) - set(filtered_state.keys())
+            if missing_keys:
+                logging.warning("[TWO-STAGE] Missing keys in checkpoint: %s", missing_keys)
+            lightning_module.load_state_dict(filtered_state, strict=False)
+            logging.info("[TWO-STAGE] Successfully loaded %d/%d parameters from checkpoint",
+                        len(filtered_state), len(model_state))
+        except Exception as e:
+            logging.error("[TWO-STAGE] Failed to load pretrained weights: %s", e)
+
+    if freeze_devices_str:
+        # Get all device names from the appliance config
+        all_device_names = [d.strip() for d in str(expes_config.appliance).split(",")]
+        devices_to_freeze = [d.strip() for d in freeze_devices_str.split(",")]
+        logging.info("[TWO-STAGE] Freezing devices: %s (all devices: %s)", devices_to_freeze, all_device_names)
+        try:
+            lightning_module.freeze_devices(devices_to_freeze, all_device_names)
+            logging.info("[TWO-STAGE] Successfully froze %d devices", len(devices_to_freeze))
+        except Exception as e:
+            logging.error("[TWO-STAGE] Failed to freeze devices: %s", e)
+
     accelerator = "cpu"
     devices = 1
     device_cfg = str(getattr(expes_config, "device", "auto")).lower()
@@ -2552,7 +3037,13 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                 ckpt_last_candidates[0],
             )
     # Enable gradient clipping to prevent gradient explosion with mixed precision
-    gradient_clip_val = 1.0
+    # NOTE: Disable gradient clipping when using PCGrad (manual optimization)
+    # because PyTorch Lightning doesn't support auto gradient clipping with manual optimization.
+    # PCGrad normalizes gradients anyway, so clipping is less critical.
+    use_pcgrad = getattr(lightning_module, "_use_gradient_conflict_resolution", False)
+    gradient_clip_val = None if use_pcgrad else 1.0
+    if use_pcgrad:
+        logging.info("[PCGRAD] Automatic gradient clipping disabled (manual optimization mode)")
     accumulate_grad_batches = int(
         getattr(expes_config, "accumulate_grad_batches", 1)
     )

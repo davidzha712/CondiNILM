@@ -229,14 +229,53 @@ def _read_jsonl(path: str) -> List[Dict[str, Any]]:
     return records
 
 
-def _best_score_from_records(records: List[Dict[str, Any]]) -> Tuple[float, Dict[str, Any]]:
+def _best_score_from_records(
+    records: List[Dict[str, Any]],
+    score_mode: str = "weighted_f1"
+) -> Tuple[float, Dict[str, Any]]:
+    """
+    Calculate best score from validation records.
+
+    score_mode options:
+        - "min_f1": minimize 1 - min(F1) across devices
+        - "mean_f1": minimize 1 - mean(F1) across devices
+        - "weighted_f1": minimize 1 - weighted_mean(F1), with higher weights for difficult devices
+
+    ENHANCED (v4): Added precision penalty for Microwave/Kettle to prevent
+    configurations that achieve high recall but terrible precision (lots of FP).
+    """
+    # Device weights: higher for difficult devices (Microwave, Kettle)
+    DEVICE_WEIGHTS = {
+        "microwave": 2.0,
+        "Microwave": 2.0,
+        "kettle": 1.5,
+        "Kettle": 1.5,
+        "fridge": 1.0,
+        "Fridge": 1.0,
+        "washingmachine": 1.0,
+        "WashingMachine": 1.0,
+        "washing_machine": 1.0,
+        "dishwasher": 1.0,
+        "Dishwasher": 1.0,
+    }
+
+    # Devices that need precision penalty (prone to false positives)
+    PRECISION_PENALTY_DEVICES = {"microwave", "kettle"}
+    PRECISION_THRESHOLD = 0.10  # Minimum acceptable precision
+
     best_score = None
     best_meta: Dict[str, Any] = {}
     for record in records:
         per_device = record.get("metrics_timestamp_per_device") or record.get("metrics_win_per_device")
         f1_vals: List[float] = []
+        f1_weighted_sum = 0.0
+        weight_sum = 0.0
         worst_name = None
         worst_val = None
+        device_f1s: Dict[str, float] = {}
+        device_precisions: Dict[str, float] = {}
+        precision_penalty = 0.0
+
         if isinstance(per_device, dict) and per_device:
             for name, mdict in per_device.items():
                 try:
@@ -244,28 +283,72 @@ def _best_score_from_records(records: List[Dict[str, Any]]) -> Tuple[float, Dict
                 except Exception:
                     continue
                 f1_vals.append(val)
+                device_f1s[name] = val
+                weight = DEVICE_WEIGHTS.get(name, 1.0)
+                f1_weighted_sum += val * weight
+                weight_sum += weight
                 if worst_val is None or val < worst_val:
                     worst_val = val
                     worst_name = str(name)
+
+                # Track precision for penalty calculation
+                try:
+                    precision = float(mdict.get("PRECISION", 0.0))
+                    device_precisions[name] = precision
+
+                    # Add precision penalty for Microwave/Kettle with low precision
+                    # This prevents configurations that achieve recall by predicting
+                    # everything as ON (which gives high recall but terrible precision)
+                    if name.lower() in PRECISION_PENALTY_DEVICES and precision < PRECISION_THRESHOLD:
+                        # Penalty: (threshold - precision) * weight * 2.0
+                        # E.g., if precision=0.003 and threshold=0.10, penalty = 0.097 * 2.0 * 2.0 = 0.388
+                        penalty = (PRECISION_THRESHOLD - precision) * weight * 2.0
+                        precision_penalty += penalty
+                except Exception:
+                    pass
+
         if not f1_vals:
             metrics = record.get("metrics_timestamp") or record.get("metrics_win") or {}
             if "F1_SCORE" in metrics:
                 try:
                     f1_vals = [float(metrics.get("F1_SCORE"))]
+                    f1_weighted_sum = f1_vals[0]
+                    weight_sum = 1.0
                 except Exception:
                     f1_vals = []
+
         if not f1_vals:
             continue
+
         min_f1 = float(min(f1_vals))
-        score = 1.0 - min_f1
+        mean_f1 = float(sum(f1_vals) / len(f1_vals))
+        weighted_f1 = float(f1_weighted_sum / weight_sum) if weight_sum > 0 else mean_f1
+
+        # Select score based on mode
+        if score_mode == "min_f1":
+            score = 1.0 - min_f1
+        elif score_mode == "mean_f1":
+            score = 1.0 - mean_f1
+        else:  # weighted_f1 (default)
+            score = 1.0 - weighted_f1
+
+        # Add precision penalty for low-precision devices
+        score += precision_penalty
+
         if bool(record.get("collapse_flag", False)):
             score += 1.0
+
         if best_score is None or score < best_score:
             best_score = score
             best_meta = {
                 "epoch": int(record.get("epoch", -1)),
                 "min_f1": min_f1,
+                "mean_f1": mean_f1,
+                "weighted_f1": weighted_f1,
                 "worst_device": worst_name if isinstance(worst_name, str) else None,
+                "device_f1s": device_f1s,
+                "device_precisions": device_precisions,
+                "precision_penalty": precision_penalty,
                 "energy_ratio": float(record.get("energy_ratio", 0.0)),
                 "off_energy_ratio": float(record.get("off_energy_ratio", 0.0)),
                 "pred_raw_max": float(record.get("pred_raw_max", 0.0)),
@@ -365,7 +448,8 @@ def run_study_for_dataset(
         launch_one_experiment(expes_config)
         group_dir = _get_group_dir(expes_config)
         records = _read_jsonl(os.path.join(group_dir, "val_report.jsonl"))
-        score, meta = _best_score_from_records(records)
+        # Use weighted_f1 score mode (prioritizes difficult devices like Microwave)
+        score, meta = _best_score_from_records(records, score_mode="weighted_f1")
         trial.set_user_attr("group_dir", group_dir)
         for k, v in meta.items():
             trial.set_user_attr(k, v)

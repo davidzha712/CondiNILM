@@ -13,18 +13,28 @@ import numpy as np
 CYCLING_DEVICE_TYPES = frozenset({"frequent_switching", "cycling_low_power", "cycling_infrequent"})
 
 # Base loss parameters for each device type
+# V3: 添加回归优化参数 (w_energy, w_on_power, w_peak, w_grad, w_range)
 DEVICE_TYPE_BASE_PARAMS = {
+    # Microwave/Kettle: 稀疏高功率设备
+    # V4: 降低ON权重、提高OFF权重以减少假阳性
+    # 问题：之前alpha_on=8.0导致过度检测ON，precision很低
     "sparse_high_power": {
-        "alpha_on": 7.0,
-        "alpha_off": 0.3,
-        "lambda_zero": 0.01,
-        "lambda_sparse": 0.01,
-        "lambda_off_hard": 0.02,
-        "lambda_on_recall": 1.5,
-        "on_recall_margin": 0.9,
-        "lambda_gate_cls": 0.1,
-        "lambda_energy": 0.03,
-        "off_margin": 0.02,
+        "alpha_on": 5.0,            # 降低ON权重减少过度检测 (从8.0降到5.0)
+        "alpha_off": 2.5,           # 提高OFF权重强化OFF状态 (从1.5升到2.5)
+        "lambda_zero": 0.04,        # 略微提高zero惩罚
+        "lambda_sparse": 0.008,     # 略微提高稀疏惩罚
+        "lambda_off_hard": 0.12,    # 增加OFF硬惩罚 (从0.05升到0.12)
+        "lambda_on_recall": 1.8,    # 降低recall压力减少假阳性 (从2.5降到1.8)
+        "on_recall_margin": 0.75,   # 略微降低margin
+        "lambda_gate_cls": 0.6,     # 略微降低gate权重
+        "lambda_energy": 0.25,
+        "off_margin": 0.035,        # 略微提高off margin
+        # 回归优化参数
+        "w_energy": 0.25,           # 能量回归权重
+        "w_on_power": 0.12,         # ON功率精度权重
+        "w_peak": 0.08,             # 峰值检测权重 (中等)
+        "w_grad": 0.05,             # 梯度平滑权重 (较低，允许快速变化)
+        "w_range": 0.18,            # 提高范围约束权重 (防止过度预测)
     },
     "frequent_switching": {
         "alpha_on": 3.0,
@@ -37,6 +47,12 @@ DEVICE_TYPE_BASE_PARAMS = {
         "lambda_gate_cls": 0.15,
         "lambda_energy": 0.2,
         "off_margin": 0.02,
+        # 回归优化参数
+        "w_energy": 0.22,
+        "w_on_power": 0.10,
+        "w_peak": 0.10,             # 中等峰值权重
+        "w_grad": 0.08,             # 适度梯度平滑
+        "w_range": 0.08,
     },
     "cycling_infrequent": {
         "alpha_on": 3.0,
@@ -49,30 +65,52 @@ DEVICE_TYPE_BASE_PARAMS = {
         "lambda_gate_cls": 0.18,
         "lambda_energy": 0.2,
         "off_margin": 0.015,
+        # 回归优化参数
+        "w_energy": 0.22,
+        "w_on_power": 0.10,
+        "w_peak": 0.12,
+        "w_grad": 0.06,
+        "w_range": 0.08,
     },
+    # Fridge: 周期性低功率设备
+    # 需要捕获压缩机启动峰值，同时保持周期性波形
     "cycling_low_power": {
-        "alpha_on": 3.0,
+        "alpha_on": 2.8,
         "alpha_off": 2.0,
         "lambda_zero": 0.02,
         "lambda_sparse": 0.005,
-        "lambda_off_hard": 0.12,
-        "lambda_on_recall": 1.0,
-        "on_recall_margin": 0.7,
-        "lambda_gate_cls": 0.15,
-        "lambda_energy": 0.2,
-        "off_margin": 0.02,
-    },
-    "long_cycle": {
-        "alpha_on": 4.0,
-        "alpha_off": 1.5,
-        "lambda_zero": 0.1,
-        "lambda_sparse": 0.02,
-        "lambda_off_hard": 0.08,
+        "lambda_off_hard": 0.25,
         "lambda_on_recall": 0.8,
         "on_recall_margin": 0.6,
-        "lambda_gate_cls": 0.1,
-        "lambda_energy": 0.15,
-        "off_margin": 0.02,
+        "lambda_gate_cls": 0.18,
+        "lambda_energy": 0.2,
+        "off_margin": 0.008,
+        # 回归优化参数 - 强调峰值和梯度
+        "w_energy": 0.28,           # 高能量权重
+        "w_on_power": 0.15,         # 高ON功率权重
+        "w_peak": 0.18,             # 高峰值权重! 捕获压缩机启动
+        "w_grad": 0.10,             # 适度梯度平滑，跟随周期变化
+        "w_range": 0.05,            # 低范围约束 (冰箱功率相对稳定)
+    },
+    # WashingMachine/Dishwasher: 长周期设备
+    # 多阶段功率变化，需要梯度平滑和能量准确
+    "long_cycle": {
+        "alpha_on": 5.0,
+        "alpha_off": 2.5,
+        "lambda_zero": 0.08,
+        "lambda_sparse": 0.015,
+        "lambda_off_hard": 0.12,
+        "lambda_on_recall": 0.6,
+        "on_recall_margin": 0.65,
+        "lambda_gate_cls": 0.2,
+        "lambda_energy": 0.12,
+        "off_margin": 0.015,
+        # 回归优化参数 - 强调能量和梯度
+        "w_energy": 0.30,           # 高能量权重 (长周期总能量重要)
+        "w_on_power": 0.12,         # 中等ON功率权重
+        "w_peak": 0.10,             # 中等峰值权重
+        "w_grad": 0.12,             # 高梯度平滑 (多阶段变化需要平滑)
+        "w_range": 0.10,            # 中等范围约束
     },
     "always_on": {
         "alpha_on": 1.0,
@@ -85,6 +123,12 @@ DEVICE_TYPE_BASE_PARAMS = {
         "lambda_gate_cls": 0.05,
         "lambda_energy": 0.25,
         "off_margin": 0.03,
+        # 回归优化参数 - 强调稳定性
+        "w_energy": 0.30,           # 高能量权重 (持续功率)
+        "w_on_power": 0.08,
+        "w_peak": 0.02,             # 低峰值权重 (几乎无峰值)
+        "w_grad": 0.15,             # 高梯度平滑 (稳定输出)
+        "w_range": 0.05,
     },
     "sparse_medium_power": {
         "alpha_on": 4.0,
@@ -97,6 +141,12 @@ DEVICE_TYPE_BASE_PARAMS = {
         "lambda_gate_cls": 0.1,
         "lambda_energy": 0.08,
         "off_margin": 0.02,
+        # 回归优化参数
+        "w_energy": 0.20,
+        "w_on_power": 0.10,
+        "w_peak": 0.08,
+        "w_grad": 0.06,
+        "w_range": 0.10,
     },
 }
 
@@ -116,15 +166,21 @@ LONG_CYCLE_LOW_DUTY_PARAMS = {
 # Device type specific config defaults (using dict lookup instead of nested ternary)
 # FIXED: Reduced gate_floor values to prevent floor noise in OFF state
 # Previous high values (e.g., 0.4 for sparse_high_power) caused significant floor noise
+# OPTIMIZED (v4): Gate配置 - 针对各设备类型调整Gate参数
+# LESSON LEARNED: gate_floor=0.02 for sparse devices caused minimum 2% activation even in OFF state
+# This led to false positives. Reduced to 0.008 to allow near-zero outputs.
 DEVICE_TYPE_GATE_CONFIG = {
-    "sparse_high_power": {"gate_soft_scale": 0.5, "gate_floor": 0.01, "gate_duty_weight": 0.0},  # Was 0.4
+    # TWO-STAGE V4: Microwave/Kettle - lower gate_floor for true zeros
+    "sparse_high_power": {"gate_soft_scale": 3.0, "gate_floor": 0.008, "gate_duty_weight": 0.06},
     "frequent_switching": {"gate_soft_scale": 2.0, "gate_floor": 0.005, "gate_duty_weight": 0.05},
     "cycling_infrequent": {"gate_soft_scale": 2.0, "gate_floor": 0.01, "gate_duty_weight": 0.01},
-    "cycling_low_power": {"gate_soft_scale": 2.0, "gate_floor": 0.01, "gate_duty_weight": 0.02},  # Was 0.02
-    "long_cycle": {"gate_soft_scale": 1.0, "gate_floor": 0.02, "gate_duty_weight": 0.0},  # Was 0.1
-    "always_on": {"gate_soft_scale": 1.0, "gate_floor": 0.05, "gate_duty_weight": 0.0},  # Was 0.1
-    "sparse_medium_power": {"gate_soft_scale": 1.0, "gate_floor": 0.02, "gate_duty_weight": 0.0},  # Was 0.1
-    "unknown": {"gate_soft_scale": 1.0, "gate_floor": 0.02, "gate_duty_weight": 0.0},  # Was 0.1
+    # Fridge: 降低gate_floor减少OFF泄漏，提高scale增加锐度
+    "cycling_low_power": {"gate_soft_scale": 2.5, "gate_floor": 0.008, "gate_duty_weight": 0.02},
+    # WashingMachine/Dishwasher: 降低gate_floor防止饱和，提高scale
+    "long_cycle": {"gate_soft_scale": 1.5, "gate_floor": 0.005, "gate_duty_weight": 0.02},
+    "always_on": {"gate_soft_scale": 1.0, "gate_floor": 0.05, "gate_duty_weight": 0.0},
+    "sparse_medium_power": {"gate_soft_scale": 1.0, "gate_floor": 0.02, "gate_duty_weight": 0.0},
+    "unknown": {"gate_soft_scale": 1.0, "gate_floor": 0.02, "gate_duty_weight": 0.0},
 }
 
 DEVICE_TYPE_POSTPROCESS_CONFIG = {
@@ -139,7 +195,8 @@ DEVICE_TYPE_POSTPROCESS_CONFIG = {
 }
 
 DEVICE_TYPE_ZERO_PENALTY_CONFIG = {
-    "sparse_high_power": {"weight": 0.0, "kernel": 1, "ratio": 0.9},
+    # V4: 适度zero penalty - 太高会导致模型塌缩
+    "sparse_high_power": {"weight": 0.15, "kernel": 24, "ratio": 0.88},
     "frequent_switching": {"weight": 0.2, "kernel": 12, "ratio": 0.55},
     "cycling_infrequent": {"weight": 0.02, "kernel": 18, "ratio": 0.8},
     "cycling_low_power": {"weight": 0.015, "kernel": 12, "ratio": 0.55},
@@ -151,7 +208,8 @@ DEVICE_TYPE_ZERO_PENALTY_CONFIG = {
 }
 
 DEVICE_TYPE_OFF_PENALTY_CONFIG = {
-    "sparse_high_power": {"off_high_agg": 0.0, "off_state": 0.0, "off_state_long": 0.0},
+    # V4: Microwave/Kettle - 适度OFF惩罚减少假阳性
+    "sparse_high_power": {"off_high_agg": 0.12, "off_state": 0.08, "off_state_long": 0.03},
     "frequent_switching": {"off_high_agg": 0.02, "off_state": 0.1, "off_state_long": 0.2},
     "cycling_infrequent": {"off_high_agg": 0.01, "off_state": 0.015, "off_state_long": 0.1},
     "cycling_low_power": {"off_high_agg": 0.02, "off_state": 0.01, "off_state_long": 0.05},
@@ -511,9 +569,13 @@ def apply_device_type_config_defaults(
         except Exception:
             pass
 
-    # Gate weights for cycling devices
+    # Gate weights - enabled for all device types with learnable gate_bias architecture
+    # CRITICAL: sparse_high_power devices (Kettle, Microwave) especially need gate supervision
+    # to learn when to activate vs suppress output
     is_cycling = device_type in CYCLING_DEVICE_TYPES
-    _set_if_missing(expes_config, "gate_cls_weight", 1.0 if is_cycling else 0.0)
+    is_sparse = device_type in ("sparse_high_power", "sparse_medium_power", "sparse_long_cycle")
+    # Enable gate_cls for both cycling and sparse devices
+    _set_if_missing(expes_config, "gate_cls_weight", 1.0 if (is_cycling or is_sparse) else 0.0)
     _set_if_missing(expes_config, "gate_window_weight", 0.5 if is_cycling else 0.0)
 
     # Postprocess threshold
@@ -526,7 +588,12 @@ def apply_device_type_config_defaults(
                 max_factor = thr_cfg["max_factor"]
                 if factor > 0:
                     post_thr = float(threshold) + factor * max(0.0, float(mean_on) - float(threshold))
-                    post_thr = min(post_thr, max(float(threshold), max_factor * float(mean_on)))
+                if max_factor > 0 and float(mean_on) > 0:
+                    cap = max_factor * float(mean_on)
+                    if float(mean_on) < float(threshold):
+                        post_thr = min(post_thr, cap)
+                    else:
+                        post_thr = min(post_thr, max(float(threshold), cap))
             except Exception:
                 pass
         expes_config["postprocess_threshold"] = float(post_thr)
