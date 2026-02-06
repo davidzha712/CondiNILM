@@ -1,0 +1,30 @@
+# Core ML/DL frameworks (install PyTorch separately per your CUDA/CPU environment)
+# torch
+# torchvision
+# torchaudio
+pytorch-lightning
+lightning
+torchmetrics
+
+# Data processing
+numpy
+pandas
+scipy
+scikit-learn
+
+# Configuration
+omegaconf
+pyyaml
+
+# Visualization and logging
+matplotlib
+tensorboard
+streamlit
+
+# Hyperparameter optimization
+optuna
+optuna-dashboard
+
+# Utilities
+tqdm
+einops
