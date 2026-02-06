@@ -145,7 +145,7 @@ REDD:
       redd_name: "fridge"
 
     microwave:
-      min_threshold: 150
+      min_threshold: 200   # Increased from 150 - catches fan/transformer noise at US 120V
       max_threshold: 3000
       min_on_duration: 1
       min_off_duration: 2
@@ -167,7 +167,7 @@ REDD:
       redd_name: "dish washer"
 
     washing_machine:
-      min_threshold: 15
+      min_threshold: 50    # Increased from 15 - catches standby power at US 120V
       max_threshold: 6000
       min_on_duration: 60
       min_off_duration: 8
@@ -225,55 +225,43 @@ REDD:
   training:
     default_sampling_rate: "1min"
     default_window_size: 128
-    overlap: 0.75
-    batch_size: 64  # Smaller due to less data
+    overlap: 0.75     # Reverted - 0.875 caused DW collapse and training instability
+    batch_size: 64    # Reverted - 32 didn't help with tiny dataset
     epochs: 30  # More epochs due to smaller dataset
     learning_rate: 5e-5  # Lower LR for stability
     weight_decay: 0.02
-    early_stopping_patience: 7
+    early_stopping_patience: 10  # Increased from 7 - need patience for tiny dataset
+    limit_train_batches: 1.0  # Use 100% - REDD is small, can't subsample
+    limit_val_batches: 1.0    # Use 100% - 0.2 * 1 batch < 1 causes crash
 
-  # Loss function hyperparameters (tuned for REDD - balanced F1 and power regression)
-  # After optimization: F1=0.619, energy_ratio=0.318
+  # Loss function hyperparameters for REDD
+  # Only override anti-collapse and output_ratio; let HPO handle other loss params
+  # (loss_alpha_on/off, gate params etc. pass through from HPO)
   loss:
     loss_type: "multi_nilm"
     output_ratio: 0.65  # Balanced ratio for both metrics
 
-    # Power regression optimization (scaled via config_overrides in AdaptiveDeviceLoss)
-    # Default w_energy is now ~0.17-0.22, this multiplier scales it further
-    loss_lambda_energy: 1.5  # Moderate multiplier for energy/power regression
-    loss_alpha_on: 6.0  # Higher weight for ON state power regression
-    loss_alpha_off: 0.5  # Lower weight for OFF state
-
-    # Classification optimization
-    loss_lambda_on_recall: 2.0  # High recall weight to predict more ON states
-    loss_on_recall_margin: 0.9  # High margin for recall loss
-
-    # Anti-collapse settings (relaxed for better predictions)
-    anti_collapse_weight: 0.15  # Low
-    state_zero_penalty_weight: 0.01  # Low
-    state_zero_kernel: 12  # Medium kernel
-    off_high_agg_penalty_weight: 0.05  # Low
-
-    # Additional regression weights
-    loss_lambda_grad: 0.25  # Low smoothness
-    loss_lambda_sparse: 0.005  # Low sparse penalty
-    loss_lambda_off_hard: 0.02  # Low off penalty
+    # Anti-collapse settings (kept moderate - higher values collapse DW)
+    anti_collapse_weight: 0.15
+    state_zero_penalty_weight: 0.01
+    state_zero_kernel: 12
+    off_high_agg_penalty_weight: 0.05
 
   # Postprocess configuration per appliance
   # NOTE: For sparse devices like microwave, use lower thresholds to catch peaks
   postprocess:
     dishwasher:
-      threshold: 15
-      min_on_steps: 4
+      threshold: 30       # Moderate - DW mean_on ~500W, 30W filters low noise
+      min_on_steps: 3     # Reduced from 4 - DW events can start/stop within fewer steps
     washing_machine:
-      threshold: 12
+      threshold: 40      # Increased from 12 - above standby noise at US 120V
       min_on_steps: 3
     fridge:
-      threshold: 25
+      threshold: 20      # Lowered from 25 - US fridge mean_on ~80-150W, 20W is safe
       min_on_steps: 2
     microwave:
-      threshold: 80   # INCREASED - microwave min_threshold is 150W, use 80W for post
-      min_on_steps: 1  # REDUCED - microwave peaks can be very short at 5s sampling
+      threshold: 120     # Increased from 80 - US MW ~800-1500W, 120W safely above noise
+      min_on_steps: 1
     cooker:
       threshold: 50
       min_on_steps: 2
@@ -299,7 +287,7 @@ REFIT:
   # Available appliances
   appliances:
     Dishwasher:
-      min_threshold: 10
+      min_threshold: 50    # Increased from 10 - UK DW standby/fan noise 10-40W
       max_threshold: 2500
       min_on_duration: 180
       min_off_duration: 180
@@ -308,7 +296,7 @@ REFIT:
       houses: [1, 2, 3, 5, 6, 7, 9, 10, 13, 15, 16, 18, 20]
 
     WashingMachine:
-      min_threshold: 20
+      min_threshold: 50    # Increased from 20 - UK WM standby 20-50W
       max_threshold: 2500
       min_on_duration: 180
       min_off_duration: 16
@@ -334,6 +322,15 @@ REFIT:
       device_type: "sparse_high_power"
       houses: [2, 3, 4, 6, 8, 9, 10, 12, 13, 15, 17, 18, 19, 20]
 
+    Fridge:
+      min_threshold: 50
+      max_threshold: 300
+      min_on_duration: 6
+      min_off_duration: 1
+      min_activation_time: 1
+      device_type: "cycling_low_power"
+      houses: [2, 5, 6, 7, 9, 12, 15, 17, 19, 20]
+
   # Training configuration
   training:
     default_sampling_rate: "1min"
@@ -344,30 +341,34 @@ REFIT:
     learning_rate: 1e-4
     weight_decay: 0.01
     early_stopping_patience: 5
+    limit_train_batches: 0.5  # Use 50% - REFIT has more data than REDD
+    limit_val_batches: 1.0    # Use 100% for reliable validation metrics
 
   # Loss function hyperparameters
-  # NOTE: Using relaxed values (same as UKDALE/REDD) to prevent collapse
+  # Only override anti-collapse; let HPO handle output_ratio and other loss params
   loss:
     loss_type: "multi_nilm"
-    output_ratio: 0.5
-    anti_collapse_weight: 0.15  # REDUCED from 0.8
-    state_zero_penalty_weight: 0.01  # REDUCED from 0.1
-    state_zero_kernel: 32  # REDUCED from 48
-    off_high_agg_penalty_weight: 0.05  # REDUCED from 0.3
+    anti_collapse_weight: 0.5      # Increased from 0.15 - match UKDALE proven value
+    state_zero_penalty_weight: 0.05  # Increased from 0.01 - match UKDALE
+    state_zero_kernel: 32
+    off_high_agg_penalty_weight: 0.15  # Increased from 0.05 - match UKDALE
 
   # Postprocess configuration
   postprocess:
     Dishwasher:
-      threshold: 20
-      min_on_steps: 6
+      threshold: 150      # Increased from 20 - DW mean_on ~500-1000W, 150W filters noise
+      min_on_steps: 4     # Reduced from 6 - DW events at 1min sampling can be short
     WashingMachine:
       threshold: 20
       min_on_steps: 5
     Kettle:
-      threshold: 20
+      threshold: 800       # Match UKDALE (kettle power >2000W, 800W is safe)
       min_on_steps: 2
     Microwave:
-      threshold: 40
+      threshold: 150       # Above noise floor but below real MW events (~700W+)
+      min_on_steps: 1      # MW events can be single-step at 1-min sampling
+    Fridge:
+      threshold: 18
       min_on_steps: 3
 
 # ============================================================

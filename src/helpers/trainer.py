@@ -46,6 +46,7 @@ class AdaptiveDeviceLoss(nn.Module):
     SPARSE_HIGH_POWER = "sparse_high_power"  # Kettle, Microwave
     CYCLING = "cycling"                       # Fridge
     LONG_CYCLE = "long_cycle"                # Washer, Dishwasher
+    SPARSE_LONG_CYCLE = "sparse_long_cycle"  # REDD Washer (sparse + multi-phase)
     ALWAYS_ON = "always_on"                  # Base load devices
 
     def __init__(
@@ -174,7 +175,9 @@ class AdaptiveDeviceLoss(nn.Module):
         else:
             raw_type = str(stats.get("device_type", "") or "").lower()
             if raw_type:
-                if raw_type in ("sparse_high_power", "sparse_medium_power"):
+                if raw_type == "sparse_long_cycle":
+                    device_type = self.SPARSE_LONG_CYCLE
+                elif raw_type in ("sparse_high_power", "sparse_medium_power"):
                     device_type = self.SPARSE_HIGH_POWER
                 elif raw_type in (
                     "cycling_low_power",
@@ -257,6 +260,8 @@ class AdaptiveDeviceLoss(nn.Module):
     ) -> str:
         """
         Classify device type from electrical statistics.
+        NOTE: SPARSE_LONG_CYCLE is only reachable via explicit device_type in YAML config,
+        not via this heuristic classifier.
 
         Classification is based primarily on DUTY CYCLE and EVENT DURATION
         which are scale-independent (work with normalized or raw data).
@@ -336,6 +341,18 @@ class AdaptiveDeviceLoss(nn.Module):
             # Precision improvement comes from OFF regression loss, not gate classification.
             # LESSON: Increasing gate_alpha_off or lambda_gate_cls for sparse devices
             # causes collapse (tested 0.5-2.0 lambda_gate_cls, all collapsed kettle+microwave).
+        elif device_type == self.SPARSE_LONG_CYCLE:
+            # Hybrid: sparse_high_power ON-bias + long_cycle multi-phase regression
+            params["alpha_on"] = 6.0 * alpha_on_scale
+            params["alpha_off"] = 0.3 * alpha_off_scale
+            params["w_main"] = 0.40
+            params["w_recall"] = 0.25 * recall_scale
+            params["w_off_fp"] = 0.08
+            params["w_energy"] = 0.18 * energy_scale
+            params["w_on_power"] = 0.12
+            params["w_hard_zero"] = 0.04
+            params["off_margin"] = 0.015
+            params["w_peak"] = 0.0
         elif device_type == self.LONG_CYCLE:
             params["alpha_on"] = 2.5 * alpha_on_scale
             params["alpha_off"] = 0.8 * alpha_off_scale
@@ -401,6 +418,7 @@ class AdaptiveDeviceLoss(nn.Module):
         # Solution: Give sparse devices 5-10x weight advantage
         base_weights = {
             self.SPARSE_HIGH_POWER: 3.0,  # INCREASED from 1.5 - aggressive for sparse
+            self.SPARSE_LONG_CYCLE: 2.5,  # Between sparse and long_cycle
             self.LONG_CYCLE: 1.3,         # INCREASED from 1.2
             self.CYCLING: 1.0,
             self.ALWAYS_ON: 0.8,          # DECREASED to give more relative weight to sparse

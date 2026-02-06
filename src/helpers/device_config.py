@@ -150,6 +150,26 @@ DEVICE_TYPE_BASE_PARAMS = {
         "w_grad": 0.06,
         "w_range": 0.10,
     },
+    # Sparse long-cycle: hybrid of sparse_high_power and long_cycle
+    # For devices like REDD washing_machine (<5% duty, multi-phase power)
+    "sparse_long_cycle": {
+        "alpha_on": 6.0,            # High weight for rare ON events
+        "alpha_off": 0.3,           # Low OFF penalty (sparse device)
+        "lambda_zero": 0.03,
+        "lambda_sparse": 0.005,
+        "lambda_off_hard": 0.01,
+        "lambda_on_recall": 2.0,    # High recall for sparse events
+        "on_recall_margin": 0.85,
+        "lambda_gate_cls": 0.15,
+        "lambda_energy": 0.18,
+        "off_margin": 0.015,
+        # 回归优化参数 - multi-phase power needs energy + gradient
+        "w_energy": 0.28,
+        "w_on_power": 0.12,
+        "w_peak": 0.0,              # Disabled (no sharp peaks like kettle)
+        "w_grad": 0.10,
+        "w_range": 0.10,
+    },
 }
 
 LONG_CYCLE_LOW_DUTY_PARAMS = {
@@ -185,6 +205,7 @@ DEVICE_TYPE_GATE_CONFIG = {
     "long_cycle": {"gate_soft_scale": 2.0, "gate_floor": 0.005, "gate_duty_weight": 0.03},
     "always_on": {"gate_soft_scale": 1.0, "gate_floor": 0.05, "gate_duty_weight": 0.0},
     "sparse_medium_power": {"gate_soft_scale": 1.0, "gate_floor": 0.02, "gate_duty_weight": 0.0},
+    "sparse_long_cycle": {"gate_soft_scale": 2.0, "gate_floor": 0.01, "gate_duty_weight": 0.03},
     "unknown": {"gate_soft_scale": 1.0, "gate_floor": 0.02, "gate_duty_weight": 0.0},
 }
 
@@ -196,6 +217,7 @@ DEVICE_TYPE_POSTPROCESS_CONFIG = {
     "long_cycle": {"min_on_steps": 5},
     "always_on": {"min_on_steps": 2},
     "sparse_medium_power": {"min_on_steps": 2},
+    "sparse_long_cycle": {"min_on_steps": 3},
     "unknown": {"min_on_steps": 2},
 }
 
@@ -209,6 +231,7 @@ DEVICE_TYPE_ZERO_PENALTY_CONFIG = {
     "long_cycle": {"weight": 0.1, "kernel": 48, "ratio": 0.9},
     "always_on": {"weight": 0.05, "kernel": 16, "ratio": 0.9},
     "sparse_medium_power": {"weight": 0.05, "kernel": 16, "ratio": 0.9},
+    "sparse_long_cycle": {"weight": 0.05, "kernel": 32, "ratio": 0.88},
     "unknown": {"weight": 0.05, "kernel": 16, "ratio": 0.9},
 }
 
@@ -224,6 +247,7 @@ DEVICE_TYPE_OFF_PENALTY_CONFIG = {
     "long_cycle_low_duty": {"off_high_agg": 0.03, "off_state": 0.02, "off_state_long": 0.01},
     "always_on": {"off_high_agg": 0.01, "off_state": 0.0, "off_state_long": 0.0},
     "sparse_medium_power": {"off_high_agg": 0.01, "off_state": 0.0, "off_state_long": 0.0},
+    "sparse_long_cycle": {"off_high_agg": 0.04, "off_state": 0.03, "off_state_long": 0.01},
     "unknown": {"off_high_agg": 0.01, "off_state": 0.0, "off_state_long": 0.0},
 }
 
@@ -325,6 +349,12 @@ def get_device_loss_params(device_type, duty_cycle):
         if float(duty_cycle) < 0.05:
             return dict(LONG_CYCLE_LOW_DUTY_PARAMS)
         return dict(DEVICE_TYPE_BASE_PARAMS["long_cycle"])
+
+    if device_type == "sparse_long_cycle":
+        params = dict(DEVICE_TYPE_BASE_PARAMS["sparse_long_cycle"])
+        if float(duty_cycle) < 0.03:
+            params["lambda_on_recall"] = 3.0  # Boost recall for very sparse (<3% duty)
+        return params
 
     base = DEVICE_TYPE_BASE_PARAMS.get(device_type)
     if base is None:

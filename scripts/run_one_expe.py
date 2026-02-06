@@ -868,8 +868,10 @@ def launch_one_experiment(expes_config: OmegaConf):
     ds_loss = params_manager.get_loss_config(dataset_name)
 
     # Apply training params if not already set
+    # Keys that should always override from dataset config (small datasets need full batches)
+    _always_override_keys = {"limit_train_batches", "limit_val_batches"}
     for key, value in ds_training.items():
-        if key not in expes_config or getattr(expes_config, key, None) is None:
+        if key in _always_override_keys or key not in expes_config or getattr(expes_config, key, None) is None:
             try:
                 expes_config[key] = value
             except Exception:
@@ -969,12 +971,23 @@ def launch_one_experiment(expes_config: OmegaConf):
         if merged:
             expes_config["loss_params_per_device"] = merged
     hpo_override = getattr(expes_config, "hpo_override", None)
-    if isinstance(hpo_override, dict) and hpo_override:
+    # Fix: OmegaConf DictConfig is not isinstance(dict), check for items() method
+    if hpo_override is not None and hasattr(hpo_override, 'items'):
+        # For non-UKDALE: only block HPO keys that the dataset explicitly overrides in ds_loss
+        # This lets HPO-tuned params (loss_alpha_on/off, gate params, etc.) pass through
+        # when the dataset doesn't set them, while protecting dataset-specific tuning
+        _ds_loss_keys = set(ds_loss.keys()) if ds_loss else set()
+        skipped = []
         for key, value in hpo_override.items():
+            if dataset_name != "UKDALE" and key in _ds_loss_keys:
+                skipped.append(key)
+                continue  # Skip HPO params that the dataset explicitly overrides
             try:
                 expes_config[key] = value
             except Exception:
                 pass
+        if dataset_name != "UKDALE":
+            logging.info("HPO override for %s: applied all except ds_loss keys %s", dataset_name, skipped)
 
     # Get dynamic output channels (number of devices)
     app_list = getattr(expes_config, "app", None)
@@ -1026,14 +1039,20 @@ def launch_one_experiment(expes_config: OmegaConf):
         hpo_override = getattr(expes_config, "hpo_override", None)
         # Fix: OmegaConf DictConfig is not isinstance(dict), check for items() method
         if hpo_override is not None and hasattr(hpo_override, 'items'):
+            _ds_loss_keys = set(ds_loss.keys()) if ds_loss else set()
             hpo_dict = dict(hpo_override)
-            logging.info("Applying %d HPO overrides (cached branch)", len(hpo_dict))
+            applied = 0
+            skipped = []
             for key, value in hpo_dict.items():
+                if dataset_name != "UKDALE" and key in _ds_loss_keys:
+                    skipped.append(key)
+                    continue
                 try:
                     OmegaConf.update(expes_config, key, value, merge=True)
-                    logging.info("Applied HPO override: %s=%s", key, value)
+                    applied += 1
                 except Exception as e:
                     logging.warning("Failed to apply HPO override %s=%s: %s", key, value, e)
+            logging.info("Applied %d/%d HPO overrides (cached branch, dataset=%s, skipped ds_loss keys: %s)", applied, len(hpo_dict), dataset_name, skipped)
 
         return launch_models_training(tuple_data, scaler, expes_config)
 
@@ -1324,14 +1343,20 @@ def launch_one_experiment(expes_config: OmegaConf):
     hpo_override = getattr(expes_config, "hpo_override", None)
     # Fix: OmegaConf DictConfig is not isinstance(dict), check for items() method
     if hpo_override is not None and hasattr(hpo_override, 'items'):
+        _ds_loss_keys = set(ds_loss.keys()) if ds_loss else set()
         hpo_dict = dict(hpo_override)
-        logging.info("Applying %d HPO overrides (non-cached branch)", len(hpo_dict))
+        applied = 0
+        skipped = []
         for key, value in hpo_dict.items():
+            if dataset_name != "UKDALE" and key in _ds_loss_keys:
+                skipped.append(key)
+                continue
             try:
                 OmegaConf.update(expes_config, key, value, merge=True)
-                logging.info("Applied HPO override: %s=%s", key, value)
+                applied += 1
             except Exception as e:
                 logging.warning("Failed to apply HPO override %s=%s: %s", key, value, e)
+        logging.info("Applied %d/%d HPO overrides (non-cached branch, dataset=%s, skipped ds_loss keys: %s)", applied, len(hpo_dict), dataset_name, skipped)
 
     scaler = NILMscaler(
         power_scaling_type=expes_config.power_scaling_type,
