@@ -23,6 +23,9 @@ UKDALE:
       min_activation_time: 12
       device_type: "long_cycle"
       houses: [1, 2, 3, 4, 5]
+      # V7.3: REMOVED loss_override - was overriding HPO-optimized params.
+      # alpha_off=3.0 (43x HPO's 0.072) caused R=0.234 (77% events missed).
+      # HPO-derived params: alpha_off~0.069, lambda_on_recall~5.37 should improve recall.
 
     dishwasher:
       min_threshold: 10
@@ -32,6 +35,8 @@ UKDALE:
       min_activation_time: 12
       device_type: "long_cycle"
       houses: [1, 2]
+      # V7.3: REMOVED loss_override - let HPO-aligned auto-config take effect.
+      # Was overriding alpha_off from 0.069 to 2.8, suppressing recall.
 
     kettle:
       min_threshold: 2000
@@ -41,12 +46,8 @@ UKDALE:
       min_activation_time: 1
       device_type: "sparse_high_power"
       houses: [1, 2]
-      # 高精度配置：减少假阳性
-      loss_override:
-        alpha_on: 5.0           # 降低ON权重减少过度检测
-        alpha_off: 3.0          # 提高OFF权重强化OFF状态
-        lambda_off_hard: 0.15   # 增加OFF硬惩罚
-        lambda_on_recall: 1.5   # 降低recall压力减少假阳性
+      # V14: REMOVED loss_override - let HPO params control via config_overrides
+      # Original HPO Trial #46 achieved F1=0.66 without device-specific overrides
 
     microwave:
       min_threshold: 200
@@ -56,12 +57,7 @@ UKDALE:
       min_activation_time: 1
       device_type: "sparse_high_power"
       houses: [1, 2]
-      # 平衡配置：提高召回同时控制假阳性
-      loss_override:
-        alpha_on: 6.0           # 适度ON权重
-        alpha_off: 2.5          # 中等OFF权重
-        lambda_off_hard: 0.12   # 中等OFF惩罚
-        lambda_on_recall: 2.0   # 适度recall压力
+      # V14: REMOVED loss_override - let HPO params control via config_overrides
 
     fridge:
       min_threshold: 50
@@ -97,7 +93,7 @@ UKDALE:
   # Postprocess configuration per appliance
   postprocess:
     washing_machine:
-      threshold: 20
+      threshold: 50       # V7.4: Raised from 20 - WM peak=2627W, 50W filters noise
       min_on_steps: 5
     dishwasher:
       threshold: 20
@@ -106,8 +102,8 @@ UKDALE:
       threshold: 800       # 提高阈值减少假阳性 - kettle功率很高(>2000W)
       min_on_steps: 2
     microwave:
-      threshold: 100       # 适度阈值
-      min_on_steps: 1      # 保持1允许短脉冲检测
+      threshold: 500       # V7.4: Raised from 300 - real MW events ≥700W, 500W filters FP leakage
+      min_on_steps: 2      # V7.3: Raised from 1 - filter single-step noise at 1-min sampling
     fridge:
       threshold: 18
       min_on_steps: 3
