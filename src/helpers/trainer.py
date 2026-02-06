@@ -330,6 +330,7 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_on_power"] = 0.12
             params["w_hard_zero"] = 0.04  # Reverted from 0.06
             params["off_margin"] = 0.02
+            params["w_peak"] = 0.0  # V7.5: Disabled for sparse - causes MW collapse (0.06 tested, collapsed)
             # V7.2d: Gate classification uses regression alphas (alpha_on=3.82, alpha_off=0.15).
             # This is ON-biased for classification, which keeps sparse devices alive.
             # Precision improvement comes from OFF regression loss, not gate classification.
@@ -345,6 +346,7 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_on_power"] = 0.10
             params["w_hard_zero"] = 0.05
             params["off_margin"] = 0.015  # V7.4: Increased from 0.01 for wash cycle edges
+            params["w_peak"] = 0.0  # V7.5: Disabled for long_cycle - hurts DW F1 (0.570→0.423)
         elif device_type == self.CYCLING:
             params["alpha_on"] = 1.5 * alpha_on_scale
             params["alpha_off"] = 1.0 * alpha_off_scale
@@ -355,6 +357,7 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_on_power"] = 0.10
             params["w_hard_zero"] = 0.03
             params["off_margin"] = 0.015
+            params["w_peak"] = 0.0  # V7.5: Disabled for cycling - hurts fridge P (0.698→0.657)
         else:
             # Default/always-on devices
             params["alpha_on"] = 1.0 * alpha_on_scale
@@ -366,6 +369,7 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_on_power"] = 0.08
             params["w_hard_zero"] = 0.02
             params["off_margin"] = 0.02
+            params["w_peak"] = 0.0  # V7.5: Disabled for default devices
 
         return params
 
@@ -633,6 +637,23 @@ class AdaptiveDeviceLoss(nn.Module):
             hard_zero_loss = non_zero_penalty.sum() / (true_zero_mask.sum() + eps)
             hard_zero_loss = torch.clamp(hard_zero_loss, 0.0, 3.0)
 
+        # === Component 7: Peak amplitude loss ===
+        # V7.5: Incentivize matching peak power (e.g., fridge compressor startup spikes).
+        # w_peak was defined in device_config but never used since V6 simplification.
+        w_peak = float(params.get("w_peak", 0.0))
+        peak_loss = pred.new_tensor(0.0)
+        if w_peak > 0 and on_mask.sum() > 0:
+            # Per-sample max ON power comparison
+            pred_on = pred * on_mask
+            target_on = target * on_mask
+            pred_peak = pred_on.amax(dim=-1)   # (B, C) or (B, 1)
+            target_peak = target_on.amax(dim=-1)
+            active = (target_peak > threshold).float()
+            if active.sum() > 0:
+                peak_error = torch.abs(pred_peak - target_peak) / (target_peak + eps)
+                peak_loss = (peak_error * active).sum() / (active.sum() + eps)
+                peak_loss = torch.clamp(peak_loss, 0.0, 3.0)
+
         # === Combine all components with FIXED weights ===
         w_main = float(params.get("w_main", 0.45))
         w_off_fp = float(params.get("w_off_fp", 0.1))
@@ -642,7 +663,8 @@ class AdaptiveDeviceLoss(nn.Module):
                  w_off_fp * off_fp_loss +
                  w_on_power * on_power_loss +
                  w_energy * energy_loss +
-                 w_hard_zero * hard_zero_loss)
+                 w_hard_zero * hard_zero_loss +
+                 w_peak * peak_loss)
 
         return total
 

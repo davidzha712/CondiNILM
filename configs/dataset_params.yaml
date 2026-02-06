@@ -93,8 +93,8 @@ UKDALE:
   # Postprocess configuration per appliance
   postprocess:
     washing_machine:
-      threshold: 50       # V7.4: Raised from 20 - WM peak=2627W, 50W filters noise
-      min_on_steps: 5
+      threshold: 20       # V7.5j: Lowered from 50 - WM mean_on=539W, 20W is safe
+      min_on_steps: 2     # V7.5j: Lowered from 5 - WM rinse/spin phases can be 2-3 steps at 1min
     dishwasher:
       threshold: 20
       min_on_steps: 6
@@ -102,8 +102,8 @@ UKDALE:
       threshold: 800       # 提高阈值减少假阳性 - kettle功率很高(>2000W)
       min_on_steps: 2
     microwave:
-      threshold: 500       # V7.4: Raised from 300 - real MW events ≥700W, 500W filters FP leakage
-      min_on_steps: 2      # V7.3: Raised from 1 - filter single-step noise at 1-min sampling
+      threshold: 300       # V7.5: Lowered from 500 - soft gate reduces MW preds (~460W), 300W balances P/R
+      min_on_steps: 1      # V7.5: Reverted from 2 - real MW events can be single-step at 1-min sampling
     fridge:
       threshold: 18
       min_on_steps: 3

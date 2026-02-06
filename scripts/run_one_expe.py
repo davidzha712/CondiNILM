@@ -1024,12 +1024,16 @@ def launch_one_experiment(expes_config: OmegaConf):
             except Exception:
                 pass
         hpo_override = getattr(expes_config, "hpo_override", None)
-        if isinstance(hpo_override, dict) and hpo_override:
-            for key, value in hpo_override.items():
+        # Fix: OmegaConf DictConfig is not isinstance(dict), check for items() method
+        if hpo_override is not None and hasattr(hpo_override, 'items'):
+            hpo_dict = dict(hpo_override)
+            logging.info("Applying %d HPO overrides (cached branch)", len(hpo_dict))
+            for key, value in hpo_dict.items():
                 try:
-                    expes_config[key] = value
-                except Exception:
-                    pass
+                    OmegaConf.update(expes_config, key, value, merge=True)
+                    logging.info("Applied HPO override: %s=%s", key, value)
+                except Exception as e:
+                    logging.warning("Failed to apply HPO override %s=%s: %s", key, value, e)
 
         return launch_models_training(tuple_data, scaler, expes_config)
 
@@ -1317,18 +1321,17 @@ def launch_one_experiment(expes_config: OmegaConf):
             logging.info(f"Re-applied dataset loss config (after auto-config): {key}={value}")
         except Exception:
             pass
-    hpo_override = None
-    try:
-        hpo_override = expes_config.get("hpo_override")
-    except Exception:
-        hpo_override = getattr(expes_config, "hpo_override", None)
-    if isinstance(hpo_override, dict):
-        for key, value in hpo_override.items():
+    hpo_override = getattr(expes_config, "hpo_override", None)
+    # Fix: OmegaConf DictConfig is not isinstance(dict), check for items() method
+    if hpo_override is not None and hasattr(hpo_override, 'items'):
+        hpo_dict = dict(hpo_override)
+        logging.info("Applying %d HPO overrides (non-cached branch)", len(hpo_dict))
+        for key, value in hpo_dict.items():
             try:
-                expes_config[key] = value
+                OmegaConf.update(expes_config, key, value, merge=True)
                 logging.info("Applied HPO override: %s=%s", key, value)
-            except Exception:
-                pass
+            except Exception as e:
+                logging.warning("Failed to apply HPO override %s=%s: %s", key, value, e)
 
     scaler = NILMscaler(
         power_scaling_type=expes_config.power_scaling_type,
@@ -1439,6 +1442,10 @@ def main(
 
     with open("configs/expes.yaml", "r", encoding="utf-8") as f:
         expes_config = yaml.safe_load(f)
+
+    # Apply optional HPO overrides passed from CLI (e.g., Optuna best params)
+    if getattr(args, "hpo_override", None):
+        expes_config["hpo_override"] = dict(args.hpo_override)
 
     with open("configs/datasets.yaml", "r", encoding="utf-8") as f:
         datasets_all = yaml.safe_load(f)
@@ -1769,7 +1776,30 @@ if __name__ == "__main__":
              "Set <1.0 to use lower LR for sparse devices in joint training.",
     )
 
+    parser.add_argument(
+        "--hpo_override_json",
+        type=str,
+        default=None,
+        help="JSON string to override expes_config hyperparameters (same keys as Optuna params).",
+    )
+
     args = parser.parse_args()
+    # Optional: allow CLI JSON overrides (same key names as Optuna params)
+    if getattr(args, "hpo_override_json", None):
+        import json
+        try:
+            raw = args.hpo_override_json
+            if isinstance(raw, str) and raw.startswith('@'):
+                from pathlib import Path
+                raw_path = Path(raw[1:])
+                raw = raw_path.read_text(encoding='utf-8')
+            args.hpo_override = json.loads(raw)
+            if not isinstance(args.hpo_override, dict):
+                raise ValueError('hpo_override_json must decode to a dict')
+        except Exception as e:
+            raise ValueError(f"Invalid --hpo_override_json: {e}")
+    else:
+        args.hpo_override = None
 
     # Parse house indices
     ind_house_train_val = None

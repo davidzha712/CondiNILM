@@ -396,6 +396,14 @@ def run_study_for_dataset(
     if args.batch_size is not None:
         base_config["batch_size"] = int(args.batch_size)
     space = _parse_search_space(args.search_space, model_key)
+
+    # If the user requests a fixed sampling_rate/window_size, remove them from the
+    # Optuna search space so trial params match what is actually executed.
+    if args.lock_sampling_rate and "sampling_rate" in space:
+        space.pop("sampling_rate")
+    if args.lock_window_size and "window_size" in space:
+        space.pop("window_size")
+
     sampling_tag = args.sampling_rate
     window_tag = args.window_size
     if "sampling_rate" in space:
@@ -427,10 +435,17 @@ def run_study_for_dataset(
         trial_seed = int(args.seed) + int(trial.number)
         sampling_rate = params.get("sampling_rate", args.sampling_rate)
         window_size = params.get("window_size", args.window_size)
+
         if args.lock_sampling_rate:
             sampling_rate = args.sampling_rate
+            params.pop("sampling_rate", None)
         if args.lock_window_size:
             window_size = args.window_size
+            params.pop("window_size", None)
+
+        # Record the actually-executed settings for debugging/repro.
+        trial.set_user_attr("exec_sampling_rate", str(sampling_rate))
+        trial.set_user_attr("exec_window_size", str(window_size))
         expes_config = _build_expes_config(
             dataset_key=dataset_key,
             dataset_config=dataset_config,

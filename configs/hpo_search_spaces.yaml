@@ -4,7 +4,7 @@
 NILMFormer:
   sampling_rate:
     type: categorical
-    choices: ["1min", "5min"]
+    choices: ['6s','30s','1min','5min']
   window_size:
     type: categorical
     choices: [64, 128, 256]
@@ -99,7 +99,7 @@ NILMFormer_Sparse:
   # 采样率和窗口 - 稀疏设备可能需要更细的采样
   sampling_rate:
     type: categorical
-    choices: ["30s", "1min"]
+    choices: ['6s','30s','1min']
   window_size:
     type: categorical
     choices: [64, 128]

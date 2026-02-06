@@ -76,7 +76,7 @@ class SimpleDeviceHead(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-    def forward_device(self, x, device_idx, training=None):
+    def forward_device(self, x, device_idx, training=None, return_ungated=False):
         """
         Forward for single device.
 
@@ -84,6 +84,9 @@ class SimpleDeviceHead(nn.Module):
             x: (B, 1, L) raw aggregate signal - NOT NORMALIZED!
             device_idx: which device
             training: override training mode
+            return_ungated: if True, return raw amplitude without internal gate.
+                Used by forward_with_gate so trainer's _apply_soft_gate is the ONLY gate,
+                preventing double-gating that causes sparse device collapse.
 
         Returns:
             power: (B, 1, L) predicted power
@@ -105,24 +108,21 @@ class SimpleDeviceHead(nn.Module):
         reg_feat = F.relu(head['reg_conv'](feat))
         power_raw = head['reg_out'](reg_feat)
 
-        # Amplitude: softplus ensures positive, scale adjusts magnitude
-        amplitude = F.softplus(power_raw) * F.softplus(self.amplitude_scales[device_idx])
+        # Amplitude: ReLU gives clean zeros in OFF state + constant gradient for peaks.
+        # softplus(amplitude_scale) keeps scale positive.
+        amplitude = F.relu(power_raw) * F.softplus(self.amplitude_scales[device_idx])
+
+        if return_ungated:
+            # Return raw amplitude for external gating (trainer's _apply_soft_gate).
+            # This eliminates double-gating that suppresses sparse devices.
+            return amplitude, cls_logit
 
         # Classification probability
-        # LESSON LEARNED (v2): Previous sharp sigmoid (4.0) combined with sharpening
-        # function killed gradients for borderline cases. Using softer approach.
-        cls_prob = torch.sigmoid(cls_logit * 2.0)  # Softer sigmoid (was 4.0)
+        cls_prob = torch.sigmoid(cls_logit * 2.0)
 
         if training:
-            # Training: Use soft gating with MILD sharpening
-            # Allow gradients to flow while still encouraging binary behavior
-            # SOFTER sharpening: linear interpolation toward hard gate
-            # At cls_prob=0.5: output=0.5 (no change)
-            # At cls_prob=0: output=0, at cls_prob=1: output=1
-            # But intermediate values are less aggressively pushed to 0/1
-            sharpened = cls_prob * cls_prob * (3 - 2 * cls_prob)  # Keep smooth step but with softer input
-            # Blend between soft and hard based on training progress
-            # Early: more soft, Later: more sharp (handled by sigmoid slope)
+            # Training: soft gating with smoothstep sharpening
+            sharpened = cls_prob * cls_prob * (3 - 2 * cls_prob)
             power = sharpened * amplitude
         else:
             # Inference: HARD gating with learnable threshold
@@ -156,9 +156,9 @@ class SparseDeviceCNN(nn.Module):
         # Use the simpler, more effective architecture
         self.simple_head = SimpleDeviceHead(d_in=d_in, hidden_dim=d_model, n_devices=n_sparse_devices)
 
-    def forward_device(self, x, device_idx, use_hard_gate=None):
+    def forward_device(self, x, device_idx, use_hard_gate=None, return_ungated=False):
         training = self.training if use_hard_gate is None else not use_hard_gate
-        return self.simple_head.forward_device(x, device_idx, training=training)
+        return self.simple_head.forward_device(x, device_idx, training=training, return_ungated=return_ungated)
 
     def forward(self, x, return_gate=False, device_idx=0, use_hard_gate=None):
         power, gate = self.forward_device(x, device_idx, use_hard_gate)
@@ -166,11 +166,11 @@ class SparseDeviceCNN(nn.Module):
             return power, gate
         return power
 
-    def forward_all(self, x, return_gate=False, use_hard_gate=None):
+    def forward_all(self, x, return_gate=False, use_hard_gate=None, return_ungated=False):
         powers = []
         gates = []
         for i in range(self.n_sparse_devices):
-            power, gate = self.forward_device(x, i, use_hard_gate)
+            power, gate = self.forward_device(x, i, use_hard_gate, return_ungated=return_ungated)
             powers.append(power)
             gates.append(gate)
         if return_gate:
@@ -636,9 +636,16 @@ class NILMFormer(nn.Module):
         gamma, beta = self._compute_film_params(x_main=x_main_original)
 
         if self.type_ids is None or self.type_power_heads is None:
-            # Use mean of adapted features for single head mode
-            mean_adapted = torch.stack(adapted_feats, dim=0).mean(dim=0)  # (B, D, L)
-            power_raw = self.PowerHead(mean_adapted)
+            # V6 FIX: Stack per-device adapted features and batch the PowerHead call.
+            # Previous: averaged all adapted features, destroying device-specific info.
+            # Now: each device channel uses its own adapted features through PowerHead.
+            # We stack along batch dim to compute all devices in one PowerHead call.
+            stacked = torch.stack(adapted_feats, dim=1)  # (B, c_out, D, L)
+            stacked_flat = stacked.reshape(B * c_out, D, L)  # (B*c_out, D, L)
+            all_power = self.PowerHead(stacked_flat)  # (B*c_out, c_out, L)
+            all_power = all_power.reshape(B, c_out, c_out, L)
+            # Extract diagonal: device i's output from device i's adapted features
+            power_raw = torch.diagonal(all_power, dim1=1, dim2=2).permute(0, 2, 1)  # (B, c_out, L)
         else:
             power_raw = shared_feat.new_zeros(B, c_out, L)
             for gid, idxs in enumerate(self.type_group_indices):
@@ -656,11 +663,8 @@ class NILMFormer(nn.Module):
 
         if gamma is not None and beta is not None:
             power_raw = (1.0 + gamma) * power_raw + beta
-        power_raw = torch.clamp(power_raw, min=-10.0)
-        # Use softplus for smooth non-negative output
-        # REMOVED: fixed +0.01 bias that caused floor noise in OFF state
-        # The model should learn to output near-zero for OFF state through training
-        transformer_power = F.softplus(power_raw)
+        # ReLU: clean zeros in OFF state, constant gradient for peaks (better than softplus)
+        transformer_power = F.relu(power_raw)
 
         alpha = float(getattr(self, "output_stats_alpha", 0.0))
         mean_max = float(getattr(self, "output_stats_mean_max", 0.0))
@@ -726,8 +730,9 @@ class NILMFormer(nn.Module):
         cnn_powers = None
         cnn_gates = None
         if self.sparse_device_indices:
-            # Training mode: soft gating for backpropagation
-            cnn_powers, cnn_gates = self.sparse_cnn.forward_all(x_main_original, return_gate=True, use_hard_gate=False)
+            # Return UNGATED amplitude so trainer's _apply_soft_gate is the ONLY gate.
+            # This eliminates double-gating that caused sparse device collapse.
+            cnn_powers, cnn_gates = self.sparse_cnn.forward_all(x_main_original, return_gate=True, use_hard_gate=False, return_ungated=True)
 
         inst_mean = torch.mean(x_main_original, dim=-1, keepdim=True).detach()
         inst_std = torch.sqrt(
@@ -771,9 +776,13 @@ class NILMFormer(nn.Module):
         gamma, beta = self._compute_film_params(x_main=x_main_original)
 
         if self.type_ids is None or self.type_power_heads is None:
-            mean_adapted = torch.stack(adapted_feats, dim=0).mean(dim=0)
-            power_raw = self.PowerHead(mean_adapted)
-            gate = self.GateHead(mean_adapted)
+            # V6 FIX: Stack per-device adapted features and batch PowerHead/GateHead
+            stacked = torch.stack(adapted_feats, dim=1)  # (B, c_out, D, L)
+            stacked_flat = stacked.reshape(B * c_out, D, L)
+            all_power = self.PowerHead(stacked_flat).reshape(B, c_out, c_out, L)
+            all_gate = self.GateHead(stacked_flat).reshape(B, c_out, c_out, L)
+            power_raw = torch.diagonal(all_power, dim1=1, dim2=2).permute(0, 2, 1)
+            gate = torch.diagonal(all_gate, dim1=1, dim2=2).permute(0, 2, 1)
         else:
             power_raw = shared_feat.new_zeros(B, c_out, L)
             gate = shared_feat.new_zeros(B, c_out, L)
@@ -798,9 +807,8 @@ class NILMFormer(nn.Module):
         alpha = float(getattr(self, "output_stats_alpha", 0.0))
         mean_max = float(getattr(self, "output_stats_mean_max", 0.0))
         std_max = float(getattr(self, "output_stats_std_max", 0.0))
-        power_raw = torch.clamp(power_raw, min=-10.0)
-        # Use softplus for smooth non-negative output
-        transformer_power = F.softplus(power_raw)
+        # ReLU: clean zeros in OFF state, constant gradient for peaks
+        transformer_power = F.relu(power_raw)
         if alpha > 0.0 and (mean_max > 0.0 or std_max > 0.0):
             stats_out = self.ProjStats2(stats_feat).float()
             raw_mean = stats_out[..., 0:1]
@@ -825,9 +833,9 @@ class NILMFormer(nn.Module):
             sparse_idx = 0  # Index into cnn_powers/cnn_gates lists
             for dev_idx in range(c_out):
                 if dev_idx in self.sparse_device_indices:
-                    # Use per-device CNN output directly (already includes gating)
+                    # Use per-device CNN ungated amplitude; trainer's _apply_soft_gate handles gating
                     power_list.append(cnn_powers[sparse_idx])
-                    gate_list.append(cnn_gates[sparse_idx])  # CNN's own gate
+                    gate_list.append(cnn_gates[sparse_idx])  # CNN's cls_logit for gating
                     sparse_idx += 1
                 else:
                     # Use Transformer for non-sparse devices

@@ -15,7 +15,7 @@ appliance_scaling_type:  MaxScaling
 
 batch_size:  128
 epochs:  25
-p_es:  5                         # Early stopping patience (epochs without improvement)
+p_es:  10                        # V7.5: Increased from 5 for more stable training
 p_rlr:  3
 n_warmup_epochs:  3
 scheduler_type:  cosine_warmup   # cosine_warmup (recommended) / plateau
@@ -157,10 +157,10 @@ postprocess_per_device:
   Fridge:
     postprocess_threshold: 50     # V5: Raised from 40
     postprocess_min_on_steps: 3
-  # WashingMachine: 更激进压制假阳性
+  # WashingMachine: 宽松后处理 - 回调F1=0.433但后处理压低到0.280
   WashingMachine:
-    postprocess_threshold: 75     # V5: Raised from 60
-    postprocess_min_on_steps: 10  # V5: Reduced for better response
+    postprocess_threshold: 20     # V7.5j: Lowered from 75 - WM mean_on=539W
+    postprocess_min_on_steps: 2   # V7.5j: Lowered from 10 - WM short phases at 1min sampling
   # Dishwasher: 更激进压制假阳性
   Dishwasher:
     postprocess_threshold: 55     # V5: Raised from 45

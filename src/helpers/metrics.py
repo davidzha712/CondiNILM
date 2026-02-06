@@ -370,17 +370,39 @@ def eval_win_energy_aggregation(
 
                 agg = inv_scale[0, 0, :]
                 app = inv_scale[1, 0, :]
-
-                list_date.extend(
-                    list(
-                        pd.date_range(
-                            tmp_st_date_test.iloc[k, 1], periods=window_size, freq=freq
-                        )
-                    )
+                # Align lengths when using seq2subseq (output_ratio < 1.0)
+                # Model prediction length may be smaller than window_size.
+                full_dates = pd.date_range(
+                    tmp_st_date_test.iloc[k, 1], periods=window_size, freq=freq
                 )
+                pred_len = int(len(pred))
+                if pred_len <= 0:
+                    continue
+                if pred_len != int(window_size):
+                    start_idx = max((int(window_size) - pred_len) // 2, 0)
+                    end_idx = start_idx + pred_len
+                    dates = full_dates[start_idx:end_idx]
+                    agg = agg[start_idx:end_idx]
+                    app = app[start_idx:end_idx]
+                else:
+                    dates = full_dates
+
+                list_date.extend(list(dates))
                 pdl_total_power.extend(list(agg))
                 pdl_true_app_power.extend(list(app))
                 pdl_pred_app_power.extend(list(pred))
+            # Safety: enforce equal lengths (seq2subseq may change per-window output length)
+            min_len = min(len(list_date), len(pdl_total_power), len(pdl_true_app_power), len(pdl_pred_app_power))
+            if min_len <= 0:
+                continue
+            if len(list_date) != min_len:
+                list_date = list_date[:min_len]
+            if len(pdl_total_power) != min_len:
+                pdl_total_power = pdl_total_power[:min_len]
+            if len(pdl_true_app_power) != min_len:
+                pdl_true_app_power = pdl_true_app_power[:min_len]
+            if len(pdl_pred_app_power) != min_len:
+                pdl_pred_app_power = pdl_pred_app_power[:min_len]
 
             df_inst = pd.DataFrame(
                 {

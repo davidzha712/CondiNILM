@@ -16,25 +16,26 @@ CYCLING_DEVICE_TYPES = frozenset({"frequent_switching", "cycling_low_power", "cy
 # V3: 添加回归优化参数 (w_energy, w_on_power, w_peak, w_grad, w_range)
 DEVICE_TYPE_BASE_PARAMS = {
     # Microwave/Kettle: 稀疏高功率设备
-    # V4: 降低ON权重、提高OFF权重以减少假阳性
-    # 问题：之前alpha_on=8.0导致过度检测ON，precision很低
+    # V6: HPO-ALIGNED - 基于Optuna Trial #46最优参数
+    # 关键发现: HIGH OFF penalties导致稀疏设备预测被完全抑制
+    # HPO最优: alpha_off=0.072, lambda_off_hard=0.003
     "sparse_high_power": {
-        "alpha_on": 5.0,            # 降低ON权重减少过度检测 (从8.0降到5.0)
-        "alpha_off": 2.5,           # 提高OFF权重强化OFF状态 (从1.5升到2.5)
-        "lambda_zero": 0.04,        # 略微提高zero惩罚
-        "lambda_sparse": 0.008,     # 略微提高稀疏惩罚
-        "lambda_off_hard": 0.12,    # 增加OFF硬惩罚 (从0.05升到0.12)
-        "lambda_on_recall": 1.8,    # 降低recall压力减少假阳性 (从2.5降到1.8)
-        "on_recall_margin": 0.75,   # 略微降低margin
-        "lambda_gate_cls": 0.6,     # 略微降低gate权重
-        "lambda_energy": 0.25,
-        "off_margin": 0.035,        # 略微提高off margin
+        "alpha_on": 3.82,           # HPO最优 (从5.0降低)
+        "alpha_off": 0.1,           # HPO-ALIGNED (从3.2大幅降低! HPO最优0.072)
+        "lambda_zero": 0.03,        # 降低zero惩罚 (太高导致塌陷)
+        "lambda_sparse": 0.005,     # 降低稀疏惩罚
+        "lambda_off_hard": 0.005,   # HPO-ALIGNED (从0.18大幅降低! HPO最优0.003)
+        "lambda_on_recall": 1.14,   # HPO最优
+        "on_recall_margin": 0.75,   # 适度margin
+        "lambda_gate_cls": 0.25,    # 降低gate权重
+        "lambda_energy": 0.15,
+        "off_margin": 0.02,         # 降低off margin
         # 回归优化参数
-        "w_energy": 0.25,           # 能量回归权重
+        "w_energy": 0.15,           # 能量回归权重
         "w_on_power": 0.12,         # ON功率精度权重
-        "w_peak": 0.08,             # 峰值检测权重 (中等)
-        "w_grad": 0.05,             # 梯度平滑权重 (较低，允许快速变化)
-        "w_range": 0.18,            # 提高范围约束权重 (防止过度预测)
+        "w_peak": 0.08,             # 峰值检测权重
+        "w_grad": 0.05,             # 梯度平滑权重
+        "w_range": 0.10,            # 适度范围约束
     },
     "frequent_switching": {
         "alpha_on": 3.0,
@@ -93,24 +94,25 @@ DEVICE_TYPE_BASE_PARAMS = {
         "w_range": 0.05,            # 低范围约束 (冰箱功率相对稳定)
     },
     # WashingMachine/Dishwasher: 长周期设备
+    # V2: 增强OFF惩罚，参考sparse_high_power的成功模式
     # 多阶段功率变化，需要梯度平滑和能量准确
     "long_cycle": {
         "alpha_on": 5.0,
-        "alpha_off": 2.5,
-        "lambda_zero": 0.08,
-        "lambda_sparse": 0.015,
-        "lambda_off_hard": 0.12,
-        "lambda_on_recall": 0.6,
+        "alpha_off": 3.0,           # 提高OFF权重 (从2.5升到3.0)
+        "lambda_zero": 0.10,        # 提高zero惩罚
+        "lambda_sparse": 0.018,     # 提高稀疏惩罚
+        "lambda_off_hard": 0.16,    # 增加OFF硬惩罚 (从0.12升到0.16)
+        "lambda_on_recall": 0.8,    # 略微提高recall权重
         "on_recall_margin": 0.65,
-        "lambda_gate_cls": 0.2,
-        "lambda_energy": 0.12,
-        "off_margin": 0.015,
+        "lambda_gate_cls": 0.25,    # 略微提高gate权重
+        "lambda_energy": 0.15,      # 略微提高能量权重
+        "off_margin": 0.02,         # 提高off margin
         # 回归优化参数 - 强调能量和梯度
-        "w_energy": 0.30,           # 高能量权重 (长周期总能量重要)
+        "w_energy": 0.32,           # 高能量权重 (长周期总能量重要)
         "w_on_power": 0.12,         # 中等ON功率权重
         "w_peak": 0.10,             # 中等峰值权重
         "w_grad": 0.12,             # 高梯度平滑 (多阶段变化需要平滑)
-        "w_range": 0.10,            # 中等范围约束
+        "w_range": 0.12,            # 提高范围约束
     },
     "always_on": {
         "alpha_on": 1.0,
@@ -170,14 +172,17 @@ LONG_CYCLE_LOW_DUTY_PARAMS = {
 # LESSON LEARNED: gate_floor=0.02 for sparse devices caused minimum 2% activation even in OFF state
 # This led to false positives. Reduced to 0.008 to allow near-zero outputs.
 DEVICE_TYPE_GATE_CONFIG = {
-    # TWO-STAGE V4: Microwave/Kettle - lower gate_floor for true zeros
-    "sparse_high_power": {"gate_soft_scale": 3.0, "gate_floor": 0.008, "gate_duty_weight": 0.06},
+    # V6: HPO-ALIGNED gate参数
+    # sparse_high_power: 适度scale, 适当floor允许检测
+    # V7.3: Restored gate_floor=0.015 (from 0.005). Lower floor allowed kettle gate_floor
+    # to learn down to 0.004, causing complete collapse (F1=0.0).
+    "sparse_high_power": {"gate_soft_scale": 2.0, "gate_floor": 0.015, "gate_duty_weight": 0.05, "gate_logits_floor": -3.0},
     "frequent_switching": {"gate_soft_scale": 2.0, "gate_floor": 0.005, "gate_duty_weight": 0.05},
     "cycling_infrequent": {"gate_soft_scale": 2.0, "gate_floor": 0.01, "gate_duty_weight": 0.01},
     # Fridge: 降低gate_floor减少OFF泄漏，提高scale增加锐度
     "cycling_low_power": {"gate_soft_scale": 2.5, "gate_floor": 0.008, "gate_duty_weight": 0.02},
-    # WashingMachine/Dishwasher: 降低gate_floor防止饱和，提高scale
-    "long_cycle": {"gate_soft_scale": 1.5, "gate_floor": 0.005, "gate_duty_weight": 0.02},
+    # WashingMachine/Dishwasher: 提高scale增加锐度
+    "long_cycle": {"gate_soft_scale": 2.0, "gate_floor": 0.005, "gate_duty_weight": 0.03},
     "always_on": {"gate_soft_scale": 1.0, "gate_floor": 0.05, "gate_duty_weight": 0.0},
     "sparse_medium_power": {"gate_soft_scale": 1.0, "gate_floor": 0.02, "gate_duty_weight": 0.0},
     "unknown": {"gate_soft_scale": 1.0, "gate_floor": 0.02, "gate_duty_weight": 0.0},
@@ -195,8 +200,8 @@ DEVICE_TYPE_POSTPROCESS_CONFIG = {
 }
 
 DEVICE_TYPE_ZERO_PENALTY_CONFIG = {
-    # V4: 适度zero penalty - 太高会导致模型塌缩
-    "sparse_high_power": {"weight": 0.15, "kernel": 24, "ratio": 0.88},
+    # V6: 降低zero penalty防止塌陷
+    "sparse_high_power": {"weight": 0.05, "kernel": 24, "ratio": 0.88},
     "frequent_switching": {"weight": 0.2, "kernel": 12, "ratio": 0.55},
     "cycling_infrequent": {"weight": 0.02, "kernel": 18, "ratio": 0.8},
     "cycling_low_power": {"weight": 0.015, "kernel": 12, "ratio": 0.55},
@@ -208,14 +213,15 @@ DEVICE_TYPE_ZERO_PENALTY_CONFIG = {
 }
 
 DEVICE_TYPE_OFF_PENALTY_CONFIG = {
-    # V4: Microwave/Kettle - 适度OFF惩罚减少假阳性
-    "sparse_high_power": {"off_high_agg": 0.12, "off_state": 0.08, "off_state_long": 0.03},
+    # V6: HPO-ALIGNED - 降低OFF惩罚以防止稀疏设备塌陷
+    "sparse_high_power": {"off_high_agg": 0.03, "off_state": 0.02, "off_state_long": 0.01},
     "frequent_switching": {"off_high_agg": 0.02, "off_state": 0.1, "off_state_long": 0.2},
     "cycling_infrequent": {"off_high_agg": 0.01, "off_state": 0.015, "off_state_long": 0.1},
     "cycling_low_power": {"off_high_agg": 0.02, "off_state": 0.01, "off_state_long": 0.05},
     "cycling_low_power_low_duty": {"off_high_agg": 0.01, "off_state": 0.01, "off_state_long": 0.05},
-    "long_cycle": {"off_high_agg": 0.01, "off_state": 0.0, "off_state_long": 0.0},
-    "long_cycle_low_duty": {"off_high_agg": 0.0, "off_state": 0.0, "off_state_long": 0.0},
+    # long_cycle: 添加OFF惩罚（之前为0导致假阳性）
+    "long_cycle": {"off_high_agg": 0.08, "off_state": 0.05, "off_state_long": 0.02},
+    "long_cycle_low_duty": {"off_high_agg": 0.03, "off_state": 0.02, "off_state_long": 0.01},
     "always_on": {"off_high_agg": 0.01, "off_state": 0.0, "off_state_long": 0.0},
     "sparse_medium_power": {"off_high_agg": 0.01, "off_state": 0.0, "off_state_long": 0.0},
     "unknown": {"off_high_agg": 0.01, "off_state": 0.0, "off_state_long": 0.0},

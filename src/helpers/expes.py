@@ -1995,6 +1995,7 @@ def evaluate_nilm_split(
     log_dict,
     min_on_duration_steps=0,
     expes_config=None,
+    criterion=None,
 ):
     metrics_helper = NILMmetrics()
     y = np.array([], dtype=np.float32)
@@ -2066,17 +2067,46 @@ def evaluate_nilm_split(
                     gate_logits = torch.nan_to_num(
                         gate_logits.float(), nan=0.0, posinf=0.0, neginf=0.0
                     )
-                    soft_scale = float(gate_soft_scale)
-                    if not np.isfinite(soft_scale) or soft_scale <= 0.0:
-                        soft_scale = 1.0
-                    gate_prob = torch.sigmoid(
-                        torch.clamp(gate_logits * soft_scale, min=-50.0, max=50.0)
-                    )
-                    gf = float(gate_floor)
-                    if not np.isfinite(gf):
-                        gf = 0.0
-                    gf = min(max(gf, 0.0), 1.0)
-                    pred = power_raw * (gf + (1.0 - gf) * gate_prob)
+                    # V7.5: Use per-device learned gate params to match training
+                    _applied_perdevice = False
+                    if (criterion is not None
+                            and hasattr(criterion, "gate_soft_scales")
+                            and hasattr(criterion, "gate_biases")
+                            and hasattr(criterion, "gate_floors")):
+                        _ss = criterion.gate_soft_scales.detach().to(gate_logits.device)
+                        _bi = criterion.gate_biases.detach().to(gate_logits.device)
+                        _fl = criterion.gate_floors.detach().to(gate_logits.device)
+                        C = gate_logits.size(1)
+                        if _ss.numel() == C and _bi.numel() == C and _fl.numel() == C:
+                            _ss = torch.clamp(_ss, min=0.5, max=6.0).view(1, C, 1)
+                            _fl = torch.clamp(_fl, min=0.01, max=0.5).view(1, C, 1)
+                            _bi = _bi.view(1, C, 1)
+                            gl = gate_logits.float()
+                            if hasattr(criterion, "_gate_logits_floors"):
+                                _glf = criterion._gate_logits_floors
+                                if len(_glf) == C:
+                                    _glf_t = torch.tensor(
+                                        _glf, device=gl.device, dtype=gl.dtype
+                                    ).view(1, C, 1)
+                                    gl = torch.maximum(gl, _glf_t)
+                            gl_adj = gl * _ss + _bi
+                            gate_prob = torch.sigmoid(
+                                torch.clamp(gl_adj, min=-50.0, max=50.0)
+                            )
+                            pred = power_raw * (_fl + (1.0 - _fl) * gate_prob)
+                            _applied_perdevice = True
+                    if not _applied_perdevice:
+                        soft_scale = float(gate_soft_scale)
+                        if not np.isfinite(soft_scale) or soft_scale <= 0.0:
+                            soft_scale = 1.0
+                        gate_prob = torch.sigmoid(
+                            torch.clamp(gate_logits * soft_scale, min=-50.0, max=50.0)
+                        )
+                        gf = float(gate_floor)
+                        if not np.isfinite(gf):
+                            gf = 0.0
+                        gf = min(max(gf, 0.0), 1.0)
+                        pred = power_raw * (gf + (1.0 - gf) * gate_prob)
                 except Exception:
                     pred = None
                     gate_logits = None
@@ -2134,15 +2164,41 @@ def evaluate_nilm_split(
                 and int(post_gate_kernel or 0) > 1
             ):
                 try:
-                    pscale = post_gate_soft_scale
-                    if pscale is None:
-                        pscale = max(float(gate_soft_scale), 1.0) * 3.0
-                    pscale = float(pscale)
-                    if not np.isfinite(pscale) or pscale <= 0.0:
-                        pscale = 1.0
-                    gate_prob_sharp = torch.sigmoid(
-                        torch.clamp(gate_logits * pscale, min=-50.0, max=50.0)
-                    )
+                    # V7.5: Use per-device learned params for postprocess gate too
+                    _pp_perdevice = False
+                    if (criterion is not None
+                            and hasattr(criterion, "gate_soft_scales")
+                            and hasattr(criterion, "gate_biases")):
+                        _ss = criterion.gate_soft_scales.detach().to(gate_logits.device)
+                        _bi = criterion.gate_biases.detach().to(gate_logits.device)
+                        C = gate_logits.size(1)
+                        if _ss.numel() == C and _bi.numel() == C:
+                            # Use 3x learned scale for sharp postprocess gate
+                            _ss_sharp = torch.clamp(_ss * 3.0, min=1.5, max=18.0).view(1, C, 1)
+                            _bi = _bi.view(1, C, 1)
+                            gl = gate_logits.float()
+                            if hasattr(criterion, "_gate_logits_floors"):
+                                _glf = criterion._gate_logits_floors
+                                if len(_glf) == C:
+                                    _glf_t = torch.tensor(
+                                        _glf, device=gl.device, dtype=gl.dtype
+                                    ).view(1, C, 1)
+                                    gl = torch.maximum(gl, _glf_t)
+                            gl_adj = gl * _ss_sharp + _bi
+                            gate_prob_sharp = torch.sigmoid(
+                                torch.clamp(gl_adj, min=-50.0, max=50.0)
+                            )
+                            _pp_perdevice = True
+                    if not _pp_perdevice:
+                        pscale = post_gate_soft_scale
+                        if pscale is None:
+                            pscale = max(float(gate_soft_scale), 1.0) * 3.0
+                        pscale = float(pscale)
+                        if not np.isfinite(pscale) or pscale <= 0.0:
+                            pscale = 1.0
+                        gate_prob_sharp = torch.sigmoid(
+                            torch.clamp(gate_logits * pscale, min=-50.0, max=50.0)
+                        )
                     pred_inv = suppress_long_off_with_gate(
                         pred_inv,
                         gate_prob_sharp,
@@ -2308,6 +2364,9 @@ def evaluate_nilm_split(
 
 
 def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
+    # V7.5: Deterministic training for reproducibility
+    seed = getattr(expes_config, "seed", 42)
+    pl.seed_everything(seed, workers=True)
     expes_config.device = get_device()
     ckpt_path = expes_config.result_path + ".pt"
 
@@ -2720,19 +2779,24 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             output_ratio = float(getattr(expes_config, "output_ratio", 1.0))
 
             config_overrides = {}
-            if n_app == 1:
-                lambda_energy = float(getattr(expes_config, "loss_lambda_energy", 1.0))
-                if lambda_energy > 0.0:
-                    config_overrides["energy_weight_scale"] = lambda_energy
-                alpha_on = float(getattr(expes_config, "loss_alpha_on", 1.0))
-                if alpha_on > 0.0:
-                    config_overrides["alpha_on_scale"] = alpha_on / 2.0
-                alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
-                if alpha_off > 0.0:
-                    config_overrides["alpha_off_scale"] = alpha_off
-                lambda_recall = float(getattr(expes_config, "loss_lambda_on_recall", 1.0))
-                if lambda_recall > 0.0:
-                    config_overrides["recall_weight_scale"] = lambda_recall
+            # V14: Apply HPO params to ALL training (was n_app == 1 only)
+            # This enables HPO-discovered optimal alpha values for multi-device
+            lambda_energy = float(getattr(expes_config, "loss_lambda_energy", 1.0))
+            if lambda_energy > 0.0:
+                config_overrides["energy_weight_scale"] = lambda_energy
+            alpha_on = float(getattr(expes_config, "loss_alpha_on", 1.0))
+            if alpha_on > 0.0:
+                config_overrides["alpha_on_scale"] = alpha_on / 2.0
+            alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
+            if alpha_off > 0.0:
+                config_overrides["alpha_off_scale"] = alpha_off
+            lambda_recall = float(getattr(expes_config, "loss_lambda_on_recall", 1.0))
+            if lambda_recall > 0.0:
+                config_overrides["recall_weight_scale"] = lambda_recall
+            # V14: Also apply lambda_off_hard for multi-device
+            lambda_off_hard = float(getattr(expes_config, "loss_lambda_off_hard", 0.0))
+            if lambda_off_hard > 0.0:
+                config_overrides["lambda_off_hard_scale"] = lambda_off_hard
             if config_overrides:
                 logging.info("AdaptiveDeviceLoss config overrides: %s", config_overrides)
 
@@ -3095,6 +3159,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         accumulate_grad_batches=accumulate_grad_batches,
         limit_train_batches=limit_train_batches,
         limit_val_batches=limit_val_batches,
+        # deterministic=True causes cascade collapse via AdaptiveTuner
     )
     trainer = pl.Trainer(**trainer_kwargs)
     if ckpt_path_resume is not None:
@@ -3116,7 +3181,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     if best_model_path:
         try:
             ckpt = torch.load(best_model_path, weights_only=False, map_location="cpu")
-            lightning_module.load_state_dict(ckpt["state_dict"])
+            lightning_module.load_state_dict(ckpt["state_dict"], strict=False)
         except Exception as e:
             logging.warning(
                 "Could not load best checkpoint %s, keeping latest weights: %s",
@@ -3134,6 +3199,8 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         logging.info("Eval model...")
         logging.info("Eval valid split metrics...")
         min_on_steps = int(getattr(expes_config, "postprocess_min_on_steps", 0))
+        # V7.5: Pass criterion with learned per-device gate params for eval consistency
+        _eval_criterion = getattr(lightning_module, "criterion", None)
         evaluate_nilm_split(
             inst_model,
             valid_loader,
@@ -3145,6 +3212,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             eval_log,
             min_on_steps,
             expes_config,
+            criterion=_eval_criterion,
         )
         logging.info("Eval test split metrics...")
         evaluate_nilm_split(
@@ -3158,6 +3226,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             eval_log,
             min_on_steps,
             expes_config,
+            criterion=_eval_criterion,
         )
         if expes_config.name_model == "DiffNILM":
             eval_win_energy_aggregation(
@@ -3239,6 +3308,23 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         "test_timestamp": eval_log.get("test_metrics_timestamp", {}),
         "test_win": eval_log.get("test_metrics_win", {}),
     }
+    # Log final eval results as JSON for easy parsing
+    import json as _json
+    class _NumpyEncoder(_json.JSONEncoder):
+        def default(self, obj):
+            if hasattr(obj, 'item'):
+                return obj.item()
+            return super().default(obj)
+    for split_name in ("valid", "test"):
+        ts_key = f"{split_name}_metrics_timestamp"
+        pd_key = f"{split_name}_metrics_timestamp_per_device"
+        ts = eval_log.get(ts_key, {})
+        pd = eval_log.get(pd_key, {})
+        if ts or pd:
+            report = {"split": split_name, "overall": ts}
+            if pd:
+                report["per_device"] = pd
+            logging.info("FINAL_EVAL_JSON: %s", _json.dumps(report, cls=_NumpyEncoder))
     return result
 
 
@@ -3409,7 +3495,7 @@ def tser_model_training(inst_model, tuple_data, expes_config):
     if best_model_path:
         try:
             ckpt = torch.load(best_model_path, weights_only=False, map_location="cpu")
-            lightning_module.load_state_dict(ckpt["state_dict"])
+            lightning_module.load_state_dict(ckpt["state_dict"], strict=False)
         except Exception as e:
             logging.warning(
                 "Could not load best checkpoint %s, keeping latest weights: %s",
