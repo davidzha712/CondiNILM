@@ -1,11 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : NILMFormer - Embedding Layers
+"""Dilated convolution embedding layers -- CondiNILM.
 
-#
-#################################################################################################################
-
+Author: Siyi Li
+"""
 import torch
 import torch.nn as nn
 

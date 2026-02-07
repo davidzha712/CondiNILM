@@ -1,5 +1,7 @@
-# -*- coding: utf-8 -*-
-"""Analyze REDD dataset device availability per house."""
+"""REDD dataset device availability analysis -- CondiNILM.
+
+Author: Siyi Li
+"""
 
 import pandas as pd
 import numpy as np

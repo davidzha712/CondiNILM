@@ -1,9 +1,7 @@
-#################################################################################################################
-#
-# @description : AdaptiveDeviceLoss - Per-device NILM loss function
-#                Extracted from trainer.py for modularity.
-#
-#################################################################################################################
+"""AdaptiveDeviceLoss per-device loss function -- CondiNILM.
+
+Author: Siyi Li
+"""
 
 import math
 

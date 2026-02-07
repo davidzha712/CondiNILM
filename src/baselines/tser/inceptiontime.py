@@ -1,9 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : InceptionTime baseline - TSER
-#
-#################################################################################################################
+"""InceptionTime baseline for time-series regression -- CondiNILM.
+
+Author: Siyi Li
+"""
 
 import torch
 import torch.nn as nn

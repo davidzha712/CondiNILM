@@ -1,10 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : TSILNet baseline
-#
-#################################################################################################################
+"""TSILNet baseline -- CondiNILM.
 
+Author: Siyi Li
+"""
 import torch
 import torch.nn as nn
 from torch.nn.utils import weight_norm

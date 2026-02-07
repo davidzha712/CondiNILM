@@ -1,9 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : NILMFormer - Experiments
-#
-#################################################################################################################
+"""Main entry point for NILM experiments -- CondiNILM.
+
+Author: Siyi Li
+"""
 
 import argparse
 import os

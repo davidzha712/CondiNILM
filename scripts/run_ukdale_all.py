@@ -1,3 +1,8 @@
+"""Batch UKDALE training across appliances -- CondiNILM.
+
+Author: Siyi Li
+"""
+
 import argparse
 import logging
 import os

@@ -1,10 +1,6 @@
-"""
-Device type configuration and classification for NILM.
+"""Device type classification and configuration -- CondiNILM.
 
-This module contains:
-- Device type constants and parameter configurations
-- Device classification logic based on electrical statistics
-- Helper functions for applying device-specific configurations
+Author: Siyi Li
 """
 
 import numpy as np

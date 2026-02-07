@@ -1,10 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : CNN1D baseline - Adapted from https://github.com/sambaiga/UNETNiLM
-#
-#################################################################################################################
+"""CNN1D baseline -- CondiNILM.
 
+Author: Siyi Li
+"""
 import torch
 from torch import nn
 

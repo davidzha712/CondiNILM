@@ -1,9 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : ResNet baseline - TSER
-#
-#################################################################################################################
+"""ResNet baseline for time-series regression -- CondiNILM.
+
+Author: Siyi Li
+"""
 
 import torch.nn as nn
 import torch.nn.functional as F

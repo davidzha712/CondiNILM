@@ -1,4 +1,9 @@
-﻿import json
+"""Summarize HPO trial results -- CondiNILM.
+
+Author: Siyi Li
+"""
+
+import json
 from pathlib import Path
 import argparse
 

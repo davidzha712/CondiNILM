@@ -1,10 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : Energformer baseline
-#
-#################################################################################################################
+"""Energformer baseline -- CondiNILM.
 
+Author: Siyi Li
+"""
 import math
 import torch
 

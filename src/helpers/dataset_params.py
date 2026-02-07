@@ -1,11 +1,6 @@
-# -*- coding: utf-8 -*-
-"""
-Dataset-specific parameter management for NILM training.
+"""Dataset-specific parameter management -- CondiNILM.
 
-This module provides:
-- Loading dataset-specific hyperparameters from YAML
-- Auto-detection of available appliances in a dataset
-- Dynamic configuration based on dataset and appliance selection
+Author: Siyi Li
 """
 
 import os

@@ -1,10 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : NILMFormer - NILMFormer Config
-#
-#################################################################################################################
+"""NILMFormer configuration dataclass -- CondiNILM.
 
+Author: Siyi Li
+"""
 from dataclasses import dataclass, field
 from typing import List
 

@@ -1,10 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : Mixture of Expert Layers
-#
-#################################################################################################################
+"""Mixture of Experts layers -- CondiNILM.
 
+Author: Siyi Li
+"""
 from typing import Any, TypeVar, Iterator, Iterable, Generic
 
 import torch.nn

@@ -1,8 +1,6 @@
-"""
-Adaptive loss tuning for NILM training.
+"""Adaptive loss hyperparameter tuning -- CondiNILM.
 
-This module provides adaptive tuning of loss function hyperparameters
-during training based on validation metrics.
+Author: Siyi Li
 """
 
 import logging

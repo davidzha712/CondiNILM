@@ -1,10 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : BERT4NILM baseline - code taken from  https://github.com/Yueeeeeeee/BERT4NILM
-#
-#################################################################################################################
+"""BERT4NILM baseline -- CondiNILM.
 
+Author: Siyi Li
+"""
 import torch
 import math
 import random

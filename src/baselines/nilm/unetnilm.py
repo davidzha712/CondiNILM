@@ -1,10 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : Unet-NILM baseline - Adapted from https://github.com/sambaiga/UNETNiLM
-#
-#################################################################################################################
+"""UNet-NILM baseline -- CondiNILM.
 
+Author: Siyi Li
+"""
 import torch
 import torch.nn.functional as F
 

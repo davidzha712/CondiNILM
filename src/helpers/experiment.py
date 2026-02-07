@@ -1,10 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : NILMFormer - Experiments Helpers
+"""Experiment helpers and model factory -- CondiNILM.
 
-#
-#################################################################################################################
+Author: Siyi Li
+"""
 
 import os
 import torch

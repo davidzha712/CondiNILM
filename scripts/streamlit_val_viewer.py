@@ -1,3 +1,8 @@
+"""Interactive validation result viewer -- CondiNILM.
+
+Author: Siyi Li
+"""
+
 import os
 
 import numpy as np

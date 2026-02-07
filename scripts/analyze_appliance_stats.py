@@ -1,8 +1,7 @@
-#################################################################################################################
-#
-# Analyze appliance-level electrical statistics over UKDALE (or cached NILM data)
-#
-#################################################################################################################
+"""Appliance electrical statistics analysis -- CondiNILM.
+
+Author: Siyi Li
+"""
 
 import argparse
 import logging

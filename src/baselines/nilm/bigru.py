@@ -1,10 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : BiGRU baseline
-#
-#################################################################################################################
+"""BiGRU baseline -- CondiNILM.
 
+Author: Siyi Li
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

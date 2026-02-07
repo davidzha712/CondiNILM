@@ -1,11 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : NILMFormer - NILMFormer Model Architecture
+"""NILMFormer model architecture -- CondiNILM.
 
-#
-#################################################################################################################
-
+Author: Siyi Li
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

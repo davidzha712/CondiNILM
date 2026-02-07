@@ -1,11 +1,6 @@
-# -*- coding: utf-8 -*-
-"""
-Run NILM training on all REDD appliances.
+"""Batch REDD training across appliances -- CondiNILM.
 
-Usage:
-    python scripts/run_redd_all.py --appliances all
-    python scripts/run_redd_all.py --appliances fridge dishwasher
-    python scripts/run_redd_all.py --appliances fridge --epochs 30
+Author: Siyi Li
 """
 
 import os

@@ -1,8 +1,7 @@
-#################################################################################################################
-#
-# Postprocessing helpers extracted from src/helpers/expes.py
-#
-#################################################################################################################
+"""Post-processing for threshold and gate suppression -- CondiNILM.
+
+Author: Siyi Li
+"""
 
 import numpy as np
 import torch

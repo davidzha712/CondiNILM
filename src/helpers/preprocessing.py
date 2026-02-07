@@ -1,10 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : NILMFormer - Data preprocessing
+"""Data loading, windowing, and train/valid splitting -- CondiNILM.
 
-#
-#################################################################################################################
+Author: Siyi Li
+"""
 
 import os
 import numpy as np

@@ -1,10 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : NILMFormer - PyTorch Trainer
+"""PyTorch Lightning training modules -- CondiNILM.
 
-#
-#################################################################################################################
+Author: Siyi Li
+"""
 
 import math
 

@@ -1,10 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : NILMFormer - PyTorch Datasets
+"""PyTorch Dataset classes and scalers -- CondiNILM.
 
-#
-#################################################################################################################
+Author: Siyi Li
+"""
 
 import torch
 import numpy as np

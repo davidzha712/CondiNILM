@@ -1,8 +1,7 @@
-#################################################################################################################
-#
-# Evaluation helpers extracted from src/helpers/expes.py
-#
-#################################################################################################################
+"""Evaluation and metric computation -- CondiNILM.
+
+Author: Siyi Li
+"""
 
 import os
 import json

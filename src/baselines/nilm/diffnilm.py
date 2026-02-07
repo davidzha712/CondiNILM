@@ -1,10 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : DiffNILM baseline
-#
-#################################################################################################################
+"""DiffNILM baseline -- CondiNILM.
 
+Author: Siyi Li
+"""
 # Codes are mainly taken and adapted from:
 # https://github.com/maum-ai/nuwave
 # https://github.com/lmnt-com/diffwave

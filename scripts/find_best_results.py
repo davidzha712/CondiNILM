@@ -1,6 +1,8 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-"""Find best 5-device results across all configurations."""
+"""Parse and rank experiment results -- CondiNILM.
+
+Author: Siyi Li
+"""
+
 import json
 import os
 import glob

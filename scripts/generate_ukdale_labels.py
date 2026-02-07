@@ -1,4 +1,8 @@
-"""Generate labels.dat files for UKDALE houses from metadata YAML files."""
+"""Generate UKDALE labels.dat from metadata -- CondiNILM.
+
+Author: Siyi Li
+"""
+
 import os
 import yaml
 

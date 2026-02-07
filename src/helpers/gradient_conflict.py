@@ -1,26 +1,7 @@
-#################################################################################################################
-#
-# @description : Gradient Conflict Resolution for Multi-Device NILM Training
-#
-# This module implements PCGrad (Projecting Conflicting Gradients) combined with gradient balancing
-# to solve the gradient conflict problem in multi-device NILM training.
-#
-# Problem:
-# - In 4-device training (e.g., Dishwasher, WashingMachine, Kettle, Microwave), some devices collapse (F1=0)
-# - Root causes:
-#   1. Alpha parameter differences (e.g., Microwave alpha_on=8.0 vs WashingMachine alpha_off=3.5) create ~26x gradient magnitude differences
-#   2. Sparse devices have high gradient variance (only 1-2 events per batch)
-#   3. Gradient direction conflicts: sparse devices want UP (recall), others want DOWN (precision)
-#   4. Shared encoder receives conflicting gradients that cancel out
-#
-# Solution V2 (Improved):
-# - Gradient balancing: Scale gradients to reduce magnitude differences while preserving relative importance
-# - PCGrad with randomized order: Project conflicting gradients with random device order to avoid systematic bias
-# - Magnitude restoration: Restore gradient magnitude after projection to maintain learning signal
-#
-# Reference: Yu et al. "Gradient Surgery for Multi-Task Learning" (NeurIPS 2020)
-#
-#################################################################################################################
+"""Gradient conflict resolution (PCGrad) -- CondiNILM.
+
+Author: Siyi Li
+"""
 
 import torch
 import torch.nn as nn

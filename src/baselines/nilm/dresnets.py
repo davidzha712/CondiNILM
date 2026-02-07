@@ -1,10 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : DResNet and DAResNet baselines
-#
-#################################################################################################################
+"""DResNet and DAResNet baselines -- CondiNILM.
 
+Author: Siyi Li
+"""
 import torch
 import torch.nn as nn
 

@@ -1,8 +1,7 @@
-#################################################################################################################
-#
-# Callback classes extracted from src/helpers/expes.py
-#
-#################################################################################################################
+"""Lightning callbacks for validation and logging -- CondiNILM.
+
+Author: Siyi Li
+"""
 
 import os
 import logging

@@ -1,10 +1,7 @@
-#################################################################################################################
-#
-# @author : Siyi Li (TU Braunschweig)
-# @description : NILMFormer - Transformer Layers
-#
-#################################################################################################################
+"""Transformer encoder layers -- CondiNILM.
 
+Author: Siyi Li
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

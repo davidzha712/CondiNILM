@@ -1,8 +1,7 @@
-#################################################################################################################
-#
-# Inference helpers extracted from src/helpers/expes.py
-#
-#################################################################################################################
+"""Sliding window inference and prediction stitching -- CondiNILM.
+
+Author: Siyi Li
+"""
 
 import torch
 

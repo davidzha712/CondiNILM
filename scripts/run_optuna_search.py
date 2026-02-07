@@ -1,3 +1,8 @@
+"""Optuna hyperparameter optimization -- CondiNILM.
+
+Author: Siyi Li
+"""
+
 import argparse
 import json
 import logging
