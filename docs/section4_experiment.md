@@ -408,7 +408,7 @@ uv run -m scripts.run_experiment \
 
 ### 10.3 批量实验
 
-- 全量组合脚本：`scripts/run_all_expe.sh`，会遍历 dataset×appliance×window×model×seed 的组合，并调用 `uv run -m scripts.run_experiment`。
+- 全量组合脚本：`scripts/run_all_experiments.sh`，会遍历 dataset×appliance×window×model×seed 的组合，并调用 `uv run -m scripts.run_experiment`。
 - 数据集专用脚本：
   - `scripts/run_ukdale_all.py`：对 UKDALE 的所有设备跑同一配置。
   - `scripts/run_redd_all.py`：对 REDD 的设备列表按预置房屋组合批量运行。
