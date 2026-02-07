@@ -11,7 +11,7 @@ import torch.nn.functional as F
 
 from typing import Any
 
-from src.nilmformer.congif import NILMFormerConfig
+from src.nilmformer.config import NILMFormerConfig
 
 
 class DiagonnalyMaskedSelfAttention(nn.Module):

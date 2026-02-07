@@ -6,7 +6,7 @@ during training based on validation metrics.
 """
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
 from .device_config import CYCLING_DEVICE_TYPES
@@ -219,13 +219,13 @@ class AdaptiveLossTuner:
         # Get recall
         try:
             recall = float(metrics.get("RECALL", 0.0))
-        except Exception:
+        except (ValueError, TypeError):
             recall = 0.0
 
         # Get OFF long run ratio
         try:
             off_long_raw = float(record.get("off_long_run_energy_ratio_raw", 0.0))
-        except Exception:
+        except (ValueError, TypeError):
             off_long_raw = 0.0
 
         # Determine thresholds based on device type
@@ -466,5 +466,5 @@ def _safe_setattr(obj, name: str, value) -> bool:
     try:
         setattr(obj, name, value)
         return True
-    except Exception:
+    except (AttributeError, TypeError):
         return False

@@ -73,10 +73,10 @@ anti_collapse_weight: 0.8
 #   - always_on:            always-on appliances
 #   - sparse_medium_power:  sparse medium-power appliances
 #
-# 使用 AdaptiveDeviceLoss (multi_nilm) - 自动根据设备类型调整参数
+# Uses AdaptiveDeviceLoss (multi_nilm) - auto-adjusts params by device type
 loss_type: multi_nilm
 
-# ===== HPO最佳参数 (Trial 4, weighted F1=0.527) =====
+# ===== HPO best params (Trial 4, weighted F1=0.527) =====
 # lambda_off_hard: OFF-state hard constraint weight
 loss_lambda_off_hard: 0.01368
 
@@ -143,28 +143,7 @@ gate_floor: 0.014
 postprocess_gate_avg_threshold: 0.25
 postprocess_gate_max_threshold: 0.5
 
-# OPTIMIZED: 后处理参数 - V5: 更严格的OFF抑制
-postprocess_per_device:
-  # Microwave: 适度阈值抑制OFF噪声
-  microwave:
-    postprocess_threshold: 35     # V5: Raised from 30 to reduce OFF noise
-    postprocess_min_on_steps: 1   # 保持敏感性
-  # Kettle: 提高阈值
-  Kettle:
-    postprocess_threshold: 25     # V5: Raised from 20
-    postprocess_min_on_steps: 2
-  # Fridge: 提高阈值压制OFF噪声
-  Fridge:
-    postprocess_threshold: 50     # V5: Raised from 40
-    postprocess_min_on_steps: 3
-  # WashingMachine: 宽松后处理 - 回调F1=0.433但后处理压低到0.280
-  WashingMachine:
-    postprocess_threshold: 20     # V7.5j: Lowered from 75 - WM mean_on=539W
-    postprocess_min_on_steps: 2   # V7.5j: Lowered from 10 - WM short phases at 1min sampling
-  # Dishwasher: 更激进压制假阳性
-  Dishwasher:
-    postprocess_threshold: 55     # V5: Raised from 45
-    postprocess_min_on_steps: 10  # V5: Reduced
+# NOTE: Per-device postprocess params are in dataset_params.yaml (overrides this file).
 
 # ============== Gradient Conflict Resolution V2 (Multi-Device Training) ==============
 # PCGrad + Gradient Balancing to solve gradient conflicts in multi-device training.

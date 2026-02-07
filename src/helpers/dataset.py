@@ -284,40 +284,6 @@ class NILMscaler:
         return rescale_data
 
 
-class TSDataset(torch.utils.data.Dataset):
-    """
-    MAP-Style PyTorch Time series Dataset
-    """
-
-    def __init__(self, X, labels=None):
-        if isinstance(X, pd.core.frame.DataFrame):
-            X = X.values
-        if isinstance(labels, pd.core.frame.DataFrame):
-            labels = labels.values
-
-        self.samples = X
-
-        if len(self.samples.shape) == 2:
-            self.samples = np.expand_dims(self.samples, axis=1)
-
-        if labels is not None:
-            self.labels = labels.ravel()
-            assert len(self.samples) == len(self.labels), (
-                f"Number of X sample {len(self.samples)} doesn't match number of y sample {len(self.labels)}."
-            )
-        else:
-            self.labels = labels
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        if self.labels is None:
-            return self.samples[idx]
-        else:
-            return self.samples[idx], self.labels[idx]
-
-
 class TSDatasetScaling(torch.utils.data.Dataset):
     """
     MAP-Style PyTorch Time series Dataset

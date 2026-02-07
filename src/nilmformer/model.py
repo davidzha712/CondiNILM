@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from src.nilmformer.layers.transformer import EncoderLayer
 from src.nilmformer.layers.embedding import DilatedBlock
 
-from src.nilmformer.congif import NILMFormerConfig
+from src.nilmformer.config import NILMFormerConfig
 
 
 class SimpleDeviceHead(nn.Module):

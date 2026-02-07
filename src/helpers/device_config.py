@@ -13,29 +13,29 @@ import numpy as np
 CYCLING_DEVICE_TYPES = frozenset({"frequent_switching", "cycling_low_power", "cycling_infrequent"})
 
 # Base loss parameters for each device type
-# V3: 添加回归优化参数 (w_energy, w_on_power, w_peak, w_grad, w_range)
+# V3: Added regression parameters (w_energy, w_on_power, w_peak, w_grad, w_range)
 DEVICE_TYPE_BASE_PARAMS = {
-    # Microwave/Kettle: 稀疏高功率设备
-    # V6: HPO-ALIGNED - 基于Optuna Trial #46最优参数
-    # 关键发现: HIGH OFF penalties导致稀疏设备预测被完全抑制
-    # HPO最优: alpha_off=0.072, lambda_off_hard=0.003
+    # Microwave/Kettle: sparse high-power devices
+    # V6: HPO-ALIGNED - Based on Optuna Trial #46 best params
+    # CRITICAL: High OFF penalties suppress sparse device predictions entirely
+    # HPO best: alpha_off=0.072, lambda_off_hard=0.003
     "sparse_high_power": {
-        "alpha_on": 3.82,           # HPO最优 (从5.0降低)
-        "alpha_off": 0.1,           # HPO-ALIGNED (从3.2大幅降低! HPO最优0.072)
-        "lambda_zero": 0.03,        # 降低zero惩罚 (太高导致塌陷)
-        "lambda_sparse": 0.005,     # 降低稀疏惩罚
-        "lambda_off_hard": 0.005,   # HPO-ALIGNED (从0.18大幅降低! HPO最优0.003)
-        "lambda_on_recall": 1.14,   # HPO最优
-        "on_recall_margin": 0.75,   # 适度margin
-        "lambda_gate_cls": 0.25,    # 降低gate权重
+        "alpha_on": 3.82,           # HPO best (reduced from 5.0)
+        "alpha_off": 0.1,           # HPO-ALIGNED (reduced from 3.2; HPO best 0.072)
+        "lambda_zero": 0.03,        # Reduced zero penalty (too high causes collapse)
+        "lambda_sparse": 0.005,
+        "lambda_off_hard": 0.005,   # HPO-ALIGNED (reduced from 0.18; HPO best 0.003)
+        "lambda_on_recall": 1.14,   # HPO best
+        "on_recall_margin": 0.75,
+        "lambda_gate_cls": 0.25,
         "lambda_energy": 0.15,
-        "off_margin": 0.02,         # 降低off margin
-        # 回归优化参数
-        "w_energy": 0.15,           # 能量回归权重
-        "w_on_power": 0.12,         # ON功率精度权重
-        "w_peak": 0.08,             # 峰值检测权重
-        "w_grad": 0.05,             # 梯度平滑权重
-        "w_range": 0.10,            # 适度范围约束
+        "off_margin": 0.02,
+        # Regression parameters
+        "w_energy": 0.15,
+        "w_on_power": 0.12,
+        "w_peak": 0.08,
+        "w_grad": 0.05,
+        "w_range": 0.10,
     },
     "frequent_switching": {
         "alpha_on": 3.0,
@@ -48,11 +48,11 @@ DEVICE_TYPE_BASE_PARAMS = {
         "lambda_gate_cls": 0.15,
         "lambda_energy": 0.2,
         "off_margin": 0.02,
-        # 回归优化参数
+        # Regression parameters
         "w_energy": 0.22,
         "w_on_power": 0.10,
-        "w_peak": 0.10,             # 中等峰值权重
-        "w_grad": 0.08,             # 适度梯度平滑
+        "w_peak": 0.10,
+        "w_grad": 0.08,
         "w_range": 0.08,
     },
     "cycling_infrequent": {
@@ -66,15 +66,15 @@ DEVICE_TYPE_BASE_PARAMS = {
         "lambda_gate_cls": 0.18,
         "lambda_energy": 0.2,
         "off_margin": 0.015,
-        # 回归优化参数
+        # Regression parameters
         "w_energy": 0.22,
         "w_on_power": 0.10,
         "w_peak": 0.12,
         "w_grad": 0.06,
         "w_range": 0.08,
     },
-    # Fridge: 周期性低功率设备
-    # 需要捕获压缩机启动峰值，同时保持周期性波形
+    # Fridge: cycling low-power device
+    # Must capture compressor start-up peaks while preserving cyclic waveform
     "cycling_low_power": {
         "alpha_on": 2.8,
         "alpha_off": 2.0,
@@ -86,33 +86,33 @@ DEVICE_TYPE_BASE_PARAMS = {
         "lambda_gate_cls": 0.18,
         "lambda_energy": 0.2,
         "off_margin": 0.008,
-        # 回归优化参数 - 强调峰值和梯度
-        "w_energy": 0.28,           # 高能量权重
-        "w_on_power": 0.15,         # 高ON功率权重
-        "w_peak": 0.18,             # 高峰值权重! 捕获压缩机启动
-        "w_grad": 0.10,             # 适度梯度平滑，跟随周期变化
-        "w_range": 0.05,            # 低范围约束 (冰箱功率相对稳定)
+        # Regression parameters - emphasize peaks and gradients
+        "w_energy": 0.28,
+        "w_on_power": 0.15,
+        "w_peak": 0.18,             # High: capture compressor start-up peaks
+        "w_grad": 0.10,             # Follow cyclic power transitions
+        "w_range": 0.05,            # Low: fridge power is relatively stable
     },
-    # WashingMachine/Dishwasher: 长周期设备
-    # V2: 增强OFF惩罚，参考sparse_high_power的成功模式
-    # 多阶段功率变化，需要梯度平滑和能量准确
+    # WashingMachine/Dishwasher: long-cycle devices
+    # V2: Enhanced OFF penalties, following sparse_high_power's success pattern
+    # Multi-phase power transitions need gradient smoothing and energy accuracy
     "long_cycle": {
         "alpha_on": 5.0,
-        "alpha_off": 3.0,           # 提高OFF权重 (从2.5升到3.0)
-        "lambda_zero": 0.10,        # 提高zero惩罚
-        "lambda_sparse": 0.018,     # 提高稀疏惩罚
-        "lambda_off_hard": 0.16,    # 增加OFF硬惩罚 (从0.12升到0.16)
-        "lambda_on_recall": 0.8,    # 略微提高recall权重
+        "alpha_off": 3.0,           # Raised from 2.5
+        "lambda_zero": 0.10,
+        "lambda_sparse": 0.018,
+        "lambda_off_hard": 0.16,    # Raised from 0.12
+        "lambda_on_recall": 0.8,
         "on_recall_margin": 0.65,
-        "lambda_gate_cls": 0.25,    # 略微提高gate权重
-        "lambda_energy": 0.15,      # 略微提高能量权重
-        "off_margin": 0.02,         # 提高off margin
-        # 回归优化参数 - 强调能量和梯度
-        "w_energy": 0.32,           # 高能量权重 (长周期总能量重要)
-        "w_on_power": 0.12,         # 中等ON功率权重
-        "w_peak": 0.10,             # 中等峰值权重
-        "w_grad": 0.12,             # 高梯度平滑 (多阶段变化需要平滑)
-        "w_range": 0.12,            # 提高范围约束
+        "lambda_gate_cls": 0.25,
+        "lambda_energy": 0.15,
+        "off_margin": 0.02,
+        # Regression parameters - emphasize energy and gradients
+        "w_energy": 0.32,           # High: total energy matters for long cycles
+        "w_on_power": 0.12,
+        "w_peak": 0.10,
+        "w_grad": 0.12,             # High: smooth multi-phase transitions
+        "w_range": 0.12,
     },
     "always_on": {
         "alpha_on": 1.0,
@@ -125,11 +125,11 @@ DEVICE_TYPE_BASE_PARAMS = {
         "lambda_gate_cls": 0.05,
         "lambda_energy": 0.25,
         "off_margin": 0.03,
-        # 回归优化参数 - 强调稳定性
-        "w_energy": 0.30,           # 高能量权重 (持续功率)
+        # Regression parameters - emphasize stability
+        "w_energy": 0.30,           # High: continuous power consumption
         "w_on_power": 0.08,
-        "w_peak": 0.02,             # 低峰值权重 (几乎无峰值)
-        "w_grad": 0.15,             # 高梯度平滑 (稳定输出)
+        "w_peak": 0.02,             # Low: almost no peaks
+        "w_grad": 0.15,             # High: stable output
         "w_range": 0.05,
     },
     "sparse_medium_power": {
@@ -143,7 +143,7 @@ DEVICE_TYPE_BASE_PARAMS = {
         "lambda_gate_cls": 0.1,
         "lambda_energy": 0.08,
         "off_margin": 0.02,
-        # 回归优化参数
+        # Regression parameters
         "w_energy": 0.20,
         "w_on_power": 0.10,
         "w_peak": 0.08,
@@ -163,7 +163,7 @@ DEVICE_TYPE_BASE_PARAMS = {
         "lambda_gate_cls": 0.15,
         "lambda_energy": 0.18,
         "off_margin": 0.015,
-        # 回归优化参数 - multi-phase power needs energy + gradient
+        # Regression parameters - multi-phase power needs energy + gradient
         "w_energy": 0.28,
         "w_on_power": 0.12,
         "w_peak": 0.0,              # Disabled (no sharp peaks like kettle)
@@ -188,20 +188,20 @@ LONG_CYCLE_LOW_DUTY_PARAMS = {
 # Device type specific config defaults (using dict lookup instead of nested ternary)
 # FIXED: Reduced gate_floor values to prevent floor noise in OFF state
 # Previous high values (e.g., 0.4 for sparse_high_power) caused significant floor noise
-# OPTIMIZED (v4): Gate配置 - 针对各设备类型调整Gate参数
+# OPTIMIZED (v4): Gate config - tuned per device type
 # LESSON LEARNED: gate_floor=0.02 for sparse devices caused minimum 2% activation even in OFF state
 # This led to false positives. Reduced to 0.008 to allow near-zero outputs.
 DEVICE_TYPE_GATE_CONFIG = {
-    # V6: HPO-ALIGNED gate参数
-    # sparse_high_power: 适度scale, 适当floor允许检测
+    # V6: HPO-ALIGNED gate params
+    # sparse_high_power: moderate scale, floor allows detection
     # V7.3: Restored gate_floor=0.015 (from 0.005). Lower floor allowed kettle gate_floor
     # to learn down to 0.004, causing complete collapse (F1=0.0).
     "sparse_high_power": {"gate_soft_scale": 2.0, "gate_floor": 0.015, "gate_duty_weight": 0.05, "gate_logits_floor": -3.0},
     "frequent_switching": {"gate_soft_scale": 2.0, "gate_floor": 0.005, "gate_duty_weight": 0.05},
     "cycling_infrequent": {"gate_soft_scale": 2.0, "gate_floor": 0.01, "gate_duty_weight": 0.01},
-    # Fridge: 降低gate_floor减少OFF泄漏，提高scale增加锐度
+    # Fridge: lower gate_floor to reduce OFF leakage, higher scale for sharper gating
     "cycling_low_power": {"gate_soft_scale": 2.5, "gate_floor": 0.008, "gate_duty_weight": 0.02},
-    # WashingMachine/Dishwasher: 提高scale增加锐度
+    # WashingMachine/Dishwasher: higher scale for sharper gating
     "long_cycle": {"gate_soft_scale": 2.0, "gate_floor": 0.005, "gate_duty_weight": 0.03},
     "always_on": {"gate_soft_scale": 1.0, "gate_floor": 0.05, "gate_duty_weight": 0.0},
     "sparse_medium_power": {"gate_soft_scale": 1.0, "gate_floor": 0.02, "gate_duty_weight": 0.0},
@@ -222,7 +222,7 @@ DEVICE_TYPE_POSTPROCESS_CONFIG = {
 }
 
 DEVICE_TYPE_ZERO_PENALTY_CONFIG = {
-    # V6: 降低zero penalty防止塌陷
+    # V6: Reduced zero penalty to prevent collapse
     "sparse_high_power": {"weight": 0.05, "kernel": 24, "ratio": 0.88},
     "frequent_switching": {"weight": 0.2, "kernel": 12, "ratio": 0.55},
     "cycling_infrequent": {"weight": 0.02, "kernel": 18, "ratio": 0.8},
@@ -236,13 +236,13 @@ DEVICE_TYPE_ZERO_PENALTY_CONFIG = {
 }
 
 DEVICE_TYPE_OFF_PENALTY_CONFIG = {
-    # V6: HPO-ALIGNED - 降低OFF惩罚以防止稀疏设备塌陷
+    # V6: HPO-ALIGNED - Reduced OFF penalties to prevent sparse device collapse
     "sparse_high_power": {"off_high_agg": 0.03, "off_state": 0.02, "off_state_long": 0.01},
     "frequent_switching": {"off_high_agg": 0.02, "off_state": 0.1, "off_state_long": 0.2},
     "cycling_infrequent": {"off_high_agg": 0.01, "off_state": 0.015, "off_state_long": 0.1},
     "cycling_low_power": {"off_high_agg": 0.02, "off_state": 0.01, "off_state_long": 0.05},
     "cycling_low_power_low_duty": {"off_high_agg": 0.01, "off_state": 0.01, "off_state_long": 0.05},
-    # long_cycle: 添加OFF惩罚（之前为0导致假阳性）
+    # long_cycle: Added OFF penalties (previously 0, causing false positives)
     "long_cycle": {"off_high_agg": 0.08, "off_state": 0.05, "off_state_long": 0.02},
     "long_cycle_low_duty": {"off_high_agg": 0.03, "off_state": 0.02, "off_state_long": 0.01},
     "always_on": {"off_high_agg": 0.01, "off_state": 0.0, "off_state_long": 0.0},
@@ -550,7 +550,7 @@ def _set_default_float(config, key, value, default_value, atol=1e-12):
         cur = float(getattr(config, key, default_value))
         if abs(cur - float(default_value)) < float(atol):
             config[key] = float(value)
-    except Exception:
+    except (ValueError, TypeError):
         pass
 
 
@@ -563,7 +563,7 @@ def _set_default_int(config, key, value, default_value):
         cur = int(getattr(config, key, default_value))
         if cur == int(default_value):
             config[key] = int(value)
-    except Exception:
+    except (ValueError, TypeError):
         pass
 
 
@@ -602,7 +602,7 @@ def apply_device_type_config_defaults(
             cur = float(getattr(expes_config, "gate_floor", 0.0) or 0.0)
             if cur > 0.005 + 1e-12:
                 expes_config["gate_floor"] = 0.005
-        except Exception:
+        except (ValueError, TypeError):
             pass
 
     # Gate weights - enabled for all device types with learnable gate_bias architecture
@@ -630,7 +630,7 @@ def apply_device_type_config_defaults(
                         post_thr = min(post_thr, cap)
                     else:
                         post_thr = min(post_thr, max(float(threshold), cap))
-            except Exception:
+            except (KeyError, ValueError, TypeError):
                 pass
         expes_config["postprocess_threshold"] = float(post_thr)
 
@@ -661,7 +661,7 @@ def apply_device_type_config_defaults(
                 expes_config["off_state_margin"] = float(
                     getattr(expes_config, "loss_off_margin", off_margin)
                 )
-    except Exception:
+    except (ValueError, TypeError, ZeroDivisionError):
         if "off_state_margin" not in expes_config:
             expes_config["off_state_margin"] = float(
                 getattr(expes_config, "loss_off_margin", off_margin)
