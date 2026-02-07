@@ -1,6 +1,6 @@
 # 第四部分：实验设计、实现细节与结果产出（论文级复现实验说明）
 
-本节给出 CondiNILM 仓库中“实验如何被定义、如何被执行、如何被记录与评估”的可复现描述。内容严格对应现有配置与实现：配置入口为 `configs/*.yaml`，运行入口为 `scripts/run_one_expe.py`，训练/评估骨架位于 `src/helpers/expes.py` 与 `src/helpers/trainer.py`，数据缩放与缓存位于 `src/helpers/dataset.py` 与 `scripts/run_one_expe.py`。
+本节给出 CondiNILM 仓库中“实验如何被定义、如何被执行、如何被记录与评估”的可复现描述。内容严格对应现有配置与实现：配置入口为 `configs/*.yaml`，运行入口为 `scripts/run_one_expe.py`，训练/评估骨架位于 `src/helpers/experiment.py` 与 `src/helpers/trainer.py`，数据缩放与缓存位于 `src/helpers/dataset.py` 与 `scripts/run_one_expe.py`。
 
 ## 1. 实验目标与对比设置
 
@@ -116,7 +116,7 @@
 ### 6.1 训练入口与训练骨架
 
 - 数据准备完成后，`scripts/run_one_expe.py` 调用 `launch_models_training(tuple_data, scaler, expes_config)`。
-- `src/helpers/expes.py` 负责：
+- `src/helpers/experiment.py` 负责：
   - 构建 `NILMDataset`（或 TSER/DiffNILM/STNILM 对应的数据封装）。
   - 构建 DataLoader，并根据操作系统设置 `num_workers`（Windows 默认会退化到 `0`，避免多进程数据加载问题）。
   - 构建回调：验证指标写入与可视化 HTML 产出。
@@ -144,7 +144,7 @@
 
 ### 7.1 loss_type 的可选项与默认值
 
-在 `src/helpers/expes.py` 中，`loss_type` 默认取 `multi_nilm`，也可由命令行 `--loss_type` 覆盖。支持：
+在 `src/helpers/experiment.py` 中，`loss_type` 默认取 `multi_nilm`，也可由命令行 `--loss_type` 覆盖。支持：
 
 - `multi_nilm`：AdaptiveDeviceLoss（设备自适应、多设备友好、支持 seq2subseq）。
 - `smoothl1`：标准 SmoothL1Loss。
@@ -173,14 +173,14 @@ multi_nilm 依赖 `scripts/run_one_expe.py` 在数据就绪后自动计算设备
 
 ### 7.4 multi_nilm 与 Trainer 辅助惩罚项的关系
 
-为了避免“同一惩罚重复计算”，在 `loss_type == multi_nilm` 时，`src/helpers/expes.py` 会将 `SeqToSeqLightningModule` 的各类辅助惩罚权重（如 zero-run、off-state 等）直接置零，让损失的所有约束集中在 AdaptiveDeviceLoss 内部完成；在非 multi_nilm 时，这些辅助项由 `SeqToSeqLightningModule` 按配置启用。
+为了避免“同一惩罚重复计算”，在 `loss_type == multi_nilm` 时，`src/helpers/experiment.py` 会将 `SeqToSeqLightningModule` 的各类辅助惩罚权重（如 zero-run、off-state 等）直接置零，让损失的所有约束集中在 AdaptiveDeviceLoss 内部完成；在非 multi_nilm 时，这些辅助项由 `SeqToSeqLightningModule` 按配置启用。
 
 ### 7.5 multi_nilm 的参数来源与覆盖链路（从 YAML 到 AdaptiveDeviceLoss）
 
 - 基础默认值：`configs/expes.yaml` 中的 `loss_lambda_* / loss_alpha_* / loss_off_margin / loss_on_recall_margin / gate_* / output_ratio` 是默认值，作为“全局初值”进入 `expes_config`。
 - dataset 级补齐：`configs/dataset_params.yaml` 中的 `loss` 与 `appliances` 结构会在 `DatasetParamsManager` 中补齐缺省字段（如 `loss_type/output_ratio/anti_collapse_weight` 与设备先验 `device_type`）。
 - 统计驱动重写：`scripts/run_one_expe.py::_configure_nilm_loss_hyperparams` 在数据就绪后计算设备统计（`duty_cycle/peak_power/mean_on/cv_on/mean_event_duration/n_events`），输出 `device_type` 并写回 `expes_config`（单设备或多设备均可），形成 `device_stats_for_loss` 与 `loss_params_per_device`。
-- AdaptiveDeviceLoss 的最终参数：`src/helpers/expes.py` 将 `loss_alpha_on/off、loss_lambda_on_recall、loss_lambda_energy、gate_soft_scale、gate_floor` 等配置作为 `config_overrides` 传入 AdaptiveDeviceLoss，用于“全局缩放”；而每个设备的“局部参数”仍由统计值与 `device_type` 决定。
+- AdaptiveDeviceLoss 的最终参数：`src/helpers/experiment.py` 将 `loss_alpha_on/off、loss_lambda_on_recall、loss_lambda_energy、gate_soft_scale、gate_floor` 等配置作为 `config_overrides` 传入 AdaptiveDeviceLoss，用于“全局缩放”；而每个设备的“局部参数”仍由统计值与 `device_type` 决定。
 
 换言之，multi_nilm 的参数是“三层融合”的：全局默认值 + dataset 补齐 + 统计驱动修正，最后由 AdaptiveDeviceLoss 完成 per-device 参数化。
 

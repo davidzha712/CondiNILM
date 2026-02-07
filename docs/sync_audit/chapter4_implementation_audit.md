@@ -160,7 +160,7 @@ Chapter 4 describes the implementation details and experimental setup. Since the
 The docs do not describe the gate-based postprocessing stage added in V7.5:
 
 ```python
-# expes.py:2167-2199
+# experiment.py:2167-2199
 # Stage 3: Suppress long OFF regions with gate confidence
 gate_avg = avg_pool1d(gate_prob, kernel_size)
 gate_max = max_pool1d(gate_prob, kernel_size)

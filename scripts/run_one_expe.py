@@ -12,6 +12,7 @@ import yaml
 import logging
 from collections.abc import Sequence, Mapping
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logging.getLogger("torch.utils.flop_counter").disabled = True
 
 _ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -34,7 +35,7 @@ from src.helpers.preprocessing import (
     split_train_valid_timeblock_nilmdataset,
 )
 from src.helpers.dataset import NILMscaler
-from src.helpers.expes import launch_models_training
+from src.helpers.experiment import launch_models_training
 from src.helpers.device_config import (
     CYCLING_DEVICE_TYPES,
     classify_device_type,
@@ -61,7 +62,7 @@ def _set_cfg_value(expes_config, key, value, default_value=None):
         cur = float(getattr(expes_config, key))
         if abs(cur - float(default_value)) < 1e-12:
             expes_config[key] = value
-    except Exception as e:
+    except (ValueError, TypeError, AttributeError) as e:
         logging.debug("_set_cfg_value(%s): %s", key, e)
 
 
@@ -73,7 +74,7 @@ def _maybe_denormalize_power_by_cutoff(power, expes_config):
         cutoff = float(getattr(expes_config, "cutoff", 0.0) or 0.0)
         if cutoff > 0.0 and float(np.nanmax(np.abs(flat))) <= 1.5:
             return power * cutoff
-    except Exception as e:
+    except (ValueError, TypeError, AttributeError) as e:
         logging.debug("_maybe_denormalize_power_by_cutoff failed: %s", e)
         return power
     return power
@@ -105,7 +106,7 @@ def _apply_cutoff_to_loss_params(expes_config):
                 expes_config["loss_off_margin"] = float(
                     min(max(expes_config["loss_off_margin"], 0.005), 0.05)
                 )
-    except Exception as e:
+    except (ValueError, TypeError, AttributeError, ZeroDivisionError) as e:
         logging.debug("_apply_cutoff_to_loss_params failed: %s", e)
         return
 
@@ -265,19 +266,14 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                         ds.get("mean_on", 0),
                     )
 
+                base_per_device = getattr(expes_config, "postprocess_per_device", None)
+                if isinstance(base_per_device, Mapping):
+                    per_device_post = dict(base_per_device)
+                else:
+                    per_device_post = {}
                 try:
-                    base_per_device = getattr(expes_config, "postprocess_per_device", None)
-                    if isinstance(base_per_device, Mapping):
-                        per_device_post = dict(base_per_device)
-                    else:
-                        per_device_post = {}
                     thr_cfg = float(threshold)
-                except Exception:
-                    base_per_device = getattr(expes_config, "postprocess_per_device", None)
-                    if isinstance(base_per_device, Mapping):
-                        per_device_post = dict(base_per_device)
-                    else:
-                        per_device_post = {}
+                except (ValueError, TypeError):
                     thr_cfg = float(getattr(expes_config, "threshold", 0.0) or 0.0)
                 if per_device_post is not None:
                     per_device_post_norm = {
@@ -393,10 +389,7 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                         except Exception:
                             kettle_idx = -1
                         if type_ids:
-                            try:
-                                mk = getattr(expes_config, "model_kwargs", None)
-                            except Exception:
-                                mk = None
+                            mk = getattr(expes_config, "model_kwargs", None)
                             if mk is None:
                                 cfg = {"type_ids_per_channel": type_ids}
                                 if kettle_idx >= 0:
@@ -712,14 +705,10 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                 "Single device stats for loss: %s (duty=%.3f, peak=%.0f, type=%s)",
                 app_name, duty_cycle, peak_power, device_type
             )
-    per_device_cfg = None
-    try:
-        if isinstance(expes_config, dict):
-            per_device_cfg = expes_config.get("postprocess_per_device")
-        else:
-            per_device_cfg = getattr(expes_config, "postprocess_per_device", None)
-    except Exception:
-        per_device_cfg = None
+    if isinstance(expes_config, dict):
+        per_device_cfg = expes_config.get("postprocess_per_device")
+    else:
+        per_device_cfg = getattr(expes_config, "postprocess_per_device", None)
     if isinstance(per_device_cfg, Mapping) and per_device_cfg:
         try:
             if isinstance(expes_config, dict):
