@@ -137,8 +137,14 @@ CondiNILM/
 │   │       ├── resnet.py           # ResNet
 │   │       └── inceptiontime.py    # InceptionTime
 │   └── helpers/
+│       ├── experiment.py           # Model factory, utility re-exports
 │       ├── trainer.py              # PyTorch Lightning trainer, AdaptiveDeviceLoss
-│       ├── expes.py                # Experiment orchestration, evaluation, logging
+│       ├── training.py             # Training loop orchestration
+│       ├── evaluation.py           # Evaluation and metric computation
+│       ├── callbacks.py            # Lightning callbacks (validation, logging)
+│       ├── loss.py                 # Loss function definitions
+│       ├── inference.py            # Sliding window inference and stitching
+│       ├── postprocess.py          # Post-processing (threshold, gate suppression)
 │       ├── preprocessing.py        # Data loading, windowing, train/valid splitting
 │       ├── dataset.py              # PyTorch Dataset classes
 │       ├── dataset_params.py       # Per-dataset device parameter loading
@@ -146,8 +152,7 @@ CondiNILM/
 │       ├── metrics.py              # F1, precision, recall, MAE, SAE metrics
 │       ├── loss_tuning.py          # Loss parameter tuning utilities
 │       ├── gradient_conflict.py    # Gradient conflict detection (PCGrad)
-│       ├── utils.py                # General utilities
-│       └── visualization.py        # Plotting and HTML report generation
+│       └── utils.py                # General utilities
 ├── configs/
 │   ├── expes.yaml                  # Experiment settings (training, loss, gate, scheduler)
 │   ├── dataset_params.yaml         # Per-dataset device parameters and postprocessing
@@ -156,16 +161,18 @@ CondiNILM/
 │   ├── hpo_search_spaces.yaml      # Optuna search space definitions
 │   └── hpo_sparse_devices.yaml     # HPO config for sparse devices
 ├── scripts/
-│   ├── run_one_expe.py             # Main entry point for single experiments
+│   ├── run_experiment.py           # Main entry point for single experiments
 │   ├── run_optuna_search.py        # Optuna hyperparameter search
 │   ├── run_ukdale_all.py           # Run all UKDALE experiments
 │   ├── run_redd_all.py             # Run all REDD experiments
+│   ├── run_all_experiments.sh      # Batch runner for all dataset/model combinations
 │   ├── streamlit_val_viewer.py     # Interactive validation visualization
 │   ├── viz_preprocessing.py        # Preprocessing visualization
 │   ├── analyze_appliance_stats.py  # Appliance statistics analysis
 │   └── find_best_results.py        # Parse and rank experiment results
 ├── assets/                         # Architecture diagrams and figures
 ├── data/                           # Dataset root (UKDALE/, REFIT/, REDD/)
+├── pyproject.toml                  # PEP 621 project metadata and packaging
 ├── requirements.txt
 ├── environment_win.yaml
 ├── environment_mac.yaml
