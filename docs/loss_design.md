@@ -11,7 +11,7 @@
 
 ## 2. loss_type 与默认入口
 
-默认 loss 为 `multi_nilm`，由 `src/helpers/expes.py` 选择并实例化 `AdaptiveDeviceLoss`。同时将其它训练模块中的辅助惩罚项置零，避免重复约束。
+默认 loss 为 `multi_nilm`，由 `src/helpers/experiment.py` 选择并实例化 `AdaptiveDeviceLoss`。同时将其它训练模块中的辅助惩罚项置零，避免重复约束。
 
 ```python
 if loss_type == "multi_nilm":
@@ -39,8 +39,8 @@ loss 参数是多层融合的结果：
 
 1) `configs/expes.yaml` 提供全局默认值  
 2) `configs/dataset_params.yaml` 提供 dataset 级默认项与设备先验  
-3) `scripts/run_one_expe.py::_configure_nilm_loss_hyperparams` 基于统计量生成 `device_stats_for_loss` 与 `loss_params_per_device`  
-4) `src/helpers/expes.py` 将部分全局超参作为 `config_overrides` 缩放到 AdaptiveDeviceLoss  
+3) `scripts/run_experiment.py::_configure_nilm_loss_hyperparams` 基于统计量生成 `device_stats_for_loss` 与 `loss_params_per_device`  
+4) `src/helpers/experiment.py` 将部分全局超参作为 `config_overrides` 缩放到 AdaptiveDeviceLoss  
 5) `AdaptiveDeviceLoss` 对每个设备基于统计量与 `device_type` 派生最终参数
 
 ## 4. 设备统计量与类型分类
@@ -200,6 +200,6 @@ gate_floor: 0.011203254019178552
 ## 11. 关键代码位置索引
 
 - AdaptiveDeviceLoss 结构与计算：`src/helpers/trainer.py`
-- loss 初始化与 config_overrides：`src/helpers/expes.py`
-- 设备统计与类型分类：`scripts/run_one_expe.py`、`src/helpers/device_config.py`
+- loss 初始化与 config_overrides：`src/helpers/experiment.py`
+- 设备统计与类型分类：`scripts/run_experiment.py`、`src/helpers/device_config.py`
 - 动态调参逻辑：`src/helpers/loss_tuning.py`

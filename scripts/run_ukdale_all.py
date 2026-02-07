@@ -52,7 +52,7 @@ def parse_appliance_list(all_appliances, appliances_str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Run NILM training on all UKDALE appliances using run_one_expe."
+        description="Run NILM training on all UKDALE appliances using run_experiment."
     )
     parser.add_argument(
         "--sampling_rate",
@@ -70,7 +70,7 @@ def main():
         "--name_model",
         required=True,
         type=str,
-        help="Model name passed to scripts.run_one_expe.",
+        help="Model name passed to scripts.run_experiment.",
     )
     parser.add_argument(
         "--appliances",
@@ -81,31 +81,31 @@ def main():
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="Forwarded to scripts.run_one_expe to resume from checkpoint.",
+        help="Forwarded to scripts.run_experiment to resume from checkpoint.",
     )
     parser.add_argument(
         "--no_final_eval",
         action="store_true",
-        help="Forwarded to scripts.run_one_expe to skip final heavy eval.",
+        help="Forwarded to scripts.run_experiment to skip final heavy eval.",
     )
     parser.add_argument(
         "--epochs",
         type=int,
         default=25,
-        help="Forwarded to scripts.run_one_expe to override max epochs.",
+        help="Forwarded to scripts.run_experiment to override max epochs.",
     )
     parser.add_argument(
         "--batch_size",
         type=int,
         default=None,
-        help="Forwarded to scripts.run_one_expe to override batch size.",
+        help="Forwarded to scripts.run_experiment to override batch size.",
     )
     parser.add_argument(
         "--loss_type",
         type=str,
         default=None,
         help=(
-            "Forwarded to scripts.run_one_expe. Choices: "
+            "Forwarded to scripts.run_experiment. Choices: "
             "'eaec', 'smoothl1', 'mse', 'mae'."
         ),
     )
@@ -138,7 +138,7 @@ def main():
         cmd = [
             sys.executable,
             "-m",
-            "scripts.run_one_expe",
+            "scripts.run_experiment",
             "--dataset",
             dataset_key,
             "--sampling_rate",

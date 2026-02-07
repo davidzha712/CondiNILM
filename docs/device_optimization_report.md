@@ -244,7 +244,7 @@ Fridge_HPO:
 
 ### 第二步：验证修改效果
 ```bash
-python scripts/run_one_expe.py \
+python scripts/run_experiment.py \
     --dataset UKDALE \
     --appliance "Kettle,Fridge,WashingMachine,Dishwasher,Microwave" \
     --name_model NILMFormer \

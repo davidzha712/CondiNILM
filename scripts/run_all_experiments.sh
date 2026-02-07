@@ -28,14 +28,14 @@ run_batch() {
       for win in "${arr_windows[@]}"; do
         for model in "${arr_models[@]}"; do
           for seed in "${SEEDS[@]}"; do
-            echo "Running: uv run -m scripts.run_one_expe \
+            echo "Running: uv run -m scripts.run_experiment \
               --dataset $dataset \
               --sampling_rate 1min \
               --appliance $appliance \
               --window_size $win \
               --name_model $model \
               --seed $seed"
-            uv run -m scripts.run_one_expe \
+            uv run -m scripts.run_experiment \
               --dataset "$dataset" \
               --sampling_rate "1min" \
               --appliance "$appliance" \

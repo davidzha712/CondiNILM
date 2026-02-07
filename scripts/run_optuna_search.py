@@ -15,7 +15,7 @@ if _ROOT_DIR not in sys.path:
 
 from src.helpers.utils import create_dir
 from src.helpers.dataset_params import DatasetParamsManager, validate_appliances_for_dataset
-from scripts.run_one_expe import launch_one_experiment
+from scripts.run_experiment import launch_one_experiment
 
 
 def _load_yaml(path: str) -> Dict[str, Any]:

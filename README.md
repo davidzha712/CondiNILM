@@ -1,137 +1,247 @@
 # CondiNILM
 
-面向 NILM（Non-Intrusive Load Monitoring，非侵入式负荷分解）的研究代码库，包含：
-- 统一的训练/评估流程（单设备与 Multi 多设备联合学习）
-- NILMFormer 与多种 NILM / TSER 基线模型
-- 预处理、指标评估、可视化与实验脚本
+## Overview
 
-**Python**：建议 3.10+（已在 Windows 环境下以 3.12 运行）
+CondiNILM is a research framework for Non-Intrusive Load Monitoring (NILM) built on PyTorch Lightning. It centers on NILMFormer, a transformer-based architecture designed for multi-device joint energy disaggregation. The framework includes device-type-aware adaptive loss functions, soft gate mechanisms for sparse appliance handling, and anti-collapse training stabilization for robust multi-task learning.
 
-## 安装（仅支持原生 Python）
+Given an aggregate household power signal, the model simultaneously disaggregates per-appliance power consumption for up to five devices (fridge, kettle, dishwasher, washing machine, microwave) in a single forward pass.
 
-本项目**不支持 uv 安装**。请使用 **python + venv + pip**。
+## Key Features
 
-### 1) 创建虚拟环境
+- **NILMFormer architecture**: Transformer encoder with dilated convolution embedding, FiLM (Feature-wise Linear Modulation) conditioning, instance normalization, and device-type-grouped prediction heads.
+- **Dual-path inference**: Transformer path for complex multi-state devices (fridge, dishwasher, washing machine) and a lightweight CNN bypass path for sparse high-power devices (kettle, microwave) with learnable blend weights.
+- **AdaptiveDeviceLoss**: Per-device loss function that automatically derives parameters from appliance electrical characteristics (duty cycle, ON/OFF power ratios), with asymmetric ON/OFF weighting and focal-style gate classification loss.
+- **Soft gate mechanism**: Learnable per-device gate with scale, bias, and floor parameters. Uses soft gating during training and hard thresholding at inference for clean ON/OFF separation.
+- **Anti-collapse stabilization**: Automatic detection and recovery from training collapse in multi-task learning, preventing dominant devices from suppressing sparse ones.
+- **Multi-dataset support**: UKDALE (5 houses, 6s sampling), REFIT (20 houses, 8s sampling), and REDD (6 houses, 1s sampling) with configurable house-level train/validation/test splits.
+- **Hyperparameter optimization**: Optuna integration with configurable search spaces for loss parameters, learning rates, and architecture hyperparameters.
+- **15 baseline architectures**: BiGRU, BiLSTM, CNN1D, UNet-NILM, FCN, DResNet, DAResNet, BERT4NILM, DiffNILM, STNILM, TSILNet, Energformer, ConvNet, ResNet, and InceptionTime for systematic comparison.
 
-Windows（PowerShell）：
+## Installation
+
+### Prerequisites
+
+- Python 3.10 or later (tested with 3.12 on Windows)
+- CUDA-capable GPU recommended
+
+### Setup with pip
+
+Create and activate a virtual environment, then install dependencies:
+
 ```bash
 python -m venv .venv
+
+# Windows (PowerShell)
 .\.venv\Scripts\Activate.ps1
-python -m pip install -U pip
-```
 
-Linux/macOS（bash/zsh）：
-```bash
-python3 -m venv .venv
+# Linux / macOS
 source .venv/bin/activate
-python -m pip install -U pip
 ```
 
-### 2) 安装依赖
+Install PyTorch according to your CUDA version (see [pytorch.org](https://pytorch.org/get-started/locally/)), then install the remaining dependencies:
 
-先安装 PyTorch（请根据你的 CUDA/CPU 环境选择官方命令）：
 ```bash
-pip install -U torch torchvision torchaudio
-python -c "import torch; print(torch.__version__)"
+pip install torch torchvision torchaudio
+pip install -r requirements.txt
 ```
 
-然后安装其余 Python 依赖（覆盖训练、评估与脚本所需的常用依赖）：
+### Alternative: Conda
+
+Conda environment files are provided for reference:
+
+- `environment_win.yaml` (Windows)
+- `environment_mac.yaml` (macOS)
+
+## Quick Start
+
+### Single-device training
+
 ```bash
-pip install -U numpy pandas scipy scikit-learn tqdm pyyaml omegaconf matplotlib tensorboard
-pip install -U pytorch-lightning lightning
-pip install -U streamlit optuna optuna-dashboard
+python scripts/run_experiment.py \
+    --dataset UKDALE \
+    --sampling_rate 1min \
+    --window_size 128 \
+    --appliance Kettle \
+    --name_model NILMFormer \
+    --n_epochs 25
 ```
 
-## 数据准备
+### Multi-device joint training
 
-默认数据根目录来自 [expes.yaml](file:///c:/Users/Workstation/Workspace/CondiNILM/configs/expes.yaml) 的 `data_path`（默认 `data/`）。
+Use `multi` to train on all five target appliances simultaneously:
 
-- UKDALE：脚本会读取 `${data_path}/UKDALE/house_1`、`house_2`… 这样的目录结构
-- REFIT：脚本会读取 `${data_path}/REFIT/RAW_DATA_CLEAN/` 下的清洗 CSV
-
-如果你的数据不在上述路径，请修改 `configs/expes.yaml` 的 `data_path`。
-
-## 运行实验
-
-入口脚本为 [run_one_expe.py](file:///c:/Users/Workstation/Workspace/CondiNILM/scripts/run_one_expe.py)，参数以 `-h` 输出为准：
 ```bash
-python scripts/run_one_expe.py -h
+python scripts/run_experiment.py \
+    --dataset UKDALE \
+    --sampling_rate 1min \
+    --window_size 128 \
+    --appliance multi \
+    --name_model NILMFormer \
+    --n_epochs 25
 ```
 
-### 单设备训练示例
+Or specify a subset of devices as a comma-separated list:
 
-Windows（PowerShell）：
 ```bash
-python scripts/run_one_expe.py ^
-  --dataset UKDALE ^
-  --sampling_rate 1min ^
-  --window_size 128 ^
-  --appliance WashingMachine ^
-  --name_model NILMFormer
+python scripts/run_experiment.py \
+    --dataset UKDALE \
+    --sampling_rate 1min \
+    --window_size 128 \
+    --appliance Kettle,Fridge,Microwave \
+    --name_model NILMFormer \
+    --n_epochs 25
 ```
 
-Linux/macOS（bash/zsh）：
+### Hyperparameter optimization
+
 ```bash
-python scripts/run_one_expe.py \
-  --dataset UKDALE \
-  --sampling_rate 1min \
-  --window_size 128 \
-  --appliance WashingMachine \
-  --name_model NILMFormer
+python scripts/run_optuna_search.py \
+    --dataset UKDALE \
+    --appliance multi \
+    --name_model NILMFormer \
+    --n_trials 50
 ```
 
-### Multi（多设备）训练示例
-`--appliance` 支持 `multi` 或逗号分隔的设备列表：
+### Run all arguments
 
-Windows（PowerShell）：
 ```bash
-python scripts/run_one_expe.py ^
-  --dataset UKDALE ^
-  --sampling_rate 1min ^
-  --window_size 128 ^
-  --appliance Kettle,Fridge ^
-  --name_model NILMFormer
+python scripts/run_experiment.py -h
 ```
 
-Linux/macOS（bash/zsh）：
-```bash
-python scripts/run_one_expe.py \
-  --dataset UKDALE \
-  --sampling_rate 1min \
-  --window_size 128 \
-  --appliance Kettle,Fridge \
-  --name_model NILMFormer
+## Project Structure
+
+```
+CondiNILM/
+├── src/
+│   ├── nilmformer/                 # NILMFormer model
+│   │   ├── model.py                # NILMFormer, SparseDeviceCNN, SimpleDeviceHead
+│   │   ├── config.py               # NILMFormerConfig dataclass
+│   │   └── layers/
+│   │       ├── embedding.py        # DilatedBlock, ResUnit convolution embedding
+│   │       └── transformer.py      # EncoderLayer with multi-head attention
+│   ├── baselines/
+│   │   ├── nilm/                   # NILM-specific baselines
+│   │   │   ├── bilstm.py           # BiLSTM
+│   │   │   ├── bigru.py            # BiGRU
+│   │   │   ├── cnn1d.py            # CNN1D
+│   │   │   ├── unetnilm.py         # UNet-NILM
+│   │   │   ├── fcn.py              # FCN
+│   │   │   ├── dresnets.py         # DResNet, DAResNet
+│   │   │   ├── bert4nilm.py        # BERT4NILM
+│   │   │   ├── diffnilm.py         # DiffNILM
+│   │   │   ├── stnilm.py           # STNILM (with MoE)
+│   │   │   ├── tsilnet.py          # TSILNet (TCN + LSTM)
+│   │   │   └── energformer.py      # Energformer
+│   │   └── tser/                   # Time-series regression baselines
+│   │       ├── convnet.py          # ConvNet
+│   │       ├── resnet.py           # ResNet
+│   │       └── inceptiontime.py    # InceptionTime
+│   └── helpers/
+│       ├── experiment.py           # Model factory, utility re-exports
+│       ├── trainer.py              # PyTorch Lightning trainer, AdaptiveDeviceLoss
+│       ├── training.py             # Training loop orchestration
+│       ├── evaluation.py           # Evaluation and metric computation
+│       ├── callbacks.py            # Lightning callbacks (validation, logging)
+│       ├── loss.py                 # Loss function definitions
+│       ├── inference.py            # Sliding window inference and stitching
+│       ├── postprocess.py          # Post-processing (threshold, gate suppression)
+│       ├── preprocessing.py        # Data loading, windowing, train/valid splitting
+│       ├── dataset.py              # PyTorch Dataset classes
+│       ├── dataset_params.py       # Per-dataset device parameter loading
+│       ├── device_config.py        # Device type classification and gate configs
+│       ├── metrics.py              # F1, precision, recall, MAE, SAE metrics
+│       ├── loss_tuning.py          # Loss parameter tuning utilities
+│       ├── gradient_conflict.py    # Gradient conflict detection (PCGrad)
+│       └── utils.py                # General utilities
+├── configs/
+│   ├── expes.yaml                  # Experiment settings (training, loss, gate, scheduler)
+│   ├── dataset_params.yaml         # Per-dataset device parameters and postprocessing
+│   ├── datasets.yaml               # House-level train/valid/test splits
+│   ├── models.yaml                 # Model architecture hyperparameters
+│   ├── hpo_search_spaces.yaml      # Optuna search space definitions
+│   └── hpo_sparse_devices.yaml     # HPO config for sparse devices
+├── scripts/
+│   ├── run_experiment.py           # Main entry point for single experiments
+│   ├── run_optuna_search.py        # Optuna hyperparameter search
+│   ├── run_ukdale_all.py           # Run all UKDALE experiments
+│   ├── run_redd_all.py             # Run all REDD experiments
+│   ├── run_all_experiments.sh      # Batch runner for all dataset/model combinations
+│   ├── streamlit_val_viewer.py     # Interactive validation visualization
+│   ├── viz_preprocessing.py        # Preprocessing visualization
+│   ├── analyze_appliance_stats.py  # Appliance statistics analysis
+│   └── find_best_results.py        # Parse and rank experiment results
+├── assets/                         # Architecture diagrams and figures
+├── data/                           # Dataset root (UKDALE/, REFIT/, REDD/)
+├── pyproject.toml                  # PEP 621 project metadata and packaging
+├── requirements.txt
+├── environment_win.yaml
+├── environment_mac.yaml
+└── LICENSE
 ```
 
-## 输出与可视化
+## Configuration
 
-输出根目录来自 `configs/expes.yaml` 的 `result_path`（默认 `result/`）。
+### expes.yaml
 
-典型输出包括：
-- `val_compare.html`：验证集曲线可视化（支持选择设备、模型、epoch）
-- `val_report.jsonl`：每个 epoch 一条验证记录，包含整体指标与 per-device 指标
+Core experiment settings: model selection, training hyperparameters (batch size, epochs, learning rate scheduler), loss function parameters (output ratio, gate weights, focal gamma), and data augmentation (cropping, event-biased sampling).
 
-此外，可以用 Streamlit 查看保存的验证片段：
+### dataset_params.yaml
+
+Per-dataset, per-device parameters including ON/OFF power thresholds, minimum event durations, postprocessing settings, and loss function overrides. Postprocessing entries in this file take precedence over those in `expes.yaml`.
+
+### datasets.yaml
+
+House-level data splits for each dataset and appliance. Defines which houses are used for training/validation (temporal 80/20 split within each house) and which are held out for testing.
+
+### models.yaml
+
+Architecture-specific hyperparameters for NILMFormer and all 15 baselines, including layer counts, hidden dimensions, dropout rates, and learning rates.
+
+## Datasets
+
+The framework supports three public NILM datasets:
+
+| Dataset | Houses | Sampling | Appliances | Reference |
+|---------|--------|----------|------------|-----------|
+| **UKDALE** | 5 | 6 seconds | Fridge, Kettle, Dishwasher, Washing Machine, Microwave | Kelly & Knottenbelt, 2015 |
+| **REFIT** | 20 | 8 seconds | Fridge, Kettle, Dishwasher, Washing Machine, Microwave | Murray et al., 2017 |
+| **REDD** | 6 | 1 second | Fridge, Dishwasher, Washing Machine, Microwave | Kolter & Johnson, 2011 |
+
+Place dataset files under the `data/` directory (or configure `data_path` in `expes.yaml`):
+
+- **UKDALE**: `data/UKDALE/house_1/`, `house_2/`, etc.
+- **REFIT**: `data/REFIT/RAW_DATA_CLEAN/CLEAN_House1.csv`, etc.
+- **REDD**: `data/REDD/house_1/`, `house_2/`, etc.
+
+## Results
+
+### UKDALE Multi-Device (V7.5i, 25 epochs)
+
+Test set F1 scores using NILMFormer with multi-device joint training:
+
+| Device | Test F1 | Validation F1 |
+|--------|---------|---------------|
+| Fridge | 0.817 | 0.774 |
+| Kettle | 0.703 | 0.504 |
+| Dishwasher | 0.662 | 0.494 |
+| Microwave | 0.295 | 0.158 |
+| Washing Machine | 0.280 | 0.351 |
+
+## Outputs
+
+Experiment results are saved under `result/` (configurable via `result_path` in `expes.yaml`), including:
+
+- **val_report.jsonl**: Per-epoch validation metrics with per-device breakdowns.
+- **val_compare.html**: Interactive visualization of validation curves.
+- **FINAL_EVAL_JSON**: Test set evaluation results with postprocessing applied.
+- **TensorBoard logs**: Training curves under `log/tensorboard/`.
+
+To view validation results interactively:
+
 ```bash
 streamlit run scripts/streamlit_val_viewer.py
 ```
 
-## 目录结构（当前仓库真实结构）
+## License
 
-```text
-.
-├── assets/                  # 图片资源
-├── configs/                 # 实验配置（YAML）
-├── scripts/                 # 运行脚本（run_one_expe 等）
-├── src/
-│   ├── baselines/           # NILM / TSER 基线模型
-│   ├── helpers/             # 训练、评估、预处理、指标等
-│   └── nilmformer/          # NILMFormer 实现
-├── environment_win.yaml     # 历史环境记录（不作为安装入口）
-├── environment_mac.yaml     # 历史环境记录（不作为安装入口）
-└── README.md
-```
-
-## 说明
-
-本仓库偏研究用途：代码与配置以可复现实验和快速迭代为目标，默认不提供“一键安装”打包发布形式。
+This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.

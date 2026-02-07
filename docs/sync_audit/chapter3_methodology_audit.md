@@ -165,7 +165,7 @@ gate_logits = torch.max(gate_logits, gate_logits_floor)
 
 **Required doc change**: Section 3.3.7 should describe how learned gate parameters are transferred to evaluation:
 ```python
-# expes.py:2071-2097
+# experiment.py:2071-2097
 pred = power_raw * (floor + (1-floor) * sigmoid(gate_logits * scale + bias))
 ```
 
@@ -248,7 +248,7 @@ $$\mathcal{L}_{gate} = -\alpha_c (1-p_t)^\gamma \log(p_t)$$
 
 | Item | Doc | Code |
 |------|-----|------|
-| Reproducibility | Not mentioned | `pl.seed_everything(42)` in expes.py:2368 |
+| Reproducibility | Not mentioned | `pl.seed_everything(42)` in experiment.py:2368 |
 | Impact | N/A | Without seed: ~50% collapse rate for sparse devices |
 | deterministic=True | Not mentioned | Explicitly NOT used (causes cascade failure via AdaptiveTuner) |
 
