@@ -1,25 +1,37 @@
 # Python-generated files
 __pycache__/
-*.py[oc]
+*.py[cod]
+*.pyo
+*$py.class
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
 
 # Virtual environments
-.venv
+.venv/
+venv/
+env/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
 
 # Local IDE/agent settings
 .claude/
 tmpclaude-*
+.vscode/
+.idea/
+.ruff_cache/
 
 # OS junk
 .DS_Store
+Thumbs.db
 
 # Windows-reserved path that breaks Git on Windows
 nul
 
-# Data and results folder
+# Data and results folders
 example/
 *.ipynb
 *.csv
@@ -28,5 +40,15 @@ example/
 data/
 data_cache/
 result/
+results/
 checkpoint/
+checkpoints/
 log/
+logs/
+wandb/
+
+# Model files
+*.ckpt
+*.pt
+*.pth
+*.h5
