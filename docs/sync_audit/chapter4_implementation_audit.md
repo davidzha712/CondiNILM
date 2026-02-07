@@ -178,7 +178,7 @@ suppress where: gate_avg < 0.25 AND gate_max < 0.5
 | Item | Doc | Code |
 |------|-----|------|
 | Config precedence | Not mentioned | `dataset_params.yaml` **OVERRIDES** `expes.yaml` postprocess_per_device |
-| Merge location | Not mentioned | `run_one_expe.py:884-927` |
+| Merge location | Not mentioned | `run_experiment.py:884-927` |
 
 **Required doc change**: Document the config merge hierarchy:
 ```
