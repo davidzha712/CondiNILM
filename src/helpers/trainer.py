@@ -1053,6 +1053,23 @@ class SeqToSeqLightningModule(pl.LightningModule):
         )
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        # V8: Split loss logging for diagnostics
+        aux_penalties = (
+            penalties["zero_run"]
+            + penalties["off_high_agg"]
+            + penalties["off_state_long"]
+            + penalties["off_state"]
+            + self.neg_penalty_weight * penalties["neg"]
+            + self.anti_collapse_weight * anti_scale * penalties["anti_collapse"]
+        )
+        gate_loss_total = (
+            gate_cls_scale * gate_cls_loss
+            + gate_window_scale * gate_window_loss
+            + self.gate_duty_weight * gate_duty_loss
+        )
+        self.log("train_loss_main", loss_main.detach(), on_step=False, on_epoch=True)
+        self.log("train_loss_aux", aux_penalties.detach(), on_step=False, on_epoch=True)
+        self.log("train_loss_gate", gate_loss_total.detach(), on_step=False, on_epoch=True)
         return loss
 
     def _training_step_with_pcgrad(self, ts_agg, target, state, batch_idx):
@@ -1208,12 +1225,19 @@ class SeqToSeqLightningModule(pl.LightningModule):
                         device_idx = i
                         break
 
-            # Type power heads: model.type_power_heads.X where X maps to device groups
+            # V8: Type heads → map to first device in the type group
             elif "type_power_heads" in name or "type_gate_heads" in name:
-                # These are grouped by device type, but for isolation we treat each output as separate
-                # For simplicity, we'll consider these as shared (updated by all devices)
-                # A more advanced approach would map type groups to device indices
-                device_idx = None  # Treat as shared for now
+                import re
+                m = re.search(r"type_(?:power|gate)_heads\.(\d+)", name)
+                if m is not None and hasattr(self.model, "type_group_to_module") and hasattr(self.model, "type_group_indices"):
+                    module_idx = int(m.group(1))
+                    g2m = self.model.type_group_to_module
+                    gi = self.model.type_group_indices
+                    # Find which group this module belongs to
+                    for gid, mid in enumerate(g2m):
+                        if mid == module_idx and gid < len(gi) and gi[gid]:
+                            device_idx = gi[gid][0]  # First device in group
+                            break
 
             # Sparse CNN device heads: model.sparse_cnn.device_heads.X
             elif "sparse_cnn" in name and "device_heads" in name:
@@ -1444,6 +1468,17 @@ class SeqToSeqLightningModule(pl.LightningModule):
         )
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        # V8: Split loss logging for diagnostics
+        aux_penalties = (
+            penalties["zero_run"]
+            + penalties["off_high_agg"]
+            + penalties["off_state_long"]
+            + penalties["off_state"]
+            + self.neg_penalty_weight * penalties["neg"]
+            + self.anti_collapse_weight * anti_scale * penalties["anti_collapse"]
+        )
+        self.log("val_loss_main", loss_main.detach(), on_step=False, on_epoch=True)
+        self.log("val_loss_aux", aux_penalties.detach(), on_step=False, on_epoch=True)
         return loss
 
     def configure_optimizers(self):

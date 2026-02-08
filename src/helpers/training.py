@@ -189,12 +189,10 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                         getattr(expes_config, "balance_window_target_on_frac", 0.5)
                     )
                     base_target_on_frac = min(max(base_target_on_frac, 0.05), 0.95)
-                    # ENHANCED: Stronger oversampling for sparse devices
-                    # - sparse_target_boost: 0.2 -> 0.4 (more aggressive ON sampling)
-                    # - sparse_duty_threshold: 0.05 -> 0.02 (catch ultra-sparse like microwave)
-                    # - max_ratio: 100 -> 200 (allow higher sampling weight)
+                    # V8: Reduced oversampling to prevent multi-task negative transfer
+                    # Previous 0.4/0.35/200x caused sparse devices to dominate training
                     sparse_target_boost = float(
-                        getattr(expes_config, "balance_window_sparse_target_boost", 0.4)
+                        getattr(expes_config, "balance_window_sparse_target_boost", 0.15)
                     )
                     sparse_duty_threshold = float(
                         getattr(expes_config, "balance_window_sparse_duty_threshold", 0.02)
@@ -204,9 +202,9 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                         getattr(expes_config, "balance_window_ultra_sparse_threshold", 0.01)
                     )
                     ultra_sparse_boost = float(
-                        getattr(expes_config, "balance_window_ultra_sparse_boost", 0.35)
+                        getattr(expes_config, "balance_window_ultra_sparse_boost", 0.10)
                     )
-                    max_ratio = float(getattr(expes_config, "balance_window_max_ratio", 200.0))
+                    max_ratio = float(getattr(expes_config, "balance_window_max_ratio", 20.0))
                     max_ratio = max(max_ratio, 1.0)
                     stats_list = None
                     try:
@@ -255,7 +253,10 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                         weight_matrix[:, idx] = np.where(
                             on_per_device[:, idx] > 0.5, w_on, w_off
                         )
-                    weights_np = weight_matrix.max(axis=1)
+                    # V8: Mean aggregation with 75th-percentile cap (was max → sparse dominated)
+                    p75 = np.percentile(weight_matrix, 75, axis=1, keepdims=True)
+                    weight_matrix_capped = np.minimum(weight_matrix, p75)
+                    weights_np = weight_matrix_capped.mean(axis=1)
                     weights = torch.from_numpy(weights_np)
                     train_sampler = torch.utils.data.WeightedRandomSampler(
                         weights=weights,
@@ -263,7 +264,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                         replacement=True,
                     )
                     logging.info(
-                        "Enable balanced window sampling (multi-device union): on_window_frac=%.4f target_on_frac=%.2f",
+                        "Enable balanced window sampling (multi-device mean+p75): on_window_frac=%.4f target_on_frac=%.2f",
                         on_window_frac,
                         target_on_frac,
                     )

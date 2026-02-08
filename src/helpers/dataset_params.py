@@ -49,10 +49,14 @@ class DatasetParamsManager:
         Returns:
             Dataset configuration dictionary
         """
-        # Case-insensitive lookup
+        # Case-insensitive lookup (exact match first, then prefix fallback)
         dataset_upper = dataset.upper()
         for key in self._config:
             if key.upper() == dataset_upper:
+                return self._config[key]
+        # Prefix fallback: UKDALE_EXT -> UKDALE, REDD_STRESS -> REDD
+        for key in self._config:
+            if dataset_upper.startswith(key.upper()):
                 return self._config[key]
         return {}
 

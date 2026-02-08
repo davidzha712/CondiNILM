@@ -33,6 +33,9 @@ train_num_crops: 4
 train_crop_ratio: 0.75
 train_crop_event_bias: 0.8
 
+# V8: Disable aggressive sparse oversampling (causes multi-task negative transfer)
+balance_window_sampling: false
+
 # EAEC Related Parameters
 p_es_eaec:  null
 p_rlr_eaec:  5
@@ -125,7 +128,7 @@ loss_w_on_power: 0.12
 # ===== Gate classification (TWO-STAGE approach for sparse devices) =====
 # gate_cls_weight: EXPLICIT gate classification loss weight (overrides loss_lambda_gate_cls)
 # Set high (1.0) to prioritize binary ON/OFF classification before power regression
-gate_cls_weight: 1.0
+gate_cls_weight: 0.3
 
 # lambda_gate_cls: legacy parameter (keep for compatibility)
 loss_lambda_gate_cls: 0.5
@@ -162,7 +165,7 @@ postprocess_gate_max_threshold: 0.5
 #
 # Enable this for multi-device training (>1 appliance):
 # NOTE: Disabled when using gradient_isolation (more aggressive isolation)
-use_gradient_conflict_resolution: false
+use_gradient_conflict_resolution: true
 
 # PCGrad sub-options:
 # - use_pcgrad: Apply gradient projection when conflicts detected (default: true)
@@ -197,7 +200,7 @@ gradient_conflict_randomize_order: true
 # This is more aggressive than PCGrad: devices train TRULY independently.
 #
 # Enable this for multi-device training with collapse issues:
-use_gradient_isolation: true
+use_gradient_isolation: false
 
 # Backbone training mode:
 # - "frozen": Shared backbone receives NO gradients (most isolated, devices are independent)

@@ -215,14 +215,20 @@ class AdaptiveDeviceLoss(nn.Module):
         # All loss params now come from _derive_params_from_stats (HPO-aligned).
         # This eliminates 200+ lines of fragile per-device overrides.
 
-        # V7.4: Microwave-specific regression-side overrides
-        # P=0.103 due to massive FP leakage. Increase OFF regression penalty.
-        # SAFE: w_off_fp is regression loss, NOT gate classification.
+        # Per-device regression-side overrides
         lname_override = str(stats.get("name", "") or "").lower()
         if "microwave" in lname_override:
             params = dict(params)
-            params["w_off_fp"] = 0.10    # Was 0.06 (shared with kettle)
-            params["off_margin"] = 0.03  # Was 0.02 (increase OFF dead zone)
+            params["w_off_fp"] = 0.12    # Extra FP penalty for MW
+            params["off_margin"] = 0.03  # Wider OFF dead zone
+
+        # V8: WashingMachine-specific overrides for better recall/energy tracking
+        if "washing" in lname_override or "washer" in lname_override:
+            params = dict(params)
+            params["w_recall"] = 0.28    # Up from LONG_CYCLE 0.22
+            params["w_energy"] = 0.22    # Up from 0.18
+            params["alpha_on"] = 2.8     # Up from 2.5
+            params["w_on_power"] = 0.14  # Up from 0.10
 
         # Apply gate config_overrides from HPO
         gate_soft_scale_override = self.config_overrides.get("gate_soft_scale")
@@ -310,22 +316,18 @@ class AdaptiveDeviceLoss(nn.Module):
         recall_scale = float(self.config_overrides.get("recall_weight_scale", 1.0))
 
         if device_type == self.SPARSE_HIGH_POWER:
-            # V7.2: Reverted OFF penalties to V7 levels (Phase 2 hurt dishwasher).
-            # Key fix: Separate gate classification alphas + negative gate_bias
-            # to fix microwave precision instead of loss function tuning.
-            params["alpha_on"] = 3.82 * alpha_on_scale
-            params["alpha_off"] = 0.15 * alpha_off_scale  # Reverted from 0.20 (Phase 2 hurt DW)
+            # V8: Reduced ON-bias from 25:1 to 8:1 ratio to improve precision.
+            # Previous 3.82/0.15 caused excessive false positives in multi-device training.
+            params["alpha_on"] = 2.8 * alpha_on_scale
+            params["alpha_off"] = 0.35 * alpha_off_scale
             params["w_main"] = 0.40
-            params["w_recall"] = 0.25 * recall_scale  # Reverted from 0.18
-            params["w_off_fp"] = 0.06  # Reverted from 0.10 (Phase 2 hurt DW F1 0.607→0.466)
+            params["w_recall"] = 0.20 * recall_scale
+            params["w_off_fp"] = 0.10  # Stronger FP penalty
             params["w_energy"] = 0.15 * energy_scale
             params["w_on_power"] = 0.12
-            params["w_hard_zero"] = 0.04  # Reverted from 0.06
+            params["w_hard_zero"] = 0.05
             params["off_margin"] = 0.02
-            params["w_peak"] = 0.0  # V7.5: Disabled for sparse - causes MW collapse (0.06 tested, collapsed)
-            # V7.2d: Gate classification uses regression alphas (alpha_on=3.82, alpha_off=0.15).
-            # This is ON-biased for classification, which keeps sparse devices alive.
-            # Precision improvement comes from OFF regression loss, not gate classification.
+            params["w_peak"] = 0.0  # Disabled for sparse - causes MW collapse
             # LESSON: Increasing gate_alpha_off or lambda_gate_cls for sparse devices
             # causes collapse (tested 0.5-2.0 lambda_gate_cls, all collapsed kettle+microwave).
         elif device_type == self.SPARSE_LONG_CYCLE:

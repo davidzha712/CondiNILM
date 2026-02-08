@@ -8,70 +8,128 @@
 #   overlap:              Window overlap ratio for sliding-window segmentation
 #
 # Validation is created by splitting each training house's data temporally:
-#   first 80% → train, last 20% → valid (with a gap buffer to prevent leakage).
+#   first 80% -> train, last 20% -> valid (with a gap buffer to prevent leakage).
 #   See src/helpers/preprocessing.py:split_train_valid_timeblock_nilmdataset()
 
 # ============================================================
 # REFIT - UK Smart Home Dataset (20 houses, 8s sampling)
+# V8: Trimmed to 6 high-quality houses [2,5,6,7,9,15]
 # ============================================================
 REFIT:
   Dishwasher:
     app: Dishwasher
-    house_with_app_i: [1, 2, 3, 5, 6, 7, 9, 10, 13, 15, 16, 18, 20]
-    ind_house_train_val: [2, 3, 5, 6]
-    ind_house_test: [7]
+    house_with_app_i: [2, 5, 6, 7, 9, 15]
+    ind_house_train_val: [2, 5, 6, 9]
+    ind_house_test: [7, 15]
     overlap: 0.5
   WashingMachine:
     app: WashingMachine
-    house_with_app_i: [1, 2, 3, 5, 6, 7, 8, 9, 10, 13, 15, 16, 17, 18, 19]
-    ind_house_train_val: [2, 3, 5, 6]
-    ind_house_test: [7]
+    house_with_app_i: [2, 5, 6, 7, 9, 15]
+    ind_house_train_val: [2, 5, 6, 9]
+    ind_house_test: [7, 15]
     overlap: 0.5
   Kettle:
     app: Kettle
-    house_with_app_i: [2, 3, 4, 5, 6, 7, 9, 12, 13, 15, 19, 20]
-    ind_house_train_val: [2, 3, 5, 6]
-    ind_house_test: [7]
+    house_with_app_i: [2, 5, 6, 7, 9, 15]
+    ind_house_train_val: [2, 5, 6, 9]
+    ind_house_test: [7, 15]
     overlap: 0.5
   Fridge:
     app: Fridge
-    house_with_app_i: [2, 5, 7, 9, 12, 15, 17, 19, 20]
+    house_with_app_i: [2, 5, 7, 9, 15]
     ind_house_train_val: [2, 5, 9]
-    ind_house_test: [7]
+    ind_house_test: [7, 15]
     overlap: 0.5
 
 # ============================================================
 # UK-DALE - UK Domestic Appliance-Level Electricity (5 houses, 6s sampling)
+# V8: Main config uses houses [1,2] only for faster iteration
 # ============================================================
 UKDALE:
   WashingMachine:
     app: washing_machine
-    ind_house_train_val: [1, 3, 4, 5]
+    ind_house_train_val: [1]
     ind_house_test: [2]
     overlap: 0.75
   Dishwasher:
     app: dishwasher
-    ind_house_train_val: [1, 3, 4, 5]
+    ind_house_train_val: [1]
     ind_house_test: [2]
     overlap: 0.75
   Kettle:
     app: kettle
-    ind_house_train_val: [1, 3, 4, 5]
+    ind_house_train_val: [1]
     ind_house_test: [2]
     overlap: 0.75
   Microwave:
     app: microwave
-    ind_house_train_val: [1, 3, 4, 5]
+    ind_house_train_val: [1]
     ind_house_test: [2]
     overlap: 0.75
   Fridge:
     app: fridge
-    ind_house_train_val: [1, 3, 4, 5]
+    ind_house_train_val: [1]
     ind_house_test: [2]
     overlap: 0.75
 
 # ============================================================
+# UKDALE_EXT - Extended UK-DALE (houses 1,2,5, no microwave)
+# ============================================================
+UKDALE_EXT:
+  WashingMachine:
+    app: washing_machine
+    ind_house_train_val: [1, 5]
+    ind_house_test: [2]
+    overlap: 0.75
+  Dishwasher:
+    app: dishwasher
+    ind_house_train_val: [1, 5]
+    ind_house_test: [2]
+    overlap: 0.75
+  Kettle:
+    app: kettle
+    ind_house_train_val: [1, 5]
+    ind_house_test: [2]
+    overlap: 0.75
+  Fridge:
+    app: fridge
+    ind_house_train_val: [1, 5]
+    ind_house_test: [2]
+    overlap: 0.75
+
+# ============================================================
+# UKDALE_BI - Bidirectional UK-DALE (train on house 2, test on house 1)
+# ============================================================
+UKDALE_BI:
+  WashingMachine:
+    app: washing_machine
+    ind_house_train_val: [2]
+    ind_house_test: [1]
+    overlap: 0.75
+  Dishwasher:
+    app: dishwasher
+    ind_house_train_val: [2]
+    ind_house_test: [1]
+    overlap: 0.75
+  Kettle:
+    app: kettle
+    ind_house_train_val: [2]
+    ind_house_test: [1]
+    overlap: 0.75
+  Microwave:
+    app: microwave
+    ind_house_train_val: [2]
+    ind_house_test: [1]
+    overlap: 0.75
+  Fridge:
+    app: fridge
+    ind_house_train_val: [2]
+    ind_house_test: [1]
+    overlap: 0.75
+
+# ============================================================
 # REDD - Reference Energy Disaggregation Dataset (6 houses, 1s sampling)
+# V8: WM moved to REDD_STRESS (appendix) due to poor generalization
 # ============================================================
 REDD:
   Fridge:
@@ -89,8 +147,27 @@ REDD:
     ind_house_train_val: [1, 2]
     ind_house_test: [3]
     overlap: 0.75
+
+# ============================================================
+# REDD_STRESS - REDD stress test (includes WM for appendix)
+# ============================================================
+REDD_STRESS:
+  Fridge:
+    app: fridge
+    ind_house_train_val: [1]
+    ind_house_test: [3]
+    overlap: 0.75
+  Microwave:
+    app: microwave
+    ind_house_train_val: [1]
+    ind_house_test: [3]
+    overlap: 0.75
+  Dishwasher:
+    app: dishwasher
+    ind_house_train_val: [1]
+    ind_house_test: [3]
+    overlap: 0.75
   WashingMachine:
-    # NOTE: Only 3 houses have WM activity. Train on house 1 only.
     app: washing_machine
     ind_house_train_val: [1]
     ind_house_test: [3]

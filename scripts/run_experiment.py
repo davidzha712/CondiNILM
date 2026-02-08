@@ -966,14 +966,14 @@ def launch_one_experiment(expes_config: OmegaConf):
         _ds_loss_keys = set(ds_loss.keys()) if ds_loss else set()
         skipped = []
         for key, value in hpo_override.items():
-            if dataset_name != "UKDALE" and key in _ds_loss_keys:
+            if not dataset_name.startswith("UKDALE") and key in _ds_loss_keys:
                 skipped.append(key)
                 continue  # Skip HPO params that the dataset explicitly overrides
             try:
                 expes_config[key] = value
             except Exception:
                 pass
-        if dataset_name != "UKDALE":
+        if not dataset_name.startswith("UKDALE"):
             logging.info("HPO override for %s: applied all except ds_loss keys %s", dataset_name, skipped)
 
     # Get dynamic output channels (number of devices)
@@ -1031,7 +1031,7 @@ def launch_one_experiment(expes_config: OmegaConf):
             applied = 0
             skipped = []
             for key, value in hpo_dict.items():
-                if dataset_name != "UKDALE" and key in _ds_loss_keys:
+                if not dataset_name.startswith("UKDALE") and key in _ds_loss_keys:
                     skipped.append(key)
                     continue
                 try:
@@ -1044,7 +1044,7 @@ def launch_one_experiment(expes_config: OmegaConf):
         return launch_models_training(tuple_data, scaler, expes_config)
 
     logging.info("Process data ...")
-    if expes_config.dataset == "UKDALE":
+    if expes_config.dataset.startswith("UKDALE"):
         overlap = getattr(expes_config, "overlap", 0.0)
         if overlap == 0:
             window_stride = expes_config.window_size
@@ -1128,7 +1128,7 @@ def launch_one_experiment(expes_config: OmegaConf):
                 )
             )
 
-    elif expes_config.dataset == "REFIT":
+    elif expes_config.dataset.startswith("REFIT"):
         # Support overlap parameter like REDD/UKDALE
         overlap = getattr(expes_config, "overlap", 0.5)
         if overlap == 0:
@@ -1219,7 +1219,7 @@ def launch_one_experiment(expes_config: OmegaConf):
         elif actual_n_devices != len(original_devices):
             expes_config["c_out"] = actual_n_devices
 
-    elif expes_config.dataset == "REDD":
+    elif expes_config.dataset.startswith("REDD"):
         overlap = getattr(expes_config, "overlap", 0.0)
         if overlap == 0:
             window_stride = expes_config.window_size
@@ -1306,7 +1306,7 @@ def launch_one_experiment(expes_config: OmegaConf):
             )
 
     else:
-        raise ValueError(f"Unknown dataset: {expes_config.dataset}. Supported: UKDALE, REFIT, REDD")
+        raise ValueError(f"Unknown dataset: {expes_config.dataset}. Supported: UKDALE*, REFIT*, REDD*")
 
     logging.info("             ... Done.")
 
@@ -1335,7 +1335,7 @@ def launch_one_experiment(expes_config: OmegaConf):
         applied = 0
         skipped = []
         for key, value in hpo_dict.items():
-            if dataset_name != "UKDALE" and key in _ds_loss_keys:
+            if not dataset_name.startswith("UKDALE") and key in _ds_loss_keys:
                 skipped.append(key)
                 continue
             try:
@@ -1349,18 +1349,18 @@ def launch_one_experiment(expes_config: OmegaConf):
         power_scaling_type=expes_config.power_scaling_type,
         appliance_scaling_type=expes_config.appliance_scaling_type,
     )
-    data = scaler.fit_transform(data)
+    # V8: Fit scaler on TRAIN data only to prevent test data leakage
+    scaler.fit(data_train)
+    data_train = scaler.transform(data_train)
+    data_valid = scaler.transform(data_valid)
+    data_test = scaler.transform(data_test)
+    data = scaler.transform(data)  # Full data for backward compat
 
     expes_config.cutoff = float(scaler.appliance_stat2[0])
     _apply_cutoff_to_loss_params(expes_config)
 
     if expes_config.name_model in ["ConvNet", "ResNet", "Inception"]:
         X, y = nilmdataset_to_tser(data)
-
-        data_train = scaler.transform(data_train)
-        data_valid = scaler.transform(data_valid)
-        data_test = scaler.transform(data_test)
-
         X_train, y_train = nilmdataset_to_tser(data_train)
         X_valid, y_valid = nilmdataset_to_tser(data_valid)
         X_test, y_test = nilmdataset_to_tser(data_test)
@@ -1373,10 +1373,6 @@ def launch_one_experiment(expes_config: OmegaConf):
         )
 
     else:
-        data_train = scaler.transform(data_train)
-        data_valid = scaler.transform(data_valid)
-        data_test = scaler.transform(data_test)
-
         tuple_data = (
             data_train,
             data_valid,
@@ -1583,7 +1579,7 @@ def main(
     # CRITICAL FIX: For REDD Multi mode, ensure consistent house configuration
     # Different REDD devices have different availability - use common houses
     is_multi_device = len(selected_keys) > 1 or appliance_lower == "multi"
-    if is_multi_device and dataset_key == "REDD":
+    if is_multi_device and dataset_key.startswith("REDD"):
         # If user didn't specify houses, use the recommended REDD multi-device config
         # Houses 1,2,3 have fridge, microwave, dishwasher with good activity
         if ind_house_train_val is None and ind_house_test is None:
@@ -1600,7 +1596,7 @@ def main(
     # - House 5: microwave is noise data (mean_on=59W < 50W threshold)
     # - Houses 1, 2: All 5 devices have clean data
     # Note: Use [1, 2] for both train and test to maximize sparse device events
-    if is_multi_device and dataset_key == "UKDALE":
+    if is_multi_device and dataset_key.startswith("UKDALE"):
         if ind_house_train_val is None and ind_house_test is None:
             logging.warning(
                 "UKDALE Multi mode: Using recommended house config [1,2] train, [2] test. "
