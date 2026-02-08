@@ -47,6 +47,9 @@ UKDALE:
       min_activation_time: 12
       device_type: "long_cycle"
       houses: [1, 2]
+      loss_override:
+        w_off_fp: 0.14        # Stronger FP penalty (UKDALE DW over-predicts: P=0.39 R=0.97)
+        off_margin: 0.02      # Wider OFF dead zone to reduce false positives
 
     kettle:
       min_threshold: 2000
@@ -107,8 +110,8 @@ UKDALE:
       threshold: 20
       min_on_steps: 2
     dishwasher:
-      threshold: 20
-      min_on_steps: 6
+      threshold: 50            # Raised from 20 (UKDALE DW over-predicts, need stricter filter)
+      min_on_steps: 8          # Raised from 6 (filter short false-positive bursts)
     kettle:
       threshold: 800
       min_on_steps: 2
@@ -237,11 +240,12 @@ REDD:
     default_sampling_rate: "1min"
     default_window_size: 128
     overlap: 0.75
-    batch_size: 64
-    epochs: 30
+    batch_size: 32             # Small dataset: fewer samples per batch for more updates
+    epochs: 50                 # Small dataset: more epochs to compensate for few batches
+    train_num_crops: 1         # Small dataset: no cropping (preserve all samples)
     learning_rate: 5e-5
     weight_decay: 0.02
-    early_stopping_patience: 10
+    early_stopping_patience: 15
     limit_train_batches: 1.0
     limit_val_batches: 1.0
     # Houses 1,2,3 have fridge+microwave+dishwasher with good activity
@@ -251,7 +255,7 @@ REDD:
   # Only override anti-collapse and output_ratio; let HPO handle other loss params
   loss:
     loss_type: "multi_nilm"
-    output_ratio: 0.65
+    output_ratio: 0.85          # Small dataset: wider output window to capture more signal
 
     anti_collapse_weight: 0.15
     state_zero_penalty_weight: 0.01
@@ -293,24 +297,26 @@ REFIT:
     location: "UK"
 
   appliances:
+    # NOTE: REFIT label params use 10s units (1 unit = 10 seconds)
+    # because REFIT_DataBuilder resamples to 10s before status computation.
     Dishwasher:
       min_threshold: 50
       max_threshold: 2500
-      min_on_duration: 180
-      min_off_duration: 180
-      min_activation_time: 12
+      min_on_duration: 18      # 180s = 3min (in 10s units)
+      min_off_duration: 18     # 180s = 3min (in 10s units)
+      min_activation_time: 12  # 120s = 2min (in 10s units)
       device_type: "long_cycle"
       houses: [2, 5, 6, 7, 9, 15]
       loss_override:
-        w_recall: 0.24       # Slightly above long_cycle default (0.22)
+        w_recall: 0.26       # Higher recall for REFIT DW (was under-detecting)
         off_margin: 0.018    # Wider edge detection for REFIT long wash cycles
 
     WashingMachine:
       min_threshold: 50
       max_threshold: 2500
-      min_on_duration: 180
-      min_off_duration: 16
-      min_activation_time: 12
+      min_on_duration: 18      # 180s = 3min (in 10s units)
+      min_off_duration: 2      # 20s (in 10s units; WM has rapid phase transitions)
+      min_activation_time: 12  # 120s = 2min (in 10s units)
       device_type: "long_cycle"
       houses: [2, 5, 6, 7, 9, 15]
       loss_override:
@@ -366,11 +372,11 @@ REFIT:
 
   postprocess:
     Dishwasher:
-      threshold: 150
-      min_on_steps: 4
+      threshold: 30            # Lower threshold for REFIT DW (was 150, too strict → low recall)
+      min_on_steps: 3
     WashingMachine:
       threshold: 20
-      min_on_steps: 5
+      min_on_steps: 3          # Lowered from 5 (WM has rapid transitions)
     Kettle:
       threshold: 800
       min_on_steps: 2

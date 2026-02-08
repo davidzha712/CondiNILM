@@ -600,11 +600,12 @@ class SeqToSeqLightningModule(pl.LightningModule):
 
             # LEARNABLE PARAMS CONSTRAINT: Clamp to valid ranges
             # soft_scales: [0.5, 6.0] - controls sharpness
-            # floors: [0.01, 0.5] - minimum activation probability
-            # V7.3: Raised floor min from 1e-4 to 0.01 to prevent sparse device collapse.
-            # With 1e-4, kettle's gate_floor learned down to 0.004, causing F1=0.0.
+            # floors: [1e-4, 0.5] - minimum activation probability
+            # V7.3 used min=0.01 but that's too high for cycling_low_power (fridge)
+            # causing OFF leakage (high R, low P). Restored to 1e-4; sparse device
+            # collapse is now handled by gate_cls_weight=0.3 instead of floor clamp.
             soft_scales = torch.clamp(soft_scales, min=0.5, max=6.0)
-            floors = torch.clamp(floors, min=0.01, max=0.5)
+            floors = torch.clamp(floors, min=1e-4, max=0.5)
 
             # V30: Apply per-device gate_logits_floor before scaling
             # This prevents extreme negative logits from causing collapse
@@ -1031,14 +1032,6 @@ class SeqToSeqLightningModule(pl.LightningModule):
         anti_scale = self._compute_anti_collapse_scale(self.current_epoch)
         gate_cls_scale = self.gate_cls_weight
         gate_window_scale = self.gate_window_weight
-        if (
-            isinstance(self.criterion, AdaptiveDeviceLoss)
-            and getattr(self.criterion, "n_devices", 1) > 1
-        ):
-            if gate_cls_scale > 0.0:
-                gate_cls_scale = 1.0
-            if gate_window_scale > 0.0:
-                gate_window_scale = 1.0
         loss = (
             loss_main
             + penalties["zero_run"]
@@ -1148,17 +1141,8 @@ class SeqToSeqLightningModule(pl.LightningModule):
         penalties = self._compute_all_penalties(pred, target, state, ts_agg)
         anti_scale = self._compute_anti_collapse_scale(self.current_epoch)
 
-        # V8: Match normal path gate weight normalization for multi-device
         gate_cls_scale = self.gate_cls_weight
         gate_window_scale = self.gate_window_weight
-        if (
-            isinstance(self.criterion, AdaptiveDeviceLoss)
-            and getattr(self.criterion, "n_devices", 1) > 1
-        ):
-            if gate_cls_scale > 0.0:
-                gate_cls_scale = 1.0
-            if gate_window_scale > 0.0:
-                gate_window_scale = 1.0
 
         # Aggregate auxiliary losses (not per-device)
         aux_loss = (

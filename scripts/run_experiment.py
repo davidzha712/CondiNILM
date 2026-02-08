@@ -248,6 +248,13 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                 expes_config["device_type_per_device"] = per_device
             if per_device_params:
                 expes_config["loss_params_per_device"] = per_device_params
+                # Inject per-device loss_params into device_stats_for_loss so
+                # AdaptiveDeviceLoss receives overrides (w_off_fp, off_margin, etc.)
+                params_norm = {str(k).strip().lower(): v for k, v in per_device_params.items()}
+                for ds in device_stats_for_loss:
+                    name = str(ds.get("name", "")).strip().lower()
+                    if name in params_norm and isinstance(params_norm[name], Mapping):
+                        ds["loss_params"] = dict(params_norm[name])
 
             if device_stats_for_loss:
                 expes_config["device_stats_for_loss"] = device_stats_for_loss
@@ -376,14 +383,9 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                 if model_name == "nilmformer":
                     try:
                         n_devices = len(device_stats_for_loss)
-                        # V8: Group type_ids by device_type so same-type devices share type heads
-                        type_map = {}
-                        type_ids = []
-                        for ds in device_stats_for_loss:
-                            dt = ds.get("device_type", f"unknown_{len(type_map)}")
-                            if dt not in type_map:
-                                type_map[dt] = len(type_map)
-                            type_ids.append(type_map[dt])
+                        # Per-device independent heads (default).
+                        # Type-head sharing (grouping by device_type) is disabled
+                        # because WM/DW both long_cycle compete for same head.
                         kettle_idx = -1
                         try:
                             for i, nm in enumerate(names):
@@ -393,24 +395,22 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                                     break
                         except Exception:
                             kettle_idx = -1
-                        if type_ids:
-                            mk = getattr(expes_config, "model_kwargs", None)
-                            if mk is None:
-                                cfg = {"type_ids_per_channel": type_ids}
-                                if kettle_idx >= 0:
-                                    cfg["kettle_channel_idx"] = kettle_idx
+                        mk = getattr(expes_config, "model_kwargs", None)
+                        if mk is None:
+                            cfg = {}
+                            if kettle_idx >= 0:
+                                cfg["kettle_channel_idx"] = kettle_idx
+                            if cfg:
                                 expes_config["model_kwargs"] = cfg
-                            else:
-                                try:
-                                    mk["type_ids_per_channel"] = type_ids
-                                    if kettle_idx >= 0:
-                                        mk["kettle_channel_idx"] = kettle_idx
-                                except TypeError:
-                                    tmp_kwargs = dict(mk)
-                                    tmp_kwargs["type_ids_per_channel"] = type_ids
-                                    if kettle_idx >= 0:
-                                        tmp_kwargs["kettle_channel_idx"] = kettle_idx
-                                    expes_config["model_kwargs"] = tmp_kwargs
+                        else:
+                            try:
+                                if kettle_idx >= 0:
+                                    mk["kettle_channel_idx"] = kettle_idx
+                            except TypeError:
+                                tmp_kwargs = dict(mk)
+                                if kettle_idx >= 0:
+                                    tmp_kwargs["kettle_channel_idx"] = kettle_idx
+                                expes_config["model_kwargs"] = tmp_kwargs
                     except Exception:
                         pass
         except Exception as e:
@@ -771,9 +771,9 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
         if parts:
             logging.info("AUTO_CFG: " + ";".join(parts))
         per_device_params = getattr(expes_config, "loss_params_per_device", None)
-        if isinstance(per_device_params, dict) and per_device_params:
+        if per_device_params is not None and hasattr(per_device_params, 'items'):
             for name, params in per_device_params.items():
-                if not isinstance(params, dict):
+                if not hasattr(params, 'items'):
                     continue
                 kv = [f"{k}={v}" for k, v in params.items()]
                 logging.info("AUTO_CFG_PER_DEVICE[%s]: %s", str(name), ";".join(kv))
@@ -861,9 +861,9 @@ def launch_one_experiment(expes_config: OmegaConf):
     ds_training = params_manager.get_training_config(dataset_name)
     ds_loss = params_manager.get_loss_config(dataset_name)
 
-    # Apply training params if not already set
-    # Keys that should always override from dataset config (small datasets need full batches)
-    _always_override_keys = {"limit_train_batches", "limit_val_batches"}
+    # Apply dataset-specific training params.
+    # Priority: CLI args > dataset_params.yaml > expes.yaml
+    _cli_overrides = set(getattr(expes_config, "_cli_overrides", []))
     # Map dataset_params.yaml keys to actual config keys used by training code
     _key_mapping = {
         "learning_rate": None,           # → model_training_param.lr (handled below)
@@ -873,11 +873,12 @@ def launch_one_experiment(expes_config: OmegaConf):
     for key, value in ds_training.items():
         if key in _key_mapping:
             continue  # Handled separately below
-        if key in _always_override_keys or key not in expes_config or getattr(expes_config, key, None) is None:
-            try:
-                expes_config[key] = value
-            except Exception:
-                pass
+        if key in _cli_overrides:
+            continue  # CLI-explicit args take priority
+        try:
+            expes_config[key] = value
+        except Exception:
+            pass
 
     # Apply mapped training params to their actual config locations
     if "learning_rate" in ds_training:
@@ -989,6 +990,7 @@ def launch_one_experiment(expes_config: OmegaConf):
             merged[k] = cur_dict
         if merged:
             expes_config["loss_params_per_device"] = merged
+
     hpo_override = getattr(expes_config, "hpo_override", None)
     # Fix: OmegaConf DictConfig is not isinstance(dict), check for items() method
     if hpo_override is not None and hasattr(hpo_override, 'items'):
@@ -1705,12 +1707,18 @@ def main(
         # This combines GAEAECLoss best practices with uncertainty weighting
         expes_config["loss_type"] = "multi_nilm"
         logging.info("Auto-selected 'multi_nilm' loss type for multi-device training")
+    # Track CLI-explicit overrides so dataset_params.yaml won't clobber them
+    _cli_overrides = set()
     if overlap is not None:
         expes_config["overlap"] = float(overlap)
+        _cli_overrides.add("overlap")
     if epochs is not None:
         expes_config["epochs"] = int(epochs)
+        _cli_overrides.add("epochs")
     if batch_size is not None:
         expes_config["batch_size"] = int(batch_size)
+        _cli_overrides.add("batch_size")
+    expes_config["_cli_overrides"] = list(_cli_overrides)
 
     # Two-stage training configuration
     if freeze_devices is not None and len(freeze_devices) > 0:
