@@ -158,35 +158,32 @@ class AdaptiveDeviceLoss(nn.Module):
         cv_on = float(stats.get("cv_on", 0.3))
         mean_event_dur = float(stats.get("mean_event_duration", 10.0))
 
-        lname = name.lower()
-
-        if lname in ("kettle", "microwave"):
-            device_type = self.SPARSE_HIGH_POWER
-        else:
-            raw_type = str(stats.get("device_type", "") or "").lower()
-            if raw_type:
-                if raw_type == "sparse_long_cycle":
-                    device_type = self.SPARSE_LONG_CYCLE
-                elif raw_type in ("sparse_high_power", "sparse_medium_power"):
-                    device_type = self.SPARSE_HIGH_POWER
-                elif raw_type in (
-                    "cycling_low_power",
-                    "cycling_infrequent",
-                    "frequent_switching",
-                ):
-                    device_type = self.CYCLING
-                elif raw_type == "long_cycle":
-                    device_type = self.LONG_CYCLE
-                elif raw_type == "always_on":
-                    device_type = self.ALWAYS_ON
-                else:
-                    device_type = self._classify_device(
-                        duty_cycle, peak_power, mean_on, cv_on, mean_event_dur
-                    )
+        # V8: Device type from stats (data-driven) or config, never from device name.
+        # This ensures all datasets get identical classification logic.
+        raw_type = str(stats.get("device_type", "") or "").lower()
+        if raw_type:
+            if raw_type == "sparse_long_cycle":
+                device_type = self.SPARSE_LONG_CYCLE
+            elif raw_type in ("sparse_high_power", "sparse_medium_power"):
+                device_type = self.SPARSE_HIGH_POWER
+            elif raw_type in (
+                "cycling_low_power",
+                "cycling_infrequent",
+                "frequent_switching",
+            ):
+                device_type = self.CYCLING
+            elif raw_type == "long_cycle":
+                device_type = self.LONG_CYCLE
+            elif raw_type == "always_on":
+                device_type = self.ALWAYS_ON
             else:
                 device_type = self._classify_device(
                     duty_cycle, peak_power, mean_on, cv_on, mean_event_dur
                 )
+        else:
+            device_type = self._classify_device(
+                duty_cycle, peak_power, mean_on, cv_on, mean_event_dur
+            )
 
         params = self._derive_params_from_stats(
             device_type, duty_cycle, peak_power, mean_on, cv_on, mean_event_dur
@@ -211,24 +208,9 @@ class AdaptiveDeviceLoss(nn.Module):
                 params = dict(params)
                 params["lambda_gate_cls"] = float(base_params["lambda_gate_cls"])
 
-        # V6: Manual per-device tuning REMOVED.
-        # All loss params now come from _derive_params_from_stats (HPO-aligned).
-        # This eliminates 200+ lines of fragile per-device overrides.
-
-        # Per-device regression-side overrides
-        lname_override = str(stats.get("name", "") or "").lower()
-        if "microwave" in lname_override:
-            params = dict(params)
-            params["w_off_fp"] = 0.12    # Extra FP penalty for MW
-            params["off_margin"] = 0.03  # Wider OFF dead zone
-
-        # V8: WashingMachine-specific overrides for better recall/energy tracking
-        if "washing" in lname_override or "washer" in lname_override:
-            params = dict(params)
-            params["w_recall"] = 0.28    # Up from LONG_CYCLE 0.22
-            params["w_energy"] = 0.22    # Up from 0.18
-            params["alpha_on"] = 2.8     # Up from 2.5
-            params["w_on_power"] = 0.14  # Up from 0.10
+        # V8: Per-device tuning moved to dataset_params.yaml loss_override.
+        # No hardcoded device name overrides — all datasets use the same code path.
+        # Device-specific params flow through: config loss_override → loss_params → extra_params.
 
         # Apply gate config_overrides from HPO
         gate_soft_scale_override = self.config_overrides.get("gate_soft_scale")
@@ -317,21 +299,20 @@ class AdaptiveDeviceLoss(nn.Module):
 
         if device_type == self.SPARSE_HIGH_POWER:
             # V8: Reduced ON-bias from 25:1 to 8:1 ratio to improve precision.
-            # Previous 3.82/0.15 caused excessive false positives in multi-device training.
             params["alpha_on"] = 2.8 * alpha_on_scale
             params["alpha_off"] = 0.35 * alpha_off_scale
             params["w_main"] = 0.40
             params["w_recall"] = 0.20 * recall_scale
-            params["w_off_fp"] = 0.10  # Stronger FP penalty
+            params["w_off_fp"] = 0.10
             params["w_energy"] = 0.15 * energy_scale
             params["w_on_power"] = 0.12
             params["w_hard_zero"] = 0.05
             params["off_margin"] = 0.02
-            params["w_peak"] = 0.0  # Disabled for sparse - causes MW collapse
-            # LESSON: Increasing gate_alpha_off or lambda_gate_cls for sparse devices
-            # causes collapse (tested 0.5-2.0 lambda_gate_cls, all collapsed kettle+microwave).
+            params["w_peak"] = 0.0
+            params["recall_coef_base"] = 0.25
+            params["recall_coef_scale"] = 0.40
+            params["recall_coef_max"] = 1.0
         elif device_type == self.SPARSE_LONG_CYCLE:
-            # Hybrid: sparse_high_power ON-bias + long_cycle multi-phase regression
             params["alpha_on"] = 6.0 * alpha_on_scale
             params["alpha_off"] = 0.3 * alpha_off_scale
             params["w_main"] = 0.40
@@ -342,17 +323,23 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_hard_zero"] = 0.04
             params["off_margin"] = 0.015
             params["w_peak"] = 0.0
+            params["recall_coef_base"] = 0.20
+            params["recall_coef_scale"] = 0.40
+            params["recall_coef_max"] = 0.70
         elif device_type == self.LONG_CYCLE:
             params["alpha_on"] = 2.5 * alpha_on_scale
             params["alpha_off"] = 0.8 * alpha_off_scale
             params["w_main"] = 0.45
-            params["w_recall"] = 0.22 * recall_scale  # V7.4: Increased from 0.15 for WM/DW recall
+            params["w_recall"] = 0.22 * recall_scale
             params["w_off_fp"] = 0.10
             params["w_energy"] = 0.18 * energy_scale
             params["w_on_power"] = 0.10
             params["w_hard_zero"] = 0.05
-            params["off_margin"] = 0.015  # V7.4: Increased from 0.01 for wash cycle edges
-            params["w_peak"] = 0.0  # V7.5: Disabled for long_cycle - hurts DW F1 (0.570→0.423)
+            params["off_margin"] = 0.015
+            params["w_peak"] = 0.0
+            params["recall_coef_base"] = 0.20
+            params["recall_coef_scale"] = 0.40
+            params["recall_coef_max"] = 0.70
         elif device_type == self.CYCLING:
             params["alpha_on"] = 1.5 * alpha_on_scale
             params["alpha_off"] = 1.0 * alpha_off_scale
@@ -363,7 +350,10 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_on_power"] = 0.10
             params["w_hard_zero"] = 0.03
             params["off_margin"] = 0.015
-            params["w_peak"] = 0.0  # V7.5: Disabled for cycling - hurts fridge P (0.698→0.657)
+            params["w_peak"] = 0.0
+            params["recall_coef_base"] = 0.10
+            params["recall_coef_scale"] = 0.10
+            params["recall_coef_max"] = 0.70
         else:
             # Default/always-on devices
             params["alpha_on"] = 1.0 * alpha_on_scale
@@ -375,7 +365,10 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_on_power"] = 0.08
             params["w_hard_zero"] = 0.02
             params["off_margin"] = 0.02
-            params["w_peak"] = 0.0  # V7.5: Disabled for default devices
+            params["w_peak"] = 0.0
+            params["recall_coef_base"] = 0.10
+            params["recall_coef_scale"] = 0.10
+            params["recall_coef_max"] = 0.70
 
         return params
 
@@ -441,55 +434,18 @@ class AdaptiveDeviceLoss(nn.Module):
         """Set current epoch for warmup scheduling."""
         self.current_epoch = int(epoch)
 
-    def _get_device_type(self, device_name: str) -> str:
-        """
-        Return device type category based on device name.
-
-        Categories:
-        - sparse_high_power: Short, high-power bursts with ultra-low duty cycle
-          (Kettle, Microwave, Toaster)
-        - cycling_low_power: Periodic cycling with moderate duty cycle
-          (Fridge, Freezer, Refrigerator)
-        - long_cycle: Long operation cycles
-          (Washing Machine, Dishwasher, Dryer)
-        - unknown: Default category
-
-        Args:
-            device_name: Name of the device
-
-        Returns:
-            Device type category string
-        """
-        name_lower = device_name.lower()
-
-        sparse_high_power = ["kettle", "microwave", "toaster"]
-        cycling_low_power = ["fridge", "freezer", "refrigerator", "fridge_freezer"]
-        long_cycle = ["washing_machine", "washingmachine", "washer", "dishwasher", "dryer"]
-
-        if any(s in name_lower for s in sparse_high_power):
-            return "sparse_high_power"
-        elif any(s in name_lower for s in cycling_low_power):
-            return "cycling_low_power"
-        elif any(s in name_lower for s in long_cycle):
-            return "long_cycle"
-        else:
-            return "unknown"
-
-    def _get_epoch_adjusted_params(self, params: dict, epoch: int, total_epochs: int = 25, device_name: str = None) -> dict:
+    def _get_epoch_adjusted_params(self, params: dict, epoch: int, total_epochs: int = 25, **kwargs) -> dict:
         """
         Adjust loss parameters based on training epoch for curriculum learning.
 
-        STRATEGY (v5): Device-type-aware three-phase curriculum
-        - cycling_low_power devices (Fridge): NO curriculum - keep stable parameters
-          Reason: Fridge already has good F1, curriculum caused regression
-        - sparse_high_power devices (Kettle, Microwave): Full curriculum
+        V8: Fully parameter-driven. Curriculum is controlled by params["use_curriculum"]
+        (default False). When enabled, applies 3-phase schedule:
           - Phase 1 (epoch < 8): Detection priority - higher recall, lower FP penalty
           - Phase 2 (8 <= epoch < 16): Balanced - use original parameters
           - Phase 3 (epoch >= 16): Precision priority - lower recall, higher FP penalty
-        - Other devices: Default curriculum (same as sparse_high_power)
 
         Args:
-            params: Original device-specific parameters
+            params: Device-specific parameters (must include use_curriculum to enable)
             epoch: Current epoch number
             total_epochs: Total training epochs (default 25)
             device_name: Name of the device (optional, for device-type-aware adjustment)
@@ -500,27 +456,11 @@ class AdaptiveDeviceLoss(nn.Module):
         # Make a copy to avoid modifying original
         adjusted = dict(params)
 
-        # Check device type for device-specific curriculum strategy
-        if device_name:
-            device_type = self._get_device_type(device_name)
-            name_lower = device_name.lower()
-
-            # cycling_low_power devices (Fridge): NO curriculum learning
-            # LESSON LEARNED: Curriculum learning caused Fridge F1 to drop from 0.752 to 0.0
-            # because early-phase recall boost led to over-activation
-            if device_type == "cycling_low_power":
-                return adjusted  # Return original params without modification
-
-            # Microwave: Also skip curriculum learning
-            # LESSON LEARNED (v12): Microwave is extremely sensitive to parameter changes
-            # Even with v89bb189 parameters restored, curriculum causes collapse
-            if "microwave" in name_lower:
-                return adjusted  # Return original params without modification
-
-            # V7.4: Long-cycle devices (WM, DW): Skip curriculum
-            # Phase 3 recall reduction (0.8x) hurts devices with R=0.305
-            if device_type == "long_cycle":
-                return adjusted
+        # V8: Curriculum is fully parameter-driven — no device_type branching.
+        # Default: disabled (False). Can be enabled per-device via loss_override.
+        # LESSON: Curriculum caused collapse for fridge, MW, and hurt WM/DW recall.
+        if not params.get("use_curriculum", False):
+            return adjusted
 
         # Get current values
         w_recall = float(adjusted.get("w_recall", 0.1))
@@ -589,25 +529,14 @@ class AdaptiveDeviceLoss(nn.Module):
         loss_main = alpha_on * loss_on + alpha_off * loss_off
 
         # === Component 2: ON recall loss ===
+        # V8: recall_coef fully parameter-driven — no device_type branching.
+        # recall_coef = base + scale * w_recall, clamped to [0, max].
+        # All values come from _derive_params_from_stats → loss_override.
         w_recall = float(params.get("w_recall", 0.1))
-        device_type = self._get_device_type(device_name) if device_name else "unknown"
-
-        # Device-type-aware recall_coef
-        recall_coef_override = params.get("recall_coef_override", None)
-        if recall_coef_override is not None:
-            recall_coef = float(recall_coef_override)
-        elif device_type == "cycling_low_power":
-            recall_coef = 0.10 + 0.10 * w_recall
-        elif device_type == "sparse_high_power":
-            recall_coef = 0.25 + 0.4 * w_recall  # Reverted to V7 value (Phase 2 reduction didn't help)
-        elif device_type == "long_cycle":
-            recall_coef = 0.20 + 0.4 * w_recall  # V7.4: Increased from 0.12+0.3*w (was 0.165→0.26)
-        else:
-            recall_coef = 0.10 + 0.10 * w_recall
-
-        # Sparse devices can predict full amplitude
-        max_coef = 1.0 if device_type == "sparse_high_power" else 0.70
-        recall_coef = min(recall_coef, max_coef)
+        recall_coef_base = float(params.get("recall_coef_base", 0.10))
+        recall_coef_scale = float(params.get("recall_coef_scale", 0.10))
+        recall_coef_max = float(params.get("recall_coef_max", 0.70))
+        recall_coef = min(recall_coef_base + recall_coef_scale * w_recall, recall_coef_max)
 
         on_deficit = torch.relu(recall_coef * target - pred) * p_on
         on_recall_loss = on_deficit.sum() / (p_on.sum() + eps)
@@ -718,11 +647,9 @@ class AdaptiveDeviceLoss(nn.Module):
             params = self.device_params[c]
             device_name = self.device_names[c] if c < len(self.device_names) else None
 
-            # Apply epoch-adjusted parameters for curriculum learning
-            # This adjusts recall/precision balance based on training phase
-            # Device-type-aware: cycling_low_power devices skip curriculum
+            # Apply epoch-adjusted parameters (curriculum controlled by params)
             adjusted_params = self._get_epoch_adjusted_params(
-                params, self.current_epoch, device_name=device_name
+                params, self.current_epoch
             )
 
             # Apply unified stable loss structure with device-specific parameters

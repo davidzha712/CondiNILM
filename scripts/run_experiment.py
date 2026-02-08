@@ -960,20 +960,22 @@ def launch_one_experiment(expes_config: OmegaConf):
     hpo_override = getattr(expes_config, "hpo_override", None)
     # Fix: OmegaConf DictConfig is not isinstance(dict), check for items() method
     if hpo_override is not None and hasattr(hpo_override, 'items'):
-        # For non-UKDALE: only block HPO keys that the dataset explicitly overrides in ds_loss
-        # This lets HPO-tuned params (loss_alpha_on/off, gate params, etc.) pass through
-        # when the dataset doesn't set them, while protecting dataset-specific tuning
+        # V8: UNIFIED HPO guard — same logic for ALL datasets.
+        # HPO params apply UNLESS the dataset's ds_loss explicitly overrides them.
+        # E.g. UKDALE ds_loss has output_ratio/anti_collapse → those are protected.
+        # E.g. REFIT ds_loss has output_ratio → that is protected.
+        # HPO params not in ds_loss (alpha_on, gate params, etc.) pass through for all.
         _ds_loss_keys = set(ds_loss.keys()) if ds_loss else set()
         skipped = []
         for key, value in hpo_override.items():
-            if not dataset_name.startswith("UKDALE") and key in _ds_loss_keys:
+            if key in _ds_loss_keys:
                 skipped.append(key)
                 continue  # Skip HPO params that the dataset explicitly overrides
             try:
                 expes_config[key] = value
             except Exception:
                 pass
-        if not dataset_name.startswith("UKDALE"):
+        if skipped:
             logging.info("HPO override for %s: applied all except ds_loss keys %s", dataset_name, skipped)
 
     # Get dynamic output channels (number of devices)
@@ -988,14 +990,13 @@ def launch_one_experiment(expes_config: OmegaConf):
         logging.info("Load cached preprocessed data from %s", cache_path)
         cache = torch.load(cache_path, weights_only=False)
 
-        # V8: Cache version check - warn if pre-fix cache (scaler fitted on all houses)
+        # V8: Cache version check - reject pre-fix cache (scaler fitted on all houses)
         cache_ver = cache.get("cache_version", 1)
         if cache_ver < 2:
-            logging.warning(
-                "STALE CACHE (v%d): %s was generated before V8 scaler fix. "
-                "Scaler may have been fitted on test data. Delete this file and re-run "
-                "to regenerate with train-only scaler.",
-                cache_ver, cache_path,
+            raise RuntimeError(
+                f"STALE CACHE (v{cache_ver}): {cache_path} was generated before V8 scaler fix. "
+                f"Scaler was fitted on test data (data leakage). "
+                f"Delete this file and re-run to regenerate with train-only scaler."
             )
 
         tuple_data = cache["tuple_data"]
@@ -1047,7 +1048,7 @@ def launch_one_experiment(expes_config: OmegaConf):
             applied = 0
             skipped = []
             for key, value in hpo_dict.items():
-                if not dataset_name.startswith("UKDALE") and key in _ds_loss_keys:
+                if key in _ds_loss_keys:
                     skipped.append(key)
                     continue
                 try:
@@ -1371,7 +1372,7 @@ def launch_one_experiment(expes_config: OmegaConf):
         applied = 0
         skipped = []
         for key, value in hpo_dict.items():
-            if not dataset_name.startswith("UKDALE") and key in _ds_loss_keys:
+            if key in _ds_loss_keys:
                 skipped.append(key)
                 continue
             try:
@@ -1613,35 +1614,28 @@ def main(
         expes_config["ind_house_test"] = ind_house_test
         logging.info("      Using custom test houses: %s", ind_house_test)
 
-    # CRITICAL FIX: For REDD Multi mode, ensure consistent house configuration
-    # Different REDD devices have different availability - use common houses
+    # V8: UNIFIED default multi-device house split from dataset_params.yaml.
+    # All datasets use the same code path — no dataset-specific hardcoding.
+    # Splits are defined in training.default_multi_train / default_multi_test.
     is_multi_device = len(selected_keys) > 1 or appliance_lower == "multi"
-    # V8: Only apply default to exact "REDD" — REDD_STRESS has its own splits
-    if is_multi_device and dataset_key == "REDD":
-        # If user didn't specify houses, use the recommended REDD multi-device config
-        # Houses 1,2,3 have fridge, microwave, dishwasher with good activity
-        if ind_house_train_val is None and ind_house_test is None:
+    if is_multi_device and ind_house_train_val is None and ind_house_test is None:
+        training_cfg = params_manager.get_training_config(dataset_key)
+        default_train = training_cfg.get("default_multi_train")
+        default_test = training_cfg.get("default_multi_test")
+        if default_train and default_test:
             logging.warning(
-                "REDD Multi mode: Using recommended house config [1,2] train, [3] test. "
-                "Devices with insufficient data will be auto-filtered."
+                "%s Multi mode: Using default house split from dataset_params.yaml. "
+                "train=%s, test=%s",
+                dataset_key, default_train, default_test,
             )
-            expes_config["ind_house_train_val"] = [1, 2]
-            expes_config["ind_house_test"] = [3]
-
-    # CRITICAL FIX: For UKDALE Multi mode, use only clean data houses
-    # Analysis results:
-    # - House 4: microwave channel is MIXED (washing_machine_microwave_breadmaker)
-    # - House 5: microwave is noise data (mean_on=59W < 50W threshold)
-    # - Houses 1, 2: All 5 devices have clean data
-    # V8: Only apply default to exact "UKDALE" — UKDALE_EXT/UKDALE_BI have their own splits
-    if is_multi_device and dataset_key == "UKDALE":
-        if ind_house_train_val is None and ind_house_test is None:
+            expes_config["ind_house_train_val"] = list(default_train)
+            expes_config["ind_house_test"] = list(default_test)
+        else:
             logging.warning(
-                "UKDALE Multi mode: Using recommended house config [1] train, [2] test. "
-                "Houses 3,4,5 excluded due to microwave data quality issues."
+                "%s Multi mode: No default_multi_train/test in dataset_params.yaml. "
+                "Must specify --ind_house_train_val and --ind_house_test.",
+                dataset_key,
             )
-            expes_config["ind_house_train_val"] = [1]
-            expes_config["ind_house_test"] = [2]
 
     # Auto-select loss type for multi-device training
     if loss_type is not None:

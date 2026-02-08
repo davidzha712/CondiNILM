@@ -1113,9 +1113,9 @@ class SeqToSeqLightningModule(pl.LightningModule):
             params = self.criterion.device_params[c]
             device_name = self.criterion.device_names[c]
 
-            # Apply epoch-adjusted parameters
+            # Apply epoch-adjusted parameters (curriculum controlled by params)
             adjusted_params = self.criterion._get_epoch_adjusted_params(
-                params, self.current_epoch, device_name=device_name
+                params, self.current_epoch
             )
 
             # Compute device-specific loss using the cycling loss
@@ -1148,6 +1148,18 @@ class SeqToSeqLightningModule(pl.LightningModule):
         penalties = self._compute_all_penalties(pred, target, state, ts_agg)
         anti_scale = self._compute_anti_collapse_scale(self.current_epoch)
 
+        # V8: Match normal path gate weight normalization for multi-device
+        gate_cls_scale = self.gate_cls_weight
+        gate_window_scale = self.gate_window_weight
+        if (
+            isinstance(self.criterion, AdaptiveDeviceLoss)
+            and getattr(self.criterion, "n_devices", 1) > 1
+        ):
+            if gate_cls_scale > 0.0:
+                gate_cls_scale = 1.0
+            if gate_window_scale > 0.0:
+                gate_window_scale = 1.0
+
         # Aggregate auxiliary losses (not per-device)
         aux_loss = (
             penalties["zero_run"]
@@ -1155,8 +1167,8 @@ class SeqToSeqLightningModule(pl.LightningModule):
             + penalties["off_state_long"]
             + penalties["off_state"]
             + self.neg_penalty_weight * penalties["neg"]
-            + self.gate_cls_weight * gate_cls_loss
-            + self.gate_window_weight * gate_window_loss
+            + gate_cls_scale * gate_cls_loss
+            + gate_window_scale * gate_window_loss
             + self.gate_duty_weight * gate_duty_loss
             + self.anti_collapse_weight * anti_scale * penalties["anti_collapse"]
         )
@@ -1327,9 +1339,9 @@ class SeqToSeqLightningModule(pl.LightningModule):
             params = self.criterion.device_params[c]
             device_name = self.criterion.device_names[c]
 
-            # Apply epoch-adjusted parameters
+            # Apply epoch-adjusted parameters (curriculum controlled by params)
             adjusted_params = self.criterion._get_epoch_adjusted_params(
-                params, self.current_epoch, device_name=device_name
+                params, self.current_epoch
             )
 
             # Compute device-specific loss using the cycling loss

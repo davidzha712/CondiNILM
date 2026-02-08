@@ -872,8 +872,11 @@ class UKDALE_DataBuilder(object):
                 else:
                     continue
             else:
-                house_data[appliance] = 0
-                house_data[appliance + "_status"] = 0
+                raise ValueError(
+                    f"UKDALE house {indice}: appliance '{appliance}' not found in data. "
+                    f"Available columns: {list(house_data.columns)}. "
+                    f"Check dataset_params.yaml 'houses' list or datasets.yaml split config."
+                )
 
         return house_data
 
@@ -1305,8 +1308,12 @@ class REFIT_DataBuilder(object):
                 else:
                     continue
             else:
-                house_data[appliance] = 0
-                house_data[appliance + "_status"] = 0
+                raise ValueError(
+                    f"REFIT house {indice}: appliance '{appliance}' not found in data "
+                    f"(even after alias resolution). "
+                    f"Available columns: {list(house_data.columns)}. "
+                    f"Check dataset_params.yaml 'houses' list or datasets.yaml split config."
+                )
 
         house_data = house_data[tmp_list]
 
@@ -1314,7 +1321,7 @@ class REFIT_DataBuilder(object):
 
     def _check_appliance_names(self):
         """
-        Check appliances names for UKDALE case.
+        Check appliances names for REFIT case.
         """
         for appliance in self.mask_app:
             assert appliance in [
