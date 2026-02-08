@@ -1,5 +1,5 @@
 # ============================================================
-# NILMFormer 完整搜索空间 (多设备通用) - 含5min采样率
+# NILMFormer: Full search space (multi-device) - includes 5min sampling rate
 # ============================================================
 NILMFormer:
   sampling_rate:
@@ -92,18 +92,18 @@ NILMFormer:
     high: 0.05
 
 # ============================================================
-# NILMFormer_Sparse: 专为稀疏高功率设备优化 (Microwave, Kettle)
-# 特点: 更高的alpha_on，更低的alpha_off，更高的gate_floor
+# NILMFormer_Sparse: Optimized for sparse high-power devices (Microwave, Kettle)
+# Features: higher alpha_on, lower alpha_off, higher gate_floor
 # ============================================================
 NILMFormer_Sparse:
-  # 采样率和窗口 - 稀疏设备可能需要更细的采样
+  # Sampling rate and window - sparse devices may need finer sampling
   sampling_rate:
     type: categorical
     choices: ['6s','30s','1min']
   window_size:
     type: categorical
     choices: [64, 128]
-  # 学习率
+  # Learning rate
   lr:
     type: loguniform
     low: 5e-5
@@ -112,7 +112,7 @@ NILMFormer_Sparse:
     type: loguniform
     low: 1e-5
     high: 1e-2
-  # 模型架构 - 稀疏设备不需要太大模型
+  # Model architecture - sparse devices don't need large models
   d_model:
     type: int
     low: 64
@@ -147,18 +147,18 @@ NILMFormer_Sparse:
     low: 1
     high: 3
     step: 2
-  # ===== 关键损失参数 - 针对稀疏设备优化 =====
-  # ON状态权重 - 大幅提高以检测稀疏事件
+  # ===== Key loss params - optimized for sparse devices =====
+  # ON-state weight - significantly increased to detect sparse events
   loss_alpha_on:
     type: loguniform
     low: 6.0
     high: 18.0
-  # OFF状态权重 - 大幅降低以减少过度惩罚
+  # OFF-state weight - significantly reduced to avoid over-penalization
   loss_alpha_off:
     type: loguniform
     low: 0.05
     high: 0.5
-  # 召回权重 - 提高以减少漏检
+  # Recall weight - increased to reduce missed detections
   loss_lambda_on_recall:
     type: loguniform
     low: 2.0
@@ -167,42 +167,42 @@ NILMFormer_Sparse:
     type: uniform
     low: 0.85
     high: 0.98
-  # 能量回归
+  # Energy regression
   loss_lambda_energy:
     type: loguniform
     low: 0.05
     high: 0.5
-  # 稀疏惩罚 - 降低以允许更多激活
+  # Sparsity penalty - reduced to allow more activations
   loss_lambda_sparse:
     type: loguniform
     low: 0.0001
     high: 0.003
-  # OFF硬约束 - 降低
+  # OFF hard constraint - reduced
   loss_lambda_off_hard:
     type: loguniform
     low: 0.001
     high: 0.02
-  # ===== Gate参数 - 关键! =====
-  # Gate锐度
+  # ===== Gate params - critical! =====
+  # Gate sharpness
   gate_soft_scale:
     type: uniform
     low: 1.5
     high: 4.0
-  # Gate下限 - 提高以允许更多检测
+  # Gate floor - increased to allow more detections
   gate_floor:
     type: loguniform
     low: 0.015
     high: 0.1
-  # 输出比例
+  # Output ratio
   output_ratio:
     type: uniform
     low: 0.5
     high: 0.75
 
 # ============================================================
-# NILMFormer_Precision: 专为提高Precision优化 (减少假阳性)
-# 适用于: Microwave (当前Precision=0.075, 需要大幅提升)
-# 策略: 增强OFF惩罚，收紧gate控制，降低过度检测
+# NILMFormer_Precision: Optimized for improving Precision (reduce false positives)
+# Target: Microwave (current Precision=0.075, needs significant improvement)
+# Strategy: enhance OFF penalty, tighten gate control, reduce over-detection
 # ============================================================
 NILMFormer_Precision:
   sampling_rate:
@@ -253,18 +253,18 @@ NILMFormer_Precision:
     low: 1
     high: 3
     step: 2
-  # ===== 关键: 提高Precision的参数 =====
-  # ON权重 - 中等即可，不要太高
+  # ===== Key: params for improving Precision =====
+  # ON weight - moderate, don't go too high
   loss_alpha_on:
     type: loguniform
     low: 4.0
     high: 10.0
-  # OFF权重 - 大幅提高以惩罚假阳性!
+  # OFF weight - significantly increased to penalize false positives!
   loss_alpha_off:
     type: loguniform
     low: 0.3
     high: 2.0
-  # 召回权重 - 适中
+  # Recall weight - moderate
   loss_lambda_on_recall:
     type: loguniform
     low: 1.0
@@ -273,27 +273,27 @@ NILMFormer_Precision:
     type: uniform
     low: 0.7
     high: 0.95
-  # OFF硬约束 - 大幅提高!
+  # OFF hard constraint - significantly increased!
   loss_lambda_off_hard:
     type: loguniform
     low: 0.02
     high: 0.2
-  # 稀疏惩罚 - 提高以减少过度激活
+  # Sparsity penalty - increased to reduce over-activation
   loss_lambda_sparse:
     type: loguniform
     low: 0.001
     high: 0.02
-  # 能量回归
+  # Energy regression
   loss_lambda_energy:
     type: loguniform
     low: 0.1
     high: 0.5
-  # Gate锐度 - 提高以更清晰区分ON/OFF
+  # Gate sharpness - increased for clearer ON/OFF separation
   gate_soft_scale:
     type: uniform
     low: 2.0
     high: 5.0
-  # Gate下限 - 降低以减少OFF时的泄漏!
+  # Gate floor - reduced to minimize OFF-state leakage!
   gate_floor:
     type: loguniform
     low: 0.005
@@ -302,13 +302,114 @@ NILMFormer_Precision:
     type: uniform
     low: 0.5
     high: 0.7
-  # 零惩罚 - 提高以惩罚OFF时的非零输出
+  # Zero penalty - increased to penalize non-zero output during OFF state
   state_zero_penalty_weight:
     type: loguniform
     low: 0.05
     high: 0.3
-  # OFF惩罚权重
+  # OFF penalty weight
   off_high_agg_penalty_weight:
     type: loguniform
     low: 0.1
     high: 0.5
+
+# ============================================================
+# NILMFormer_REFIT: Optimized for REFIT dataset
+# REFIT native sampling rate 8s (not UKDALE's 6s), 4 devices: DW, WM, Kettle, Fridge
+# Note: ds_loss params like output_ratio/anti_collapse are protected by smart HPO guard
+# ============================================================
+NILMFormer_REFIT:
+  # REFIT native 8s -> options: 8s/30s/1min (no 6s/5min)
+  sampling_rate:
+    type: categorical
+    choices: ['8s', '30s', '1min']
+  # Window size: must cover sufficient device cycle lengths
+  # 8s*256=34min, 30s*128=64min, 1min*128=128min
+  window_size:
+    type: categorical
+    choices: [64, 128, 256]
+  # Learning rate
+  lr:
+    type: loguniform
+    low: 5e-5
+    high: 5e-4
+  wd:
+    type: loguniform
+    low: 1e-6
+    high: 5e-2
+  # Model architecture (same range as general NILMFormer)
+  d_model:
+    type: int
+    low: 64
+    high: 192
+    step: 16
+  n_encoder_layers:
+    type: int
+    low: 2
+    high: 6
+    step: 1
+  n_head:
+    type: int
+    low: 2
+    high: 8
+    step: 2
+  dp_rate:
+    type: uniform
+    low: 0.05
+    high: 0.3
+  pffn_ratio:
+    type: int
+    low: 2
+    high: 6
+    step: 1
+  kernel_size:
+    type: int
+    low: 3
+    high: 9
+    step: 2
+  kernel_size_head:
+    type: int
+    low: 1
+    high: 5
+    step: 2
+  # ===== Loss params (only search params NOT protected by ds_loss) =====
+  # Smart HPO guard skips REFIT ds_loss keys:
+  #   output_ratio, anti_collapse_weight, state_zero_penalty_weight,
+  #   state_zero_kernel, off_high_agg_penalty_weight
+  # The following params are passed to training:
+  loss_lambda_energy:
+    type: loguniform
+    low: 0.05
+    high: 5.0
+  loss_alpha_on:
+    type: loguniform
+    low: 2.0
+    high: 12.0
+  loss_alpha_off:
+    type: loguniform
+    low: 0.05
+    high: 1.2
+  loss_lambda_on_recall:
+    type: loguniform
+    low: 1.0
+    high: 8.0
+  loss_on_recall_margin:
+    type: uniform
+    low: 0.5
+    high: 0.95
+  gate_soft_scale:
+    type: uniform
+    low: 0.6
+    high: 2.4
+  gate_floor:
+    type: loguniform
+    low: 0.01
+    high: 0.06
+  loss_lambda_sparse:
+    type: loguniform
+    low: 0.0005
+    high: 0.01
+  loss_lambda_off_hard:
+    type: loguniform
+    low: 0.003
+    high: 0.05

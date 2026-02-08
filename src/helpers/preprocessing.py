@@ -910,6 +910,15 @@ class UKDALE_DataBuilder(object):
         return np.isnan(np.sum(a))
 
 
+# Mapping from standard REFIT appliance names to variant column names
+# found in HOUSES_Labels. Priority order: most common variant first.
+REFIT_APPLIANCE_ALIASES = {
+    "Fridge": ["Fridge-Freezer", "Fridge & Freezer", "Fridge(garage)", "Freezer"],
+    "WashingMachine": ["Washer Dryer", "WashingMachine (1)"],
+    "Microwave": ["Combination Microwave"],
+}
+
+
 # ===================== REFIT DataBuilder =====================#
 class REFIT_DataBuilder(object):
     def __init__(
@@ -1011,6 +1020,13 @@ class REFIT_DataBuilder(object):
                     "min_off_duration": 3,
                     "min_activation_time": 0,
                 },
+                "Fridge": {
+                    "min_threshold": 50,
+                    "max_threshold": 300,
+                    "min_on_duration": 6,
+                    "min_off_duration": 1,
+                    "min_activation_time": 1,
+                },
             }
         else:
             # Threshold parameters are in Watts
@@ -1019,6 +1035,7 @@ class REFIT_DataBuilder(object):
                 "WashingMachine": {"min_threshold": 300, "max_threshold": 4000},
                 "Dishwasher": {"min_threshold": 300, "max_threshold": 4000},
                 "Microwave": {"min_threshold": 200, "max_threshold": 6000},
+                "Fridge": {"min_threshold": 50, "max_threshold": 300},
             }
 
     def get_house_data(self, house_indicies):
@@ -1202,6 +1219,15 @@ class REFIT_DataBuilder(object):
 
         house_data = pd.read_csv(file)
         house_data.columns = list(labels_houses.loc[int(indice)].values)
+
+        # Resolve REFIT appliance name variants (e.g. "Fridge-Freezer" → "Fridge")
+        for std_name, aliases in REFIT_APPLIANCE_ALIASES.items():
+            if std_name in self.mask_app and std_name not in house_data.columns:
+                for alias in aliases:
+                    if alias in house_data.columns:
+                        house_data = house_data.rename(columns={alias: std_name})
+                        break
+
         house_data = house_data.set_index("Time").sort_index()
         house_data.index = pd.to_datetime(house_data.index)
         idx_to_drop = house_data[house_data["Issues"] == 1].index
@@ -1296,6 +1322,7 @@ class REFIT_DataBuilder(object):
                 "Dishwasher",
                 "Kettle",
                 "Microwave",
+                "Fridge",
             ], f"Selected applicance unknow for REFIT Dataset, got: {appliance}"
         return
 

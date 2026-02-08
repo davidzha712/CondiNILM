@@ -400,7 +400,8 @@ def run_study_for_dataset(
         base_config["epochs"] = int(args.epochs)
     if args.batch_size is not None:
         base_config["batch_size"] = int(args.batch_size)
-    space = _parse_search_space(args.search_space, model_key)
+    space_key = getattr(args, 'search_space_key', None) or model_key
+    space = _parse_search_space(args.search_space, space_key)
 
     # If the user requests a fixed sampling_rate/window_size, remove them from the
     # Optuna search space so trial params match what is actually executed.
@@ -420,7 +421,7 @@ def run_study_for_dataset(
     study_name = (
         args.study_name
         or _build_study_name(
-            dataset_key, model_key, sampling_tag, window_tag, args.study_prefix
+            dataset_key, space_key, sampling_tag, window_tag, args.study_prefix
         )
     )
     storage = f"sqlite:///{os.path.join(storage_dir, study_name)}.db"
@@ -496,6 +497,8 @@ def main() -> None:
     parser.add_argument("--storage_dir", type=str, default="optuna_studies")
     parser.add_argument("--study_name", type=str, default=None)
     parser.add_argument("--study_prefix", type=str, default="study")
+    parser.add_argument("--search_space_key", type=str, default=None,
+        help="Override search space key (default: same as --name_model)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     datasets_all = _load_yaml("configs/datasets.yaml")

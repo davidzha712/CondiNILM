@@ -1,16 +1,16 @@
 # ============================================================
-# HPO搜索空间 - 专为稀疏高功率设备优化 (Microwave, Kettle)
-# 特点: 更高的alpha_on，更低的alpha_off，更高的gate_floor
+# HPO search space - Optimized for sparse high-power devices (Microwave, Kettle)
+# Features: higher alpha_on, lower alpha_off, higher gate_floor
 # ============================================================
 NILMFormer:
-  # 采样率和窗口 - 锁定以加速搜索
+  # Sampling rate and window - locked to speed up search
   sampling_rate:
     type: categorical
     choices: ["1min"]
   window_size:
     type: categorical
     choices: [128]
-  # 学习率
+  # Learning rate
   lr:
     type: loguniform
     low: 5e-5
@@ -19,7 +19,7 @@ NILMFormer:
     type: loguniform
     low: 1e-5
     high: 1e-2
-  # 模型架构 - 稀疏设备不需要太大模型
+  # Model architecture - sparse devices don't need large models
   d_model:
     type: int
     low: 64
@@ -55,18 +55,18 @@ NILMFormer:
     high: 3
     step: 2
 
-  # ===== 关键损失参数 - 针对稀疏设备优化 =====
-  # ON状态权重 - 大幅提高以检测稀疏事件
+  # ===== Key loss params - optimized for sparse devices =====
+  # ON-state weight - significantly increased to detect sparse events
   loss_alpha_on:
     type: loguniform
     low: 6.0
     high: 18.0
-  # OFF状态权重 - 大幅降低以减少过度惩罚
+  # OFF-state weight - significantly reduced to avoid over-penalization
   loss_alpha_off:
     type: loguniform
     low: 0.05
     high: 0.5
-  # 召回权重 - 提高以减少漏检
+  # Recall weight - increased to reduce missed detections
   loss_lambda_on_recall:
     type: loguniform
     low: 2.0
@@ -75,34 +75,34 @@ NILMFormer:
     type: uniform
     low: 0.85
     high: 0.98
-  # 能量回归
+  # Energy regression
   loss_lambda_energy:
     type: loguniform
     low: 0.05
     high: 0.5
-  # 稀疏惩罚 - 降低以允许更多激活
+  # Sparsity penalty - reduced to allow more activations
   loss_lambda_sparse:
     type: loguniform
     low: 0.0001
     high: 0.003
-  # OFF硬约束 - 降低
+  # OFF hard constraint - reduced
   loss_lambda_off_hard:
     type: loguniform
     low: 0.001
     high: 0.02
 
-  # ===== Gate参数 - 关键! =====
-  # Gate锐度
+  # ===== Gate params - critical! =====
+  # Gate sharpness
   gate_soft_scale:
     type: uniform
     low: 1.5
     high: 4.0
-  # Gate下限 - 提高以允许更多检测
+  # Gate floor - increased to allow more detections
   gate_floor:
     type: loguniform
     low: 0.015
     high: 0.1
-  # 输出比例
+  # Output ratio
   output_ratio:
     type: uniform
     low: 0.5

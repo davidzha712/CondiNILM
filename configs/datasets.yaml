@@ -35,8 +35,8 @@ REFIT:
     overlap: 0.5
   Fridge:
     app: Fridge
-    house_with_app_i: [2, 5, 6, 7, 9, 12, 15, 17, 19, 20]
-    ind_house_train_val: [2, 5, 6]
+    house_with_app_i: [2, 5, 7, 9, 12, 15, 17, 19, 20]
+    ind_house_train_val: [2, 5, 9]
     ind_house_test: [7]
     overlap: 0.5
 
