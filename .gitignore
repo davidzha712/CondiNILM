@@ -47,6 +47,9 @@ log/
 logs/
 wandb/
 
+# Optuna HPO studies
+optuna_studies/
+
 # Model files
 *.ckpt
 *.pt
