@@ -376,7 +376,14 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                 if model_name == "nilmformer":
                     try:
                         n_devices = len(device_stats_for_loss)
-                        type_ids = list(range(n_devices))
+                        # V8: Group type_ids by device_type so same-type devices share type heads
+                        type_map = {}
+                        type_ids = []
+                        for ds in device_stats_for_loss:
+                            dt = ds.get("device_type", f"unknown_{len(type_map)}")
+                            if dt not in type_map:
+                                type_map[dt] = len(type_map)
+                            type_ids.append(type_map[dt])
                         kettle_idx = -1
                         try:
                             for i, nm in enumerate(names):
@@ -857,12 +864,37 @@ def launch_one_experiment(expes_config: OmegaConf):
     # Apply training params if not already set
     # Keys that should always override from dataset config (small datasets need full batches)
     _always_override_keys = {"limit_train_batches", "limit_val_batches"}
+    # Map dataset_params.yaml keys to actual config keys used by training code
+    _key_mapping = {
+        "learning_rate": None,           # → model_training_param.lr (handled below)
+        "weight_decay": None,            # → model_training_param.wd (handled below)
+        "early_stopping_patience": None, # → p_es (handled below)
+    }
     for key, value in ds_training.items():
+        if key in _key_mapping:
+            continue  # Handled separately below
         if key in _always_override_keys or key not in expes_config or getattr(expes_config, key, None) is None:
             try:
                 expes_config[key] = value
             except Exception:
                 pass
+
+    # Apply mapped training params to their actual config locations
+    if "learning_rate" in ds_training:
+        try:
+            expes_config.model_training_param.lr = float(ds_training["learning_rate"])
+        except Exception:
+            pass
+    if "weight_decay" in ds_training:
+        try:
+            expes_config.model_training_param.wd = float(ds_training["weight_decay"])
+        except Exception:
+            pass
+    if "early_stopping_patience" in ds_training:
+        try:
+            expes_config.p_es = int(ds_training["early_stopping_patience"])
+        except Exception:
+            pass
 
     for key, value in ds_loss.items():
         try:
@@ -1076,12 +1108,24 @@ def launch_one_experiment(expes_config: OmegaConf):
                 1, int(round(expes_config.window_size * (1.0 - float(overlap))))
             )
 
+        # Load UKDALE-specific appliance params from dataset_params.yaml
+        ukdale_appliance_params = {}
+        ds_config_ukdale = params_manager.get_dataset_config("UKDALE")
+        if ds_config_ukdale:
+            for app_name, app_cfg in ds_config_ukdale.get("appliances", {}).items():
+                ukdale_appliance_params[app_name.lower()] = {
+                    k: v for k, v in app_cfg.items()
+                    if k in ["min_threshold", "max_threshold", "min_on_duration",
+                             "min_off_duration", "min_activation_time"]
+                }
+
         data_builder = UKDALE_DataBuilder(
             data_path=f"{expes_config.data_path}/UKDALE/",
             mask_app=expes_config.app,
             sampling_rate=expes_config.sampling_rate,
             window_size=expes_config.window_size,
             window_stride=window_stride,
+            appliance_params=ukdale_appliance_params if ukdale_appliance_params else None,
         )
 
         # V8: Only load train+test houses (not all 5) to avoid non-target house contamination
@@ -1165,12 +1209,25 @@ def launch_one_experiment(expes_config: OmegaConf):
                 1, int(round(expes_config.window_size * (1.0 - float(overlap))))
             )
 
+        # Load REFIT-specific appliance params from dataset_params.yaml
+        refit_appliance_params = {}
+        ds_config_refit = params_manager.get_dataset_config("REFIT")
+        if ds_config_refit:
+            for app_name, app_cfg in ds_config_refit.get("appliances", {}).items():
+                refit_appliance_params[app_name] = {
+                    k: v for k, v in app_cfg.items()
+                    if k in ["min_threshold", "max_threshold", "min_on_duration",
+                             "min_off_duration", "min_activation_time"]
+                }
+
         data_builder = REFIT_DataBuilder(
             data_path=f"{expes_config.data_path}/REFIT/RAW_DATA_CLEAN/",
             mask_app=expes_config.app,
             sampling_rate=expes_config.sampling_rate,
             window_size=expes_config.window_size,
             window_stride=window_stride,
+            use_status_from_kelly_paper=True,
+            appliance_params=refit_appliance_params if refit_appliance_params else None,
         )
 
         # Use ind_house_train_val/ind_house_test if available, else use house_with_app_i
@@ -1488,6 +1545,9 @@ def main(
 
     with open("configs/expes.yaml", "r", encoding="utf-8") as f:
         expes_config = yaml.safe_load(f)
+
+    # Initialize params_manager for dataset-specific config (used for default house splits)
+    params_manager = DatasetParamsManager()
 
     # Apply optional HPO overrides passed from CLI (e.g., Optuna best params)
     if getattr(args, "hpo_override", None):

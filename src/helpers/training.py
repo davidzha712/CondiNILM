@@ -328,7 +328,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     if expes_config.p_es is not None:
         callbacks.append(
             pl.callbacks.EarlyStopping(
-                monitor="val_loss", patience=expes_config.p_es, mode="min"
+                monitor="val_loss_main", patience=expes_config.p_es, mode="min"
             )
         )
     ckpt_root = os.path.join(
@@ -341,7 +341,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     os.makedirs(ckpt_root, exist_ok=True)
     ckpt_name = "ckpt"
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        monitor="val_loss",
+        monitor="val_loss_main",
         mode="min",
         save_top_k=1,
         save_last=True,
@@ -1092,7 +1092,7 @@ def tser_model_training(inst_model, tuple_data, expes_config):
     if expes_config.p_es is not None:
         callbacks.append(
             pl.callbacks.EarlyStopping(
-                monitor="val_loss", patience=expes_config.p_es, mode="min"
+                monitor="val_loss_main", patience=expes_config.p_es, mode="min"
             )
         )
     ckpt_root = os.path.join(
@@ -1105,7 +1105,7 @@ def tser_model_training(inst_model, tuple_data, expes_config):
     os.makedirs(ckpt_root, exist_ok=True)
     ckpt_name = "ckpt"
     checkpoint_callback = pl.callbacks.ModelCheckpoint(
-        monitor="val_loss",
+        monitor="val_loss_main",
         mode="min",
         save_top_k=1,
         save_last=True,

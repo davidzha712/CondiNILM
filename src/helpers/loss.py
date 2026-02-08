@@ -393,27 +393,25 @@ class AdaptiveDeviceLoss(nn.Module):
         Returns:
             Weight multiplier for this device's loss
         """
-        # V3: AGGRESSIVE weights for sparse devices to prevent gradient drowning
-        # in multi-device training. Sparse devices need MUCH stronger gradients
-        # to compete with frequent devices like Fridge.
-        # Problem: Kettle/Microwave collapse in multi-device training despite PCGrad
-        # Solution: Give sparse devices 5-10x weight advantage
+        # V8: Moderate weights for sparse devices — enough to prevent collapse,
+        # not so aggressive as to steal gradient from long-cycle devices (WM, DW).
+        # Max effective weight: 1.8 * 1.5 = 2.7x (down from 3.0 * 2.5 = 7.5x)
         base_weights = {
-            self.SPARSE_HIGH_POWER: 3.0,  # INCREASED from 1.5 - aggressive for sparse
-            self.SPARSE_LONG_CYCLE: 2.5,  # Between sparse and long_cycle
-            self.LONG_CYCLE: 1.3,         # INCREASED from 1.2
+            self.SPARSE_HIGH_POWER: 1.8,
+            self.SPARSE_LONG_CYCLE: 1.5,
+            self.LONG_CYCLE: 1.2,
             self.CYCLING: 1.0,
-            self.ALWAYS_ON: 0.8,          # DECREASED to give more relative weight to sparse
+            self.ALWAYS_ON: 0.8,
         }
         base = base_weights.get(device_type, 1.0)
 
         if not math.isfinite(mean_on) or mean_on <= 0:
             mean_on = 1.0
-        # V3: AGGRESSIVE duty factors for very sparse devices
+        # V8: Moderate duty factors — prevent gradient drowning without dominance
         if duty_cycle < 0.01:
-            duty_factor = 2.5  # INCREASED from 1.5 - ultra-sparse needs MUCH more weight
+            duty_factor = 1.5
         elif duty_cycle < 0.05:
-            duty_factor = 1.8  # INCREASED from 1.3
+            duty_factor = 1.3
         elif duty_cycle < 0.15:
             duty_factor = 1.1
         elif duty_cycle > 0.5:

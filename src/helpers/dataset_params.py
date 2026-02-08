@@ -212,10 +212,11 @@ class DatasetParamsManager:
 
         # Apply training config
         training = ds_config.get("training", {})
+        # Map dataset_params keys to actual config locations
+        _skip_keys = {"learning_rate", "weight_decay", "early_stopping_patience"}
         for key, value in training.items():
-            if key == "learning_rate":
-                # Special handling for nested model_training_param
-                pass  # Handled separately
+            if key in _skip_keys:
+                continue  # Handled by run_experiment.py key mapping
             elif not hasattr(expes_config, key) or getattr(expes_config, key) is None:
                 try:
                     expes_config[key] = value

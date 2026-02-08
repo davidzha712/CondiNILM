@@ -1052,8 +1052,8 @@ class SeqToSeqLightningModule(pl.LightningModule):
             + self.anti_collapse_weight * anti_scale * penalties["anti_collapse"]
         )
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
-        self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
-        # V8: Split loss logging for diagnostics
+        self.log("train_loss", loss, prog_bar=False, on_step=False, on_epoch=True)
+        # V8: Split loss logging — train_loss_main is comparable with val_loss_main
         aux_penalties = (
             penalties["zero_run"]
             + penalties["off_high_agg"]
@@ -1067,7 +1067,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
             + gate_window_scale * gate_window_loss
             + self.gate_duty_weight * gate_duty_loss
         )
-        self.log("train_loss_main", loss_main.detach(), on_step=False, on_epoch=True)
+        self.log("train_loss_main", loss_main.detach(), prog_bar=True, on_step=False, on_epoch=True)
         self.log("train_loss_aux", aux_penalties.detach(), on_step=False, on_epoch=True)
         self.log("train_loss_gate", gate_loss_total.detach(), on_step=False, on_epoch=True)
         return loss
@@ -1203,10 +1203,8 @@ class SeqToSeqLightningModule(pl.LightningModule):
 
         # Compute total loss for logging (sum of per-device losses)
         total_loss = sum(l.detach() for l in per_device_losses)
-        self.log("train_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True)
-        # V8: Split loss logging (matching normal path)
-        # total_loss = sum(weighted device losses) + aux_loss
-        # Decompose: main = total - aux, gate = gate subset of aux, penalty = aux - gate
+        self.log("train_loss", total_loss, prog_bar=False, on_step=False, on_epoch=True)
+        # V8: Split loss logging — train_loss_main is comparable with val_loss_main
         loss_main_det = (total_loss - aux_loss.detach())
         penalty_det = (
             penalties["zero_run"]
@@ -1221,7 +1219,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
             + self.gate_window_weight * gate_window_loss
             + self.gate_duty_weight * gate_duty_loss
         ).detach()
-        self.log("train_loss_main", loss_main_det, on_step=False, on_epoch=True)
+        self.log("train_loss_main", loss_main_det, prog_bar=True, on_step=False, on_epoch=True)
         self.log("train_loss_aux", penalty_det, on_step=False, on_epoch=True)
         self.log("train_loss_gate", gate_det, on_step=False, on_epoch=True)
 
@@ -1510,8 +1508,8 @@ class SeqToSeqLightningModule(pl.LightningModule):
             + self.anti_collapse_weight * anti_scale * penalties["anti_collapse"]
         )
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
-        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
-        # V8: Split loss logging for diagnostics
+        self.log("val_loss", loss, prog_bar=False, on_step=False, on_epoch=True)
+        # V8: Split loss logging — val_loss_main is comparable with train_loss_main
         aux_penalties = (
             penalties["zero_run"]
             + penalties["off_high_agg"]
@@ -1520,7 +1518,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
             + self.neg_penalty_weight * penalties["neg"]
             + self.anti_collapse_weight * anti_scale * penalties["anti_collapse"]
         )
-        self.log("val_loss_main", loss_main.detach(), on_step=False, on_epoch=True)
+        self.log("val_loss_main", loss_main.detach(), prog_bar=True, on_step=False, on_epoch=True)
         self.log("val_loss_aux", aux_penalties.detach(), on_step=False, on_epoch=True)
         return loss
 
@@ -1829,7 +1827,8 @@ class TserLightningModule(pl.LightningModule):
         pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
         loss = self.criterion(pred, target)
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
-        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_loss", loss, prog_bar=False, on_step=False, on_epoch=True)
+        self.log("val_loss_main", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def configure_optimizers(self):
@@ -1949,7 +1948,8 @@ class DiffNILMLightningModule(pl.LightningModule):
         pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
         loss = self.criterion(pred, target)
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
-        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_loss", loss, prog_bar=False, on_step=False, on_epoch=True)
+        self.log("val_loss_main", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def configure_optimizers(self):
@@ -2043,7 +2043,8 @@ class STNILMLightningModule(pl.LightningModule):
         pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
         loss = self.criterion(pred, target)
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
-        self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_loss", loss, prog_bar=False, on_step=False, on_epoch=True)
+        self.log("val_loss_main", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def configure_optimizers(self):

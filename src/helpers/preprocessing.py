@@ -456,7 +456,8 @@ class UKDALE_DataBuilder(object):
         window_stride=None,
         soft_label=False,
         use_status_from_kelly_paper=True,
-        use_appliance_aliases=True,  # Whether to use appliance aliases
+        use_appliance_aliases=True,
+        appliance_params=None,
     ):
         # =============== Class variables =============== #
         self.data_path = data_path
@@ -465,6 +466,7 @@ class UKDALE_DataBuilder(object):
         self.window_size = window_size
         self.soft_label = soft_label
         self.use_appliance_aliases = use_appliance_aliases
+        self._external_appliance_params = appliance_params
 
         if isinstance(self.mask_app, str):
             self.mask_app = [self.mask_app]
@@ -566,6 +568,14 @@ class UKDALE_DataBuilder(object):
                 "microwave": {"min_threshold": 200, "max_threshold": 6000},
                 "fridge": {"min_threshold": 50, "max_threshold": 300},
             }
+
+        # Override with external params if provided (from dataset_params.yaml)
+        if self._external_appliance_params is not None:
+            for app_name, params in self._external_appliance_params.items():
+                app_key = app_name.lower()
+                if app_key not in self.appliance_param:
+                    self.appliance_param[app_key] = {}
+                self.appliance_param[app_key].update(params)
 
     def get_house_data(self, house_indicies):
         assert len(house_indicies) == 1, (
@@ -931,14 +941,16 @@ class REFIT_DataBuilder(object):
         sampling_rate,
         window_size,
         window_stride=None,
-        use_status_from_kelly_paper=False,
+        use_status_from_kelly_paper=True,
         soft_label=False,
+        appliance_params=None,
     ):
         # =============== Class variables =============== #
         self.data_path = data_path
         self.mask_app = mask_app
         self.sampling_rate = sampling_rate
         self.soft_label = soft_label
+        self._external_appliance_params = appliance_params
 
         if isinstance(self.mask_app, str):
             self.mask_app = [self.mask_app]
@@ -1040,6 +1052,13 @@ class REFIT_DataBuilder(object):
                 "Microwave": {"min_threshold": 200, "max_threshold": 6000},
                 "Fridge": {"min_threshold": 50, "max_threshold": 300},
             }
+
+        # Override with external params if provided (from dataset_params.yaml)
+        if self._external_appliance_params is not None:
+            for app_name, params in self._external_appliance_params.items():
+                if app_name not in self.appliance_param:
+                    self.appliance_param[app_name] = {}
+                self.appliance_param[app_name].update(params)
 
     def get_house_data(self, house_indicies):
         assert len(house_indicies) == 1, (
