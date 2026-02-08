@@ -79,6 +79,8 @@ UKDALE:
     learning_rate: 1e-4
     weight_decay: 0.01
     early_stopping_patience: 5
+    limit_train_batches: 1.0
+    limit_val_batches: 1.0
 
   loss:
     loss_type: "multi_nilm"
@@ -276,6 +278,9 @@ REFIT:
       min_activation_time: 12
       device_type: "long_cycle"
       houses: [2, 5, 6, 7, 9, 15]
+      loss_override:
+        w_recall: 0.24       # Slightly above long_cycle default (0.22)
+        off_margin: 0.018    # Wider edge detection for REFIT long wash cycles
 
     WashingMachine:
       min_threshold: 50
@@ -285,6 +290,11 @@ REFIT:
       min_activation_time: 12
       device_type: "long_cycle"
       houses: [2, 5, 6, 7, 9, 15]
+      loss_override:
+        w_recall: 0.28       # WM needs stronger recall (complex multi-phase)
+        w_energy: 0.22       # Better energy tracking for variable power
+        alpha_on: 2.8        # Stronger ON detection
+        w_on_power: 0.14     # Better ON power accuracy
 
     Kettle:
       min_threshold: 2000
@@ -294,6 +304,9 @@ REFIT:
       min_activation_time: 1
       device_type: "sparse_high_power"
       houses: [2, 5, 6, 7, 9, 15]
+      loss_override:
+        alpha_on: 3.0        # Slightly higher than V8 default (2.8) for REFIT sparse kettle
+        w_off_fp: 0.08       # Lower FP penalty than MW - kettle has cleaner ON/OFF edges
 
     Fridge:
       min_threshold: 50

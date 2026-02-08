@@ -987,6 +987,17 @@ def launch_one_experiment(expes_config: OmegaConf):
     if os.path.isfile(cache_path):
         logging.info("Load cached preprocessed data from %s", cache_path)
         cache = torch.load(cache_path, weights_only=False)
+
+        # V8: Cache version check - warn if pre-fix cache (scaler fitted on all houses)
+        cache_ver = cache.get("cache_version", 1)
+        if cache_ver < 2:
+            logging.warning(
+                "STALE CACHE (v%d): %s was generated before V8 scaler fix. "
+                "Scaler may have been fitted on test data. Delete this file and re-run "
+                "to regenerate with train-only scaler.",
+                cache_ver, cache_path,
+            )
+
         tuple_data = cache["tuple_data"]
         scaler = cache["scaler"]
         expes_config.cutoff = cache["cutoff"]
@@ -1007,13 +1018,18 @@ def launch_one_experiment(expes_config: OmegaConf):
                 logging.info(f"Updated c_out from cache: {n_devices}")
 
         _apply_cutoff_to_loss_params(expes_config)
+        # V8: Use tuple_data[0] (train data) for loss config, not tuple_data[3] (all data)
         try:
-            if isinstance(tuple_data, tuple) and len(tuple_data) >= 4:
-                data_for_stats = tuple_data[3]
-                if isinstance(data_for_stats, np.ndarray):
+            if isinstance(tuple_data, tuple) and len(tuple_data) >= 1:
+                data_for_loss_cfg = tuple_data[0]
+                # Handle tser format: (X_train, y_train, st_date_train)
+                if isinstance(data_for_loss_cfg, tuple):
+                    data_for_loss_cfg = None  # Skip - tser format doesn't have raw windows
+                if isinstance(data_for_loss_cfg, np.ndarray):
                     _configure_nilm_loss_hyperparams(
-                        expes_config, data_for_stats, expes_config.threshold
+                        expes_config, data_for_loss_cfg, expes_config.threshold
                     )
+                    logging.info("Loss auto-config source: cached data_train (shape=%s)", data_for_loss_cfg.shape)
         except Exception:
             pass
 
@@ -1067,7 +1083,11 @@ def launch_one_experiment(expes_config: OmegaConf):
             window_stride=window_stride,
         )
 
-        data, st_date = data_builder.get_nilm_dataset(house_indicies=[1, 2, 3, 4, 5])
+        # V8: Only load train+test houses (not all 5) to avoid non-target house contamination
+        all_houses = list(set(
+            list(expes_config.ind_house_train_val) + list(expes_config.ind_house_test)
+        ))
+        data, st_date = data_builder.get_nilm_dataset(house_indicies=all_houses)
 
         if isinstance(expes_config.window_size, str):
             expes_config.window_size = data_builder.window_size
@@ -1310,6 +1330,20 @@ def launch_one_experiment(expes_config: OmegaConf):
 
     logging.info("             ... Done.")
 
+    # V8: Safety assertion — train and test houses must never overlap
+    _train_h = set(getattr(expes_config, "ind_house_train_val", []) or [])
+    _test_h = set(getattr(expes_config, "ind_house_test", []) or [])
+    if _train_h and _test_h:
+        _overlap = _train_h & _test_h
+        assert not _overlap, (
+            f"DATA LEAKAGE: train houses {sorted(_train_h)} and test houses {sorted(_test_h)} "
+            f"overlap on {sorted(_overlap)}. Fix datasets.yaml or CLI args."
+        )
+        logging.info(
+            "Split verified: train_houses=%s test_houses=%s (disjoint OK)",
+            sorted(_train_h), sorted(_test_h),
+        )
+
     app_key = expes_config.app
     if isinstance(app_key, Sequence) and not isinstance(app_key, (str, bytes)):
         candidates = [a for a in app_key if a in data_builder.appliance_param]
@@ -1318,7 +1352,9 @@ def launch_one_experiment(expes_config: OmegaConf):
         app_key = candidates[0]
     threshold = data_builder.appliance_param[app_key]["min_threshold"]
     expes_config.threshold = threshold
-    _configure_nilm_loss_hyperparams(expes_config, data, threshold)
+    # V8: Use train-only data for loss config to prevent test info leakage
+    _configure_nilm_loss_hyperparams(expes_config, data_train, threshold)
+    logging.info("Loss auto-config source: data_train only (%d windows, shape=%s)", data_train.shape[0], data_train.shape)
 
     # Re-apply YAML loss config AFTER auto-config to ensure YAML takes precedence
     for key, value in ds_loss.items():
@@ -1397,6 +1433,7 @@ def launch_one_experiment(expes_config: OmegaConf):
         "cutoff": expes_config.cutoff,
         "threshold": expes_config.threshold,
         "app_list": app_list_serializable,  # Save device names for visualization
+        "cache_version": 2,  # V8: scaler fit on train only, data excludes non-target houses
     }
     torch.save(cache, cache_path, pickle_protocol=4)
 
@@ -1579,7 +1616,8 @@ def main(
     # CRITICAL FIX: For REDD Multi mode, ensure consistent house configuration
     # Different REDD devices have different availability - use common houses
     is_multi_device = len(selected_keys) > 1 or appliance_lower == "multi"
-    if is_multi_device and dataset_key.startswith("REDD"):
+    # V8: Only apply default to exact "REDD" — REDD_STRESS has its own splits
+    if is_multi_device and dataset_key == "REDD":
         # If user didn't specify houses, use the recommended REDD multi-device config
         # Houses 1,2,3 have fridge, microwave, dishwasher with good activity
         if ind_house_train_val is None and ind_house_test is None:
@@ -1595,14 +1633,14 @@ def main(
     # - House 4: microwave channel is MIXED (washing_machine_microwave_breadmaker)
     # - House 5: microwave is noise data (mean_on=59W < 50W threshold)
     # - Houses 1, 2: All 5 devices have clean data
-    # Note: Use [1, 2] for both train and test to maximize sparse device events
-    if is_multi_device and dataset_key.startswith("UKDALE"):
+    # V8: Only apply default to exact "UKDALE" — UKDALE_EXT/UKDALE_BI have their own splits
+    if is_multi_device and dataset_key == "UKDALE":
         if ind_house_train_val is None and ind_house_test is None:
             logging.warning(
-                "UKDALE Multi mode: Using recommended house config [1,2] train, [2] test. "
-                "Houses 4,5 excluded due to microwave data quality issues."
+                "UKDALE Multi mode: Using recommended house config [1] train, [2] test. "
+                "Houses 3,4,5 excluded due to microwave data quality issues."
             )
-            expes_config["ind_house_train_val"] = [1, 2]
+            expes_config["ind_house_train_val"] = [1]
             expes_config["ind_house_test"] = [2]
 
     # Auto-select loss type for multi-device training

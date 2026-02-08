@@ -1134,6 +1134,16 @@ class SeqToSeqLightningModule(pl.LightningModule):
         gate_cls_loss = self._gate_focal_bce(gate, state) if state is not None else pred.new_tensor(0.0)
         gate_window_loss = self._gate_window_bce(gate, state) if state is not None else pred.new_tensor(0.0)
 
+        # V8: Compute gate_duty_loss (was missing from PCGrad path)
+        gate_duty_loss = pred.new_tensor(0.0)
+        if self.gate_duty_weight > 0.0 and gate_prob is not None and state is not None:
+            total_duty_loss = gate_prob.new_tensor(0.0)
+            for c in range(gate_prob.size(1)):
+                target_duty = torch.clamp(state[:, c, :].float().mean(), 0.0, 1.0)
+                pred_duty = torch.clamp(gate_prob[:, c, :].mean(), 0.0, 1.0)
+                total_duty_loss = total_duty_loss + F.mse_loss(pred_duty, target_duty)
+            gate_duty_loss = total_duty_loss / max(gate_prob.size(1), 1)
+
         # Compute penalties (these apply to all predictions collectively)
         penalties = self._compute_all_penalties(pred, target, state, ts_agg)
         anti_scale = self._compute_anti_collapse_scale(self.current_epoch)
@@ -1147,6 +1157,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
             + self.neg_penalty_weight * penalties["neg"]
             + self.gate_cls_weight * gate_cls_loss
             + self.gate_window_weight * gate_window_loss
+            + self.gate_duty_weight * gate_duty_loss
             + self.anti_collapse_weight * anti_scale * penalties["anti_collapse"]
         )
 
@@ -1181,6 +1192,26 @@ class SeqToSeqLightningModule(pl.LightningModule):
         # Compute total loss for logging (sum of per-device losses)
         total_loss = sum(l.detach() for l in per_device_losses)
         self.log("train_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True)
+        # V8: Split loss logging (matching normal path)
+        # total_loss = sum(weighted device losses) + aux_loss
+        # Decompose: main = total - aux, gate = gate subset of aux, penalty = aux - gate
+        loss_main_det = (total_loss - aux_loss.detach())
+        penalty_det = (
+            penalties["zero_run"]
+            + penalties["off_high_agg"]
+            + penalties["off_state_long"]
+            + penalties["off_state"]
+            + self.neg_penalty_weight * penalties["neg"]
+            + self.anti_collapse_weight * anti_scale * penalties["anti_collapse"]
+        ).detach()
+        gate_det = (
+            self.gate_cls_weight * gate_cls_loss
+            + self.gate_window_weight * gate_window_loss
+            + self.gate_duty_weight * gate_duty_loss
+        ).detach()
+        self.log("train_loss_main", loss_main_det, on_step=False, on_epoch=True)
+        self.log("train_loss_aux", penalty_det, on_step=False, on_epoch=True)
+        self.log("train_loss_gate", gate_det, on_step=False, on_epoch=True)
 
         # Log PCGrad statistics periodically
         if batch_idx % 100 == 0:
