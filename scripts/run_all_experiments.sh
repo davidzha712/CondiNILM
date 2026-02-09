@@ -1,8 +1,5 @@
 #!/usr/bin bash
 
-# Global parameters
-declare -a SEEDS=(0 1 2)
-
 declare -a DATASETS_1=("REFIT")
 declare -a APPLIANCES_1=("WashingMachine" "Dishwasher" "Kettle" "Microwave")
 
@@ -27,22 +24,18 @@ run_batch() {
     for appliance in "${arr_appliances[@]}"; do
       for win in "${arr_windows[@]}"; do
         for model in "${arr_models[@]}"; do
-          for seed in "${SEEDS[@]}"; do
-            echo "Running: uv run -m scripts.run_experiment \
-              --dataset $dataset \
-              --sampling_rate 1min \
-              --appliance $appliance \
-              --window_size $win \
-              --name_model $model \
-              --seed $seed"
-            uv run -m scripts.run_experiment \
-              --dataset "$dataset" \
-              --sampling_rate "1min" \
-              --appliance "$appliance" \
-              --window_size "$win" \
-              --name_model "$model" \
-              --seed "$seed"
-          done
+          echo "Running: uv run -m scripts.run_experiment \
+            --dataset $dataset \
+            --sampling_rate 1min \
+            --appliance $appliance \
+            --window_size $win \
+            --name_model $model"
+          uv run -m scripts.run_experiment \
+            --dataset "$dataset" \
+            --sampling_rate "1min" \
+            --appliance "$appliance" \
+            --window_size "$win" \
+            --name_model "$model"
         done
       done
     done

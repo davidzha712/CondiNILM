@@ -48,6 +48,9 @@ from src.helpers.dataset_params import (
 )
 
 
+FIXED_EXPERIMENT_SEED = 42
+
+
 # Helper functions for config management
 def _set_cfg_value(expes_config, key, value, default_value=None):
     """Set config value, optionally only if current equals default."""
@@ -107,6 +110,11 @@ def _apply_cutoff_to_loss_params(expes_config):
     except (ValueError, TypeError, AttributeError, ZeroDivisionError) as e:
         logging.debug("_apply_cutoff_to_loss_params failed: %s", e)
         return
+
+
+def _is_locked_seed_key(key):
+    key_norm = str(key).strip().lower()
+    return key_norm == "seed" or key_norm.endswith(".seed")
 
 
 def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
@@ -1002,6 +1010,9 @@ def launch_one_experiment(expes_config: OmegaConf):
         _ds_loss_keys = set(ds_loss.keys()) if ds_loss else set()
         skipped = []
         for key, value in hpo_override.items():
+            if _is_locked_seed_key(key):
+                skipped.append(key)
+                continue
             if key in _ds_loss_keys:
                 skipped.append(key)
                 continue  # Skip HPO params that the dataset explicitly overrides
@@ -1082,6 +1093,9 @@ def launch_one_experiment(expes_config: OmegaConf):
             applied = 0
             skipped = []
             for key, value in hpo_dict.items():
+                if _is_locked_seed_key(key):
+                    skipped.append(key)
+                    continue
                 if key in _ds_loss_keys:
                     skipped.append(key)
                     continue
@@ -1431,6 +1445,9 @@ def launch_one_experiment(expes_config: OmegaConf):
         applied = 0
         skipped = []
         for key, value in hpo_dict.items():
+            if _is_locked_seed_key(key):
+                skipped.append(key)
+                continue
             if key in _ds_loss_keys:
                 skipped.append(key)
                 continue
@@ -1506,7 +1523,6 @@ def main(
     window_size,
     appliance,
     name_model,
-    seed,
     resume,
     no_final_eval,
     loss_type=None,
@@ -1529,7 +1545,6 @@ def main(
         window_size (int or str): Size of the window (converted to int if possible not day, week or month).
         appliance (str): Selected appliance (case-insensitive).
         name_model (str): Name of the model to use for the experiment (case-insensitive).
-        seed (int): Random seed for reproducible splits/training.
         ind_house_train_val (list): Optional list of house indices for training/validation.
         ind_house_test (list): Optional list of house indices for testing.
         freeze_devices (list): Optional list of device names to freeze during training.
@@ -1537,7 +1552,7 @@ def main(
         sparse_lr_scale (float): Learning rate scale for sparse devices.
     """
 
-    seed = int(seed)
+    seed = FIXED_EXPERIMENT_SEED
 
     try:
         window_size = int(window_size)
@@ -1555,7 +1570,17 @@ def main(
 
     # Apply optional HPO overrides passed from CLI (e.g., Optuna best params)
     if getattr(args, "hpo_override", None):
-        expes_config["hpo_override"] = dict(args.hpo_override)
+        filtered_hpo = {}
+        dropped_hpo = []
+        for key, value in dict(args.hpo_override).items():
+            if _is_locked_seed_key(key):
+                dropped_hpo.append(key)
+                continue
+            filtered_hpo[key] = value
+        if dropped_hpo:
+            logging.warning("Ignoring locked seed override keys from hpo_override: %s", dropped_hpo)
+        if filtered_hpo:
+            expes_config["hpo_override"] = filtered_hpo
 
     with open("configs/datasets.yaml", "r", encoding="utf-8") as f:
         datasets_all = yaml.safe_load(f)
@@ -1658,7 +1683,7 @@ def main(
     logging.info("      Window Size: %s", window_size)
     logging.info("      Appliance : %s", appliance_log)
     logging.info("      Model: %s", model_key)
-    logging.info("      Seed: %s", seed)
+    logging.info("      Seed: %s (locked)", seed)
     logging.info("--------------------------------------------------")
 
     expes_config["dataset"] = dataset_key
@@ -1814,12 +1839,6 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for reproducibility (default: 42).",
-    )
-    parser.add_argument(
         "--resume",
         action="store_true",
         help="Resume training from existing checkpoint for the same experiment if available.",
@@ -1937,7 +1956,6 @@ if __name__ == "__main__":
         window_size=args.window_size,
         appliance=args.appliance,
         name_model=args.name_model,
-        seed=args.seed,
         resume=args.resume,
         no_final_eval=args.no_final_eval,
         loss_type=args.loss_type,

@@ -115,12 +115,6 @@ def main():
         ),
     )
     parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed forwarded to scripts.run_experiment (default: 42).",
-    )
-    parser.add_argument(
         "--stop_on_error",
         action="store_true",
         help="Stop batch at first failed subprocess (default: continue).",
@@ -160,8 +154,6 @@ def main():
             appliance,
             "--name_model",
             args.name_model,
-            "--seed",
-            str(int(args.seed)),
             "--epochs",
             str(int(args.epochs)),
         ]
