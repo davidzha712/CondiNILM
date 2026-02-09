@@ -69,7 +69,7 @@ UKDALE:
       device_type: "sparse_high_power"
       houses: [1, 2]
       loss_override:
-        w_off_fp: 0.12       # Extra FP penalty (lower power → more false positives)
+        w_off_fp: 0.09       # Reduced from 0.12 (MW regressed -0.055 in V8.1, FP penalty too strict)
         off_margin: 0.03     # Wider OFF dead zone
 
     fridge:
@@ -116,7 +116,7 @@ UKDALE:
       threshold: 800
       min_on_steps: 2
     microwave:
-      threshold: 300       # Lowered from 500 - soft gate reduces MW preds (~460W)
+      threshold: 260       # Lowered from 300 (gate attenuates MW preds, need lower threshold)
       min_on_steps: 1
     fridge:
       threshold: 18
@@ -162,7 +162,9 @@ REDD:
       activity_rates: {1: 1.14, 2: 10.71, 3: 0.74, 5: 7.46}
       redd_name: "microwave"
       loss_override:
-        w_off_fp: 0.12       # Extra FP penalty (lower power → more false positives)
+        loss_weight_multiplier: 1.6  # Boost MW loss weight (ultra-sparse <1.2% activity)
+        w_off_fp: 0.06       # Reduced FP penalty (MW collapsed at 0.12 → too aggressive)
+        w_recall: 0.22       # Stronger recall for sparse device recovery
         off_margin: 0.03     # Wider OFF dead zone
 
     dishwasher:
@@ -248,6 +250,7 @@ REDD:
     early_stopping_patience: 15
     limit_train_batches: 1.0
     limit_val_batches: 1.0
+    postprocess_use_gate: false   # REDD MW too sparse for gate postprocess (activity <1.2%)
     # Houses 1,2,3 have fridge+microwave+dishwasher with good activity
     default_multi_train: [1, 2]
     default_multi_test: [3]
@@ -273,7 +276,7 @@ REDD:
       threshold: 20
       min_on_steps: 2
     microwave:
-      threshold: 120
+      threshold: 90           # Lowered from 120 (help recover MW from collapse)
       min_on_steps: 1
     cooker:
       threshold: 50
@@ -308,7 +311,8 @@ REFIT:
       device_type: "long_cycle"
       houses: [2, 5, 6, 7, 9, 15]
       loss_override:
-        w_recall: 0.26       # Higher recall for REFIT DW (was under-detecting)
+        w_recall: 0.22       # Reduced from 0.26 (DW was over-predicting: P=0.358, R=0.856)
+        w_off_fp: 0.14       # Add FP penalty to curb over-prediction
         off_margin: 0.018    # Wider edge detection for REFIT long wash cycles
 
     WashingMachine:
@@ -372,8 +376,8 @@ REFIT:
 
   postprocess:
     Dishwasher:
-      threshold: 30            # Lower threshold for REFIT DW (was 150, too strict → low recall)
-      min_on_steps: 3
+      threshold: 50            # Raised from 30 (DW over-predicts, need stricter filter)
+      min_on_steps: 4          # Raised from 3 (filter short false-positive bursts)
     WashingMachine:
       threshold: 20
       min_on_steps: 3          # Lowered from 5 (WM has rapid transitions)
