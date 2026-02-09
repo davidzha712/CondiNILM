@@ -86,6 +86,7 @@ def run_single_appliance(appliance: str, args):
         "--sampling_rate", args.sampling_rate,
         "--window_size", str(args.window_size),
         "--name_model", args.model,
+        "--seed", str(int(args.seed)),
         "--epochs", str(args.epochs),
         "--batch_size", str(args.batch_size),
         "--ind_house_train_val", ",".join(map(str, houses_train)),
@@ -122,6 +123,7 @@ def main():
     parser.add_argument("--sampling_rate", default="1min", help="Sampling rate")
     parser.add_argument("--window_size", type=int, default=128, help="Window size")
     parser.add_argument("--model", default="NILMFormer", help="Model name")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--epochs", type=int, default=30, help="Number of epochs")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
     parser.add_argument("--overlap", type=float, default=0.75, help="Window overlap ratio")
@@ -136,7 +138,7 @@ def main():
 
     logger.info(f"Training REDD with appliances: {appliances}")
     logger.info(f"Configuration: sampling_rate={args.sampling_rate}, window_size={args.window_size}")
-    logger.info(f"Model: {args.model}, epochs={args.epochs}, batch_size={args.batch_size}")
+    logger.info(f"Model: {args.model}, seed={args.seed}, epochs={args.epochs}, batch_size={args.batch_size}")
 
     results = {}
     for appliance in appliances:

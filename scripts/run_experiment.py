@@ -1506,6 +1506,7 @@ def main(
     window_size,
     appliance,
     name_model,
+    seed,
     resume,
     no_final_eval,
     loss_type=None,
@@ -1528,6 +1529,7 @@ def main(
         window_size (int or str): Size of the window (converted to int if possible not day, week or month).
         appliance (str): Selected appliance (case-insensitive).
         name_model (str): Name of the model to use for the experiment (case-insensitive).
+        seed (int): Random seed for reproducible splits/training.
         ind_house_train_val (list): Optional list of house indices for training/validation.
         ind_house_test (list): Optional list of house indices for testing.
         freeze_devices (list): Optional list of device names to freeze during training.
@@ -1535,7 +1537,7 @@ def main(
         sparse_lr_scale (float): Learning rate scale for sparse devices.
     """
 
-    seed = 42
+    seed = int(seed)
 
     try:
         window_size = int(window_size)
@@ -1709,6 +1711,7 @@ def main(
         logging.info("Auto-selected 'multi_nilm' loss type for multi-device training")
     # Track CLI-explicit overrides so dataset_params.yaml won't clobber them
     _cli_overrides = set()
+    _cli_overrides.add("seed")
     if overlap is not None:
         expes_config["overlap"] = float(overlap)
         _cli_overrides.add("overlap")
@@ -1809,6 +1812,12 @@ if __name__ == "__main__":
         help="Name of the model for training (non-case-insensitive). Choices: {}.".format(
             _model_choices
         ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility (default: 42).",
     )
     parser.add_argument(
         "--resume",
@@ -1928,6 +1937,7 @@ if __name__ == "__main__":
         window_size=args.window_size,
         appliance=args.appliance,
         name_model=args.name_model,
+        seed=args.seed,
         resume=args.resume,
         no_final_eval=args.no_final_eval,
         loss_type=args.loss_type,
