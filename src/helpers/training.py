@@ -474,24 +474,44 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             output_ratio = float(getattr(expes_config, "output_ratio", 1.0))
 
             config_overrides = {}
-            # V14: Apply HPO params to ALL training (was n_app == 1 only)
-            # This enables HPO-discovered optimal alpha values for multi-device
-            lambda_energy = float(getattr(expes_config, "loss_lambda_energy", 1.0))
-            if lambda_energy > 0.0:
-                config_overrides["energy_weight_scale"] = lambda_energy
-            alpha_on = float(getattr(expes_config, "loss_alpha_on", 1.0))
-            if alpha_on > 0.0:
-                config_overrides["alpha_on_scale"] = alpha_on / 2.0
-            alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
-            if alpha_off > 0.0:
-                config_overrides["alpha_off_scale"] = alpha_off
-            lambda_recall = float(getattr(expes_config, "loss_lambda_on_recall", 1.0))
-            if lambda_recall > 0.0:
-                config_overrides["recall_weight_scale"] = lambda_recall
-            # V14: Also apply lambda_off_hard for multi-device
-            lambda_off_hard = float(getattr(expes_config, "loss_lambda_off_hard", 0.0))
-            if lambda_off_hard > 0.0:
-                config_overrides["lambda_off_hard_scale"] = lambda_off_hard
+            if n_app > 1:
+                # V14: Apply HPO params for multi-device training
+                # These scaling factors were tuned for multi-device and are safe there
+                lambda_energy = float(getattr(expes_config, "loss_lambda_energy", 1.0))
+                if lambda_energy > 0.0:
+                    config_overrides["energy_weight_scale"] = lambda_energy
+                alpha_on = float(getattr(expes_config, "loss_alpha_on", 1.0))
+                if alpha_on > 0.0:
+                    config_overrides["alpha_on_scale"] = alpha_on / 2.0
+                alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
+                if alpha_off > 0.0:
+                    config_overrides["alpha_off_scale"] = alpha_off
+                lambda_recall = float(getattr(expes_config, "loss_lambda_on_recall", 1.0))
+                if lambda_recall > 0.0:
+                    config_overrides["recall_weight_scale"] = lambda_recall
+                lambda_off_hard = float(getattr(expes_config, "loss_lambda_off_hard", 0.0))
+                if lambda_off_hard > 0.0:
+                    config_overrides["lambda_off_hard_scale"] = lambda_off_hard
+            else:
+                # V9-fix: Single-device mode — cap HPO scaling to prevent collapse.
+                # The expes.yaml HPO params were tuned for the old ga_eaec loss.
+                # When applied as multiplicative scales to AdaptiveDeviceLoss, they are
+                # too extreme for sparse devices (e.g., recall becomes 0.20 * 5.368 = 1.074).
+                # Solution: apply capped versions so cycling devices still get adequate
+                # ON-state incentive, but sparse devices don't get overwhelmed.
+                lambda_energy = float(getattr(expes_config, "loss_lambda_energy", 1.0))
+                if lambda_energy > 0.0:
+                    config_overrides["energy_weight_scale"] = min(lambda_energy, 1.0)
+                alpha_on = float(getattr(expes_config, "loss_alpha_on", 1.0))
+                if alpha_on > 0.0:
+                    config_overrides["alpha_on_scale"] = min(alpha_on / 2.0, 1.5)
+                alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
+                if alpha_off > 0.0:
+                    config_overrides["alpha_off_scale"] = min(alpha_off, 1.0)
+                lambda_recall = float(getattr(expes_config, "loss_lambda_on_recall", 1.0))
+                if lambda_recall > 0.0:
+                    config_overrides["recall_weight_scale"] = min(lambda_recall, 2.0)
+                logging.info("AdaptiveDeviceLoss: single-device mode, capped HPO config_overrides")
             if config_overrides:
                 logging.info("AdaptiveDeviceLoss config overrides: %s", config_overrides)
 
@@ -746,16 +766,13 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     elif accelerator == "gpu":
         device_type = str(getattr(expes_config, "device_type", "") or "")
         appliance_name = str(getattr(expes_config, "appliance", "") or "")
-        # Use FP32 precision to prevent numerical instability with mixed precision
-        # (bfloat16/float16 can cause NaN in model weights during training)
-        force_fp32 = True
-        if force_fp32:
-            precision = "32"
+        # V9: Enable mixed precision for RTX 5090 (32GB VRAM, bf16 native)
+        # Previous force_fp32=True was overly conservative.
+        # bf16-mixed is safe on Ampere+ GPUs and gives ~2x throughput.
+        if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
+            precision = "bf16-mixed"
         else:
-            if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
-                precision = "bf16-mixed"
-            else:
-                precision = "16-mixed"
+            precision = "16-mixed"
     tb_root = os.path.join("log", "tensorboard")
     os.makedirs(tb_root, exist_ok=True)
     tb_name = "{}_{}_{}_{}_{}".format(
@@ -981,6 +998,10 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     if appliance_name is not None:
         group_dir = os.path.join(group_dir, str(appliance_name))
     html_path = os.path.join(group_dir, "val_compare.html")
+
+    # V9: Save training curves after training completes
+    _save_training_curves(trainer, expes_config)
+
     logging.info(
         "Training and eval completed! Best checkpoint: %s, TensorBoard logdir: %s, HTML: %s",
         best_model_path,
@@ -1197,6 +1218,71 @@ def tser_model_training(inst_model, tuple_data, expes_config):
     return None
 
 
+def _save_experiment_config(expes_config):
+    """Save a JSON snapshot of the effective experiment config to the result directory."""
+    try:
+        from omegaconf import OmegaConf
+        result_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(expes_config.result_path))
+        )
+        group_dir = os.path.join(
+            result_root,
+            "{}_{}".format(expes_config.dataset, expes_config.sampling_rate),
+            str(expes_config.window_size),
+        )
+        appliance_name = getattr(expes_config, "appliance", None)
+        if appliance_name is not None:
+            group_dir = os.path.join(group_dir, str(appliance_name))
+        os.makedirs(group_dir, exist_ok=True)
+        cfg_path = os.path.join(group_dir, "experiment_config.json")
+        cfg_dict = OmegaConf.to_container(expes_config, resolve=True)
+        # Remove large/non-serializable fields
+        for key in ("device_stats_for_loss", "loss_params_per_device",
+                     "postprocess_per_device", "device_type_per_device",
+                     "_cli_overrides"):
+            cfg_dict.pop(key, None)
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg_dict, f, indent=2, default=str)
+        logging.info("Saved experiment config snapshot: %s", cfg_path)
+    except Exception as e:
+        logging.warning("Could not save experiment config snapshot: %s", e)
+
+
+def _save_training_curves(trainer, expes_config):
+    """Save per-epoch training curves (from TensorBoard logged metrics) as JSON."""
+    try:
+        result_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(expes_config.result_path))
+        )
+        group_dir = os.path.join(
+            result_root,
+            "{}_{}".format(expes_config.dataset, expes_config.sampling_rate),
+            str(expes_config.window_size),
+        )
+        appliance_name = getattr(expes_config, "appliance", None)
+        if appliance_name is not None:
+            group_dir = os.path.join(group_dir, str(appliance_name))
+        os.makedirs(group_dir, exist_ok=True)
+        curves_path = os.path.join(group_dir, "training_curves.json")
+
+        # Extract logged metrics from trainer callback_metrics history
+        curves = {"epochs": [], "train_loss": [], "val_loss": [], "val_F1": []}
+        for cb in trainer.callbacks:
+            if isinstance(cb, ValidationNILMMetricCallback) and hasattr(cb, "epoch_records"):
+                for rec in cb.epoch_records:
+                    curves["epochs"].append(rec.get("epoch", 0))
+                    curves["val_loss"].append(rec.get("val_loss", None))
+                    f1 = rec.get("f1", rec.get("F1", None))
+                    curves["val_F1"].append(f1)
+                break
+
+        with open(curves_path, "w", encoding="utf-8") as f:
+            json.dump(curves, f, indent=2, default=str)
+        logging.info("Saved training curves: %s", curves_path)
+    except Exception as e:
+        logging.warning("Could not save training curves: %s", e)
+
+
 def launch_models_training(data_tuple, scaler, expes_config):
     if "cutoff" in expes_config.model_kwargs:
         expes_config.model_kwargs.cutoff = expes_config.cutoff
@@ -1204,19 +1290,33 @@ def launch_models_training(data_tuple, scaler, expes_config):
     if "threshold" in expes_config.model_kwargs:
         expes_config.model_kwargs.threshold = expes_config.threshold
 
-    if expes_config.name_model == "NILMFormer" and scaler is not None:
+    # V9: Save experiment config snapshot before training
+    _save_experiment_config(expes_config)
+
+    # Sync model output channels with number of appliances from scaler
+    if scaler is not None:
         try:
             n_app = int(getattr(scaler, "n_appliance", 1) or 1)
         except Exception:
             n_app = 1
         if n_app < 1:
             n_app = 1
+
+        # Map c_out to the correct model-specific parameter name
+        # CNN1D/UNET_NILM use "num_classes", BiGRU uses "out_channels",
+        # BERT4NILM/Energformer/STNILM/NILMFormer use "c_out"
+        _OUTPUT_PARAM_MAP = {
+            "CNN1D": "num_classes",
+            "UNET_NILM": "num_classes",
+            "BiGRU": "out_channels",
+        }
+        param_name = _OUTPUT_PARAM_MAP.get(expes_config.name_model, "c_out")
         try:
-            expes_config.model_kwargs["c_out"] = n_app
+            expes_config.model_kwargs[param_name] = n_app
         except (TypeError, KeyError):
             try:
                 tmp_kwargs = dict(expes_config.model_kwargs)
-                tmp_kwargs["c_out"] = n_app
+                tmp_kwargs[param_name] = n_app
                 expes_config.model_kwargs = tmp_kwargs
             except (TypeError, AttributeError):
                 pass

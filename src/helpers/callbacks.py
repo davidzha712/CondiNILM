@@ -104,6 +104,7 @@ class ValidationNILMMetricCallback(pl.Callback):
         self.expes_config = expes_config
         self.metrics = NILMmetrics()
         self.adaptive_tuner = AdaptiveLossTuner()
+        self.epoch_records = []  # V9: track per-epoch metrics for training curves
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if getattr(trainer, "sanity_checking", False):
@@ -793,6 +794,16 @@ class ValidationNILMMetricCallback(pl.Callback):
         }
         _append_jsonl(os.path.join(group_dir, "val_report.jsonl"), record)
         logging.info("VAL_REPORT_JSON: %s", json.dumps(_to_jsonable(record), ensure_ascii=False))
+
+        # V9: Track per-epoch metrics for training curves
+        curve_rec = {
+            "epoch": int(trainer.current_epoch),
+            "val_loss": float(trainer.callback_metrics.get("val_loss_main", float("nan"))),
+        }
+        if isinstance(metrics_timestamp, dict):
+            curve_rec["f1"] = metrics_timestamp.get("F1", None)
+            curve_rec["mae"] = metrics_timestamp.get("MAE", None)
+        self.epoch_records.append(curve_rec)
 
         # Adaptive loss tuning using AdaptiveLossTuner
         try:

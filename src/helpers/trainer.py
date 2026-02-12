@@ -1082,11 +1082,17 @@ class SeqToSeqLightningModule(pl.LightningModule):
         opt = self.optimizers()
 
         # Forward pass
-        power, gate = self.model.forward_with_gate(ts_agg)
-        power = torch.nan_to_num(power, nan=0.0, posinf=1e4, neginf=-1e4)
-        gate = torch.nan_to_num(gate, nan=0.0, posinf=1e4, neginf=-1e4)
-        pred, gate_prob = self._apply_soft_gate(power, gate)
-        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+        if hasattr(self.model, "forward_with_gate"):
+            power, gate = self.model.forward_with_gate(ts_agg)
+            power = torch.nan_to_num(power, nan=0.0, posinf=1e4, neginf=-1e4)
+            gate = torch.nan_to_num(gate, nan=0.0, posinf=1e4, neginf=-1e4)
+            pred, gate_prob = self._apply_soft_gate(power, gate)
+            pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+        else:
+            pred = self(ts_agg)
+            pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+            gate = None
+            gate_prob = None
 
         # Apply output_ratio center cropping (seq2subseq) - MUST match AdaptiveDeviceLoss.forward
         output_ratio = getattr(self.criterion, 'output_ratio', 1.0)
@@ -1124,8 +1130,8 @@ class SeqToSeqLightningModule(pl.LightningModule):
             per_device_losses.append(weight * loss_c)
 
         # Add gate classification loss (shared across devices, not per-device)
-        gate_cls_loss = self._gate_focal_bce(gate, state) if state is not None else pred.new_tensor(0.0)
-        gate_window_loss = self._gate_window_bce(gate, state) if state is not None else pred.new_tensor(0.0)
+        gate_cls_loss = self._gate_focal_bce(gate, state) if (gate is not None and state is not None) else pred.new_tensor(0.0)
+        gate_window_loss = self._gate_window_bce(gate, state) if (gate is not None and state is not None) else pred.new_tensor(0.0)
 
         # V8: Compute gate_duty_loss (was missing from PCGrad path)
         gate_duty_loss = pred.new_tensor(0.0)
@@ -1297,11 +1303,17 @@ class SeqToSeqLightningModule(pl.LightningModule):
         param_groups = self._get_device_param_groups()
 
         # Forward pass
-        power, gate = self.model.forward_with_gate(ts_agg)
-        power = torch.nan_to_num(power, nan=0.0, posinf=1e4, neginf=-1e4)
-        gate = torch.nan_to_num(gate, nan=0.0, posinf=1e4, neginf=-1e4)
-        pred, gate_prob = self._apply_soft_gate(power, gate)
-        pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+        if hasattr(self.model, "forward_with_gate"):
+            power, gate = self.model.forward_with_gate(ts_agg)
+            power = torch.nan_to_num(power, nan=0.0, posinf=1e4, neginf=-1e4)
+            gate = torch.nan_to_num(gate, nan=0.0, posinf=1e4, neginf=-1e4)
+            pred, gate_prob = self._apply_soft_gate(power, gate)
+            pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+        else:
+            pred = self(ts_agg)
+            pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+            gate = None
+            gate_prob = None
 
         # Apply output_ratio center cropping (seq2subseq)
         output_ratio = getattr(self.criterion, 'output_ratio', 1.0)
@@ -1339,8 +1351,8 @@ class SeqToSeqLightningModule(pl.LightningModule):
             per_device_losses.append(weight * loss_c)
 
         # Add gate classification loss (shared across devices)
-        gate_cls_loss = self._gate_focal_bce(gate, state) if state is not None else pred.new_tensor(0.0)
-        gate_window_loss = self._gate_window_bce(gate, state) if state is not None else pred.new_tensor(0.0)
+        gate_cls_loss = self._gate_focal_bce(gate, state) if (gate is not None and state is not None) else pred.new_tensor(0.0)
+        gate_window_loss = self._gate_window_bce(gate, state) if (gate is not None and state is not None) else pred.new_tensor(0.0)
 
         # Compute penalties
         penalties = self._compute_all_penalties(pred, target, state, ts_agg)
@@ -1520,8 +1532,8 @@ class SeqToSeqLightningModule(pl.LightningModule):
         - Loshchilov & Hutter "Decoupled Weight Decay Regularization" (AdamW)
         - Recent LLM training: warmup + cosine decay is standard
         """
-        # Ensure weight_decay is not zero for regularization
-        effective_wd = self.weight_decay if self.weight_decay > 0 else 0.01
+        # Respect configured weight_decay (baselines may intentionally set wd=0)
+        effective_wd = self.weight_decay
 
         # Collect all learnable parameters:
         # 1. Model parameters (main network)

@@ -90,8 +90,8 @@ UKDALE:
     learning_rate: 1e-4
     weight_decay: 0.01
     early_stopping_patience: 5
-    limit_train_batches: 1.0
-    limit_val_batches: 1.0
+    limit_train_batches: 0.1   # V9-fix: 10% sampling per epoch (prevents collapse)
+    limit_val_batches: 0.2     # V9-fix: 20% validation matches working config
     # Default multi-device house split (used when datasets.yaml has no entry)
     # Houses 1,2 have all 5 devices with clean data; 3,4,5 have MW quality issues
     default_multi_train: [1]
@@ -248,8 +248,8 @@ REDD:
     learning_rate: 5e-5
     weight_decay: 0.02
     early_stopping_patience: 15
-    limit_train_batches: 1.0
-    limit_val_batches: 1.0
+    limit_train_batches: 0.1   # V9-fix: 10% sampling per epoch (prevents collapse)
+    limit_val_batches: 0.2     # V9-fix: 20% validation matches working config
     postprocess_use_gate: false   # REDD MW too sparse for gate postprocess (activity <1.2%)
     # Houses 1,2,3 have fridge+microwave+dishwasher with good activity
     default_multi_train: [1, 2]
@@ -359,8 +359,8 @@ REFIT:
     learning_rate: 1e-4
     weight_decay: 0.01
     early_stopping_patience: 5
-    limit_train_batches: 1.0
-    limit_val_batches: 1.0
+    limit_train_batches: 0.1   # V9-fix: 10% sampling per epoch (prevents collapse)
+    limit_val_batches: 0.2     # V9-fix: 20% validation matches working config
     # Houses [2,5,6,9] train, [7,15] test — good coverage for all 4 devices
     default_multi_train: [2, 5, 6, 9]
     default_multi_test: [7, 15]

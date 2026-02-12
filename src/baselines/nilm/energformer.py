@@ -376,9 +376,8 @@ class Energformer(nn.Module):
         # Input as [batch, c_in, seq_length]
 
         # Forward embedding, permute and add PE
-        x = self.embedding(x).permute(0, 2, 1) + self.pe(
-            x
-        )  # [batch, seq_length, d_model]
+        x = self.embedding(x).permute(0, 2, 1)  # [batch, seq_length, d_model]
+        x = x + self.pe(x)  # PE indexes by x.size(1)=seq_length
 
         # Transformer Block
         x = self.encoder(x)  # [batch, seq_length, d_model]

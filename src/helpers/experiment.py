@@ -195,11 +195,10 @@ def get_device():
 
 
 def _get_num_workers(num_workers):
-    if platform.system() == "Windows":
-        return 0
     cpu_count = os.cpu_count()
     if cpu_count is None or cpu_count < 1:
         cpu_count = 1
+
     if isinstance(num_workers, int):
         if num_workers <= 0:
             return 0
@@ -207,6 +206,11 @@ def _get_num_workers(num_workers):
             return cpu_count
         return num_workers
 
+    # Windows uses spawn (not fork) for multiprocessing, which pickles the entire
+    # Dataset object through a pipe to each worker. For large multi-device datasets
+    # (e.g. 5 devices x 53K samples = ~327MB), this exceeds the pipe buffer limit
+    # and crashes with OSError: [Errno 22]. Default to 0 workers on Windows.
+    # Users can still override via num_workers in config/HPO if their dataset fits.
     if platform.system() == "Windows":
         return 0
 
@@ -246,36 +250,49 @@ def get_model_instance(name_model, c_in, window_size, **kwargs):
     """
     Get model instances
     """
+    # Filter kwargs to only pass parameters the model actually accepts
+    def _filter_kwargs(cls, extra_kwargs):
+        import inspect
+        sig = inspect.signature(cls.__init__)
+        valid_params = set(sig.parameters.keys()) - {"self"}
+        has_var_keyword = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        )
+        if has_var_keyword:
+            return extra_kwargs  # Model accepts **kwargs, pass everything
+        return {k: v for k, v in extra_kwargs.items() if k in valid_params}
+
     if name_model == "BiGRU":
-        inst = BiGRU(c_in=c_in, **kwargs)
+        inst = BiGRU(c_in=c_in, window_size=window_size, **_filter_kwargs(BiGRU, kwargs))
     elif name_model == "BiLSTM":
-        inst = BiLSTM(c_in=c_in, window_size=window_size, **kwargs)
+        inst = BiLSTM(c_in=c_in, window_size=window_size, **_filter_kwargs(BiLSTM, kwargs))
     elif name_model == "CNN1D":
-        inst = CNN1D(c_in=c_in, window_size=window_size, **kwargs)
-    elif name_model == "UNetNILM":
-        inst = UNetNiLM(c_in=c_in, window_size=window_size, **kwargs)
+        inst = CNN1D(c_in=c_in, window_size=window_size, **_filter_kwargs(CNN1D, kwargs))
+    elif name_model in ("UNetNILM", "UNET_NILM"):
+        inst = UNetNiLM(c_in=c_in, window_size=window_size, **_filter_kwargs(UNetNiLM, kwargs))
     elif name_model == "FCN":
-        inst = FCN(c_in=c_in, window_size=window_size, **kwargs)
+        inst = FCN(c_in=c_in, window_size=window_size, **_filter_kwargs(FCN, kwargs))
     elif name_model == "BERT4NILM":
-        inst = BERT4NILM(c_in=c_in, window_size=window_size, **kwargs)
+        inst = BERT4NILM(c_in=c_in, window_size=window_size, **_filter_kwargs(BERT4NILM, kwargs))
     elif name_model == "STNILM":
-        inst = STNILM(c_in=c_in, window_size=window_size, **kwargs)
+        inst = STNILM(c_in=c_in, window_size=window_size, **_filter_kwargs(STNILM, kwargs))
     elif name_model == "DResNet":
-        inst = DResNet(c_in=c_in, window_size=window_size, **kwargs)
+        inst = DResNet(c_in=c_in, window_size=window_size, **_filter_kwargs(DResNet, kwargs))
     elif name_model == "DAResNet":
-        inst = DAResNet(c_in=c_in, window_size=window_size, **kwargs)
+        inst = DAResNet(c_in=c_in, window_size=window_size, **_filter_kwargs(DAResNet, kwargs))
     elif name_model == "DiffNILM":
-        inst = DiffNILM(**kwargs)
+        inst = DiffNILM(**_filter_kwargs(DiffNILM, kwargs))
     elif name_model == "TSILNet":
-        inst = TSILNet(c_in=c_in, window_size=window_size, **kwargs)
+        inst = TSILNet(c_in=c_in, window_size=window_size, **_filter_kwargs(TSILNet, kwargs))
     elif name_model == "Energformer":
-        inst = Energformer(c_in=c_in, **kwargs)
+        inst = Energformer(c_in=c_in, **_filter_kwargs(Energformer, kwargs))
     elif name_model == "ConvNet":
-        inst = ConvNet(in_channels=1, nb_class=1, **kwargs)
+        inst = ConvNet(in_channels=1, nb_class=1, **_filter_kwargs(ConvNet, kwargs))
     elif name_model == "ResNet":
-        inst = ResNet(in_channels=1, nb_class=1, **kwargs)
+        inst = ResNet(in_channels=1, nb_class=1, **_filter_kwargs(ResNet, kwargs))
     elif name_model == "Inception":
-        inst = Inception(in_channels=1, nb_class=1, **kwargs)
+        inst = Inception(in_channels=1, nb_class=1, **_filter_kwargs(Inception, kwargs))
     elif name_model == "NILMFormer":
         cfg = kwargs.copy()
         c_out = int(cfg.get("c_out", 1))

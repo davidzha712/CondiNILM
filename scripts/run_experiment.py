@@ -905,12 +905,48 @@ def launch_one_experiment(expes_config: OmegaConf):
         except Exception:
             pass
 
+    # dataset_params.yaml loss config is NILMFormer-specific (multi_nilm loss,
+    # seq2subseq output_ratio, anti-collapse penalties). Only apply to NILMFormer.
+    # Other models use their own loss_type from baseline_configs.yaml or expes.yaml.
+    _model_name = str(getattr(expes_config, "name_model", "")).lower()
+    _is_nilmformer = _model_name == "nilmformer"
     for key, value in ds_loss.items():
+        if key in _cli_overrides:
+            logging.info(f"Skipping dataset loss config {key}={value} (CLI override)")
+            continue
+        if not _is_nilmformer:
+            logging.info(f"Skipping dataset loss config {key}={value} (non-NILMFormer model)")
+            continue
         try:
             expes_config[key] = value
             logging.info(f"Applied dataset loss config: {key}={value}")
         except Exception:
             pass
+
+    # For non-NILMFormer models, override NILMFormer-specific defaults from expes.yaml
+    # back to baseline-safe values. expes.yaml is the NILMFormer project config and has:
+    #   loss_type: multi_nilm     -> baselines need smoothl1
+    #   output_ratio: 0.75        -> baselines need 1.0 (full sequence)
+    #   train_num_crops: 4        -> baselines need 1 (BERT4NILM crashes with multi-crop)
+    # These are only overridden if the user didn't explicitly set them via CLI/HPO.
+    if not _is_nilmformer:
+        if "loss_type" not in _cli_overrides:
+            expes_config["loss_type"] = "smoothl1"
+            logging.info("Non-NILMFormer model: set loss_type=smoothl1 (override expes.yaml default)")
+        if "output_ratio" not in _cli_overrides:
+            expes_config["output_ratio"] = 1.0
+            logging.info("Non-NILMFormer model: set output_ratio=1.0 (override expes.yaml default)")
+        # Multi-crop augmentation changes input length, which breaks models with fixed
+        # positional embeddings (BERT4NILM: LPPool1d halves seq to 48, but PE expects 64)
+        cur_crops = int(getattr(expes_config, "train_num_crops", 1))
+        if cur_crops > 1:
+            expes_config["train_num_crops"] = 1
+            logging.info("Non-NILMFormer model: set train_num_crops=1 (override expes.yaml default of %d)", cur_crops)
+        # limit_train/val_batches: respect expes.yaml / hpo_override values for all models.
+        # V9 showed that forcing 1.0 causes transformer baselines (BERT4NILM, Energformer)
+        # to collapse, while simple models (CNN1D, BiGRU) work fine with either setting.
+        # Let each model's config decide; hpo_override can further customize per-model.
+
     ds_post = params_manager.get_postprocess_config(dataset_name)
     if isinstance(ds_post, dict) and ds_post:
         base_per_device = getattr(expes_config, "postprocess_per_device", None)
@@ -1004,10 +1040,9 @@ def launch_one_experiment(expes_config: OmegaConf):
     if hpo_override is not None and hasattr(hpo_override, 'items'):
         # V8: UNIFIED HPO guard — same logic for ALL datasets.
         # HPO params apply UNLESS the dataset's ds_loss explicitly overrides them.
-        # E.g. UKDALE ds_loss has output_ratio/anti_collapse → those are protected.
-        # E.g. REFIT ds_loss has output_ratio → that is protected.
-        # HPO params not in ds_loss (alpha_on, gate params, etc.) pass through for all.
-        _ds_loss_keys = set(ds_loss.keys()) if ds_loss else set()
+        # For non-NILMFormer models, ds_loss was not applied, so don't protect those keys
+        # (allow HPO to set loss_type, output_ratio, etc. from baseline_configs.yaml).
+        _ds_loss_keys = set(ds_loss.keys()) if (ds_loss and _is_nilmformer) else set()
         skipped = []
         for key, value in hpo_override.items():
             if _is_locked_seed_key(key):
@@ -1022,6 +1057,14 @@ def launch_one_experiment(expes_config: OmegaConf):
                 pass
         if skipped:
             logging.info("HPO override for %s: applied all except ds_loss keys %s", dataset_name, skipped)
+        # V9: Map flat 'lr' key to model_training_param.lr for baseline configs
+        hpo_lr = hpo_override.get("lr") if hasattr(hpo_override, "get") else None
+        if hpo_lr is not None:
+            try:
+                expes_config.model_training_param.lr = float(hpo_lr)
+                logging.info("HPO override: set model_training_param.lr = %s", hpo_lr)
+            except Exception:
+                pass
 
     # Get dynamic output channels (number of devices)
     app_list = getattr(expes_config, "app", None)
@@ -1079,16 +1122,23 @@ def launch_one_experiment(expes_config: OmegaConf):
         except Exception:
             pass
 
-        for key, value in ds_loss.items():
-            try:
-                expes_config[key] = value
-                logging.info(f"Re-applied dataset loss config (after auto-config): {key}={value}")
-            except Exception:
-                pass
+        # Only re-apply ds_loss for NILMFormer (dataset_params loss is NILMFormer-specific)
+        if _is_nilmformer:
+            for key, value in ds_loss.items():
+                if key in _cli_overrides:
+                    logging.info(f"Skipping dataset loss re-apply {key}={value} (CLI override)")
+                    continue
+                try:
+                    expes_config[key] = value
+                    logging.info(f"Re-applied dataset loss config (after auto-config): {key}={value}")
+                except Exception:
+                    pass
         hpo_override = getattr(expes_config, "hpo_override", None)
         # Fix: OmegaConf DictConfig is not isinstance(dict), check for items() method
         if hpo_override is not None and hasattr(hpo_override, 'items'):
-            _ds_loss_keys = set(ds_loss.keys()) if ds_loss else set()
+            # For NILMFormer, ds_loss keys are protected from HPO override.
+            # For baselines, ds_loss was not applied, so don't protect those keys.
+            _ds_loss_keys = set(ds_loss.keys()) if (ds_loss and _is_nilmformer) else set()
             hpo_dict = dict(hpo_override)
             applied = 0
             skipped = []
@@ -1105,6 +1155,14 @@ def launch_one_experiment(expes_config: OmegaConf):
                 except Exception as e:
                     logging.warning("Failed to apply HPO override %s=%s: %s", key, value, e)
             logging.info("Applied %d/%d HPO overrides (cached branch, dataset=%s, skipped ds_loss keys: %s)", applied, len(hpo_dict), dataset_name, skipped)
+            # V9: Map flat 'lr' key to model_training_param.lr for baseline configs
+            hpo_lr = hpo_dict.get("lr")
+            if hpo_lr is not None:
+                try:
+                    expes_config.model_training_param.lr = float(hpo_lr)
+                    logging.info("HPO override (cached): set model_training_param.lr = %s", hpo_lr)
+                except Exception:
+                    pass
 
         return launch_models_training(tuple_data, scaler, expes_config)
 
@@ -1431,16 +1489,21 @@ def launch_one_experiment(expes_config: OmegaConf):
     logging.info("Loss auto-config source: data_train only (%d windows, shape=%s)", data_train.shape[0], data_train.shape)
 
     # Re-apply YAML loss config AFTER auto-config to ensure YAML takes precedence
-    for key, value in ds_loss.items():
-        try:
-            expes_config[key] = value
-            logging.info(f"Re-applied dataset loss config (after auto-config): {key}={value}")
-        except Exception:
-            pass
+    # Only for NILMFormer (dataset_params loss config is NILMFormer-specific)
+    if _is_nilmformer:
+        for key, value in ds_loss.items():
+            if key in _cli_overrides:
+                logging.info(f"Skipping dataset loss re-apply {key}={value} (CLI override)")
+                continue
+            try:
+                expes_config[key] = value
+                logging.info(f"Re-applied dataset loss config (after auto-config): {key}={value}")
+            except Exception:
+                pass
     hpo_override = getattr(expes_config, "hpo_override", None)
     # Fix: OmegaConf DictConfig is not isinstance(dict), check for items() method
     if hpo_override is not None and hasattr(hpo_override, 'items'):
-        _ds_loss_keys = set(ds_loss.keys()) if ds_loss else set()
+        _ds_loss_keys = set(ds_loss.keys()) if (ds_loss and _is_nilmformer) else set()
         hpo_dict = dict(hpo_override)
         applied = 0
         skipped = []
@@ -1534,6 +1597,7 @@ def main(
     freeze_devices=None,
     load_pretrained=None,
     sparse_lr_scale=1.0,
+    experiment_tag=None,
 ):
     """
     Main function to load configuration, update it with parameters,
@@ -1687,6 +1751,10 @@ def main(
     logging.info("--------------------------------------------------")
 
     expes_config["dataset"] = dataset_key
+    # Append experiment tag to appliance name for separate result directories
+    if experiment_tag:
+        appliance_cfg_name = f"{appliance_cfg_name}_{experiment_tag}"
+        logging.info("      Experiment tag: %s → appliance dir: %s", experiment_tag, appliance_cfg_name)
     expes_config["appliance"] = appliance_cfg_name
     expes_config["window_size"] = window_size
     expes_config["sampling_rate"] = sampling_rate
@@ -1737,6 +1805,8 @@ def main(
     # Track CLI-explicit overrides so dataset_params.yaml won't clobber them
     _cli_overrides = set()
     _cli_overrides.add("seed")
+    if loss_type is not None:
+        _cli_overrides.add("loss_type")
     if overlap is not None:
         expes_config["overlap"] = float(overlap)
         _cli_overrides.add("overlap")
@@ -1918,6 +1988,12 @@ if __name__ == "__main__":
         default=None,
         help="JSON string to override expes_config hyperparameters (same keys as Optuna params).",
     )
+    parser.add_argument(
+        "--experiment_tag",
+        type=str,
+        default=None,
+        help="Tag appended to appliance dir name for separate results (e.g., 'A1_no_film').",
+    )
 
     args = parser.parse_args()
     # Optional: allow CLI JSON overrides (same key names as Optuna params)
@@ -1967,4 +2043,5 @@ if __name__ == "__main__":
         freeze_devices=freeze_devices,
         load_pretrained=args.load_pretrained,
         sparse_lr_scale=args.sparse_lr_scale,
+        experiment_tag=args.experiment_tag,
     )

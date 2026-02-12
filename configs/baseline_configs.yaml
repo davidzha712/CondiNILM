@@ -1,0 +1,114 @@
+# Per-model training profiles for baseline comparison experiments.
+#
+# Each baseline gets neutral/standard training settings (not NILMFormer-centric).
+# NILMFormer keeps its own optimized config from expes.yaml + models.yaml.
+#
+# Author: Siyi Li
+
+# === Shared baseline defaults (neutral, non-NILMFormer-centric) ===
+_baseline_defaults: &baseline_defaults
+  loss_type: smoothl1                # Standard loss, NOT custom adaptive
+  scheduler_type: plateau            # ReduceLROnPlateau (neutral, not cosine_warmup)
+  output_ratio: 1.0                  # Full sequence supervision (no seq2subseq)
+  train_num_crops: 1                 # Baselines use fixed-length FC layers
+  p_es: 10                           # Early stopping patience
+  p_rlr: 5                           # Plateau patience
+  n_warmup_epochs: 0                 # No warmup (not needed for plateau)
+  gate_cls_weight: 0                 # No gate (NILMFormer feature)
+  gate_window_weight: 0
+  anti_collapse_weight: 0            # No anti-collapse penalty
+  state_zero_penalty_weight: 0       # No zero-run penalty
+  off_high_agg_penalty_weight: 0     # No agg penalty
+  use_gradient_conflict_resolution: false  # No PCGrad
+  balance_window_sampling: false     # No balanced sampling
+
+# === Per-model configs ===
+BiLSTM:
+  <<: *baseline_defaults
+  lr: 1e-4
+  batch_size: 256                    # Kelly et al.: 1000 (at 6s); scale for 1min
+  epochs: 50
+
+BiGRU:
+  <<: *baseline_defaults
+  lr: 1e-4
+  batch_size: 256
+  epochs: 50
+
+CNN1D:
+  <<: *baseline_defaults
+  lr: 1e-4
+  batch_size: 128
+  epochs: 50
+
+FCN:
+  <<: *baseline_defaults
+  lr: 1e-3                           # Zhang et al. AAAI 2018: higher LR
+  batch_size: 256
+  epochs: 50
+
+UNET_NILM:
+  <<: *baseline_defaults
+  lr: 1e-4
+  batch_size: 128
+  epochs: 50
+
+BERT4NILM:
+  <<: *baseline_defaults
+  scheduler_type: cosine_warmup      # Transformers need warmup, not plateau
+  n_warmup_epochs: 5                 # Linear warmup prevents early collapse
+  p_es: 15                           # More patience (transformers learn slowly)
+  lr: 1e-4
+  batch_size: 256                    # Original: 128-512
+  epochs: 50
+
+Energformer:
+  <<: *baseline_defaults
+  scheduler_type: cosine_warmup      # Transformers need warmup, not plateau
+  n_warmup_epochs: 5                 # Linear warmup prevents early collapse
+  p_es: 15                           # More patience (transformers learn slowly)
+  lr: 1e-4
+  batch_size: 256
+  epochs: 50
+
+DResNet:
+  <<: *baseline_defaults
+  lr: 1e-4
+  batch_size: 256
+  epochs: 50
+
+DAResNet:
+  <<: *baseline_defaults
+  lr: 1e-4
+  batch_size: 256
+  epochs: 50
+
+STNILM:
+  <<: *baseline_defaults
+  lr: 1e-3                           # Original paper: 1e-3
+  batch_size: 128
+  epochs: 50
+
+TSILNet:
+  <<: *baseline_defaults
+  lr: 1e-4
+  batch_size: 128
+  epochs: 50
+
+DiffNILM:
+  <<: *baseline_defaults
+  lr: 3e-5                           # DiffNILM paper: very low LR
+  batch_size: 64                     # Diffusion models need smaller batch
+  epochs: 100                        # Diffusion needs more epochs
+
+# NILMFormer keeps its full optimized config (from expes.yaml + models.yaml)
+NILMFormer:
+  loss_type: multi_nilm              # Custom adaptive loss
+  scheduler_type: cosine_warmup      # Optimized scheduler
+  output_ratio: 0.75                 # Seq2SubSeq
+  train_num_crops: 4                 # Multi-crop augmentation
+  n_warmup_epochs: 3
+  epochs: 25
+  limit_train_batches: 0.1           # 10% sampling per epoch (prevents collapse)
+  limit_val_batches: 0.2             # 20% validation
+  # lr/batch from models.yaml (1.21e-4, 128)

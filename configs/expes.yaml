@@ -23,8 +23,8 @@ rlr_min_lr:  1e-6
 
 device:  auto          # auto / cuda / mps / cpu
 accumulate_grad_batches: 1
-limit_train_batches: 0.1
-limit_val_batches: 0.2
+limit_train_batches: 0.1   # V9-fix: Restored — 10% sampling per epoch prevents collapse
+limit_val_batches: 0.2     # V9-fix: Restored — 20% validation matches working config
 
 num_workers: 8
 prefetch_factor: 4
