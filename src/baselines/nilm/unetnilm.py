@@ -146,7 +146,6 @@ class UNetCNN1D(nn.Module):
         self.layers = nn.ModuleList(layers)
 
     def forward(self, x):
-        # x = x.unsqueeze(-1).permute(0, 2, 1)
         xi = [self.layers[0](x)]
 
         for layer in self.layers[1 : self.num_layers]:

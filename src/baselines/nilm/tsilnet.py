@@ -79,9 +79,6 @@ class TemporalBlock(nn.Module):
 
         # Calculate the enhanced residual
         res = input if self.downsample is None else self.downsample(input)
-        # att_weights_combined = att1.mean(dim=1) + att2.mean(dim=1)  # Combine attention weights
-        # enhanced_residual = res * att_weights_combined.unsqueeze(1)
-
         # Add enhanced residual and apply activation
         x = x + res
         return self.gelu(x)
