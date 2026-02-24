@@ -1,1 +1,0 @@
-{"scheduler_type":"cosine_warmup","output_ratio":0.75,"train_num_crops":4,"n_warmup_epochs":3,"limit_train_batches":0.1,"limit_val_batches":0.2,"num_workers":0}

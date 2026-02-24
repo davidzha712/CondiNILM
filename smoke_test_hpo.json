@@ -1,1 +1,0 @@
-{"scheduler_type":"cosine_warmup","output_ratio":1.0,"train_num_crops":1,"p_es":15,"p_rlr":5,"n_warmup_epochs":5,"gate_cls_weight":0,"gate_window_weight":0,"anti_collapse_weight":0,"state_zero_penalty_weight":0,"off_high_agg_penalty_weight":0,"use_gradient_conflict_resolution":false,"balance_window_sampling":false,"lr":1e-4}
