@@ -348,10 +348,17 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
                                     getattr(expes_config, "postprocess_min_on_steps", 3),
                                 )
                             )
-                        per_device_post[name] = {
+                        post_entry = {
                             "postprocess_threshold": post_thr,
                             "postprocess_min_on_steps": post_min_on,
                         }
+                        # Pass through min_off_steps and max_power from dataset_params
+                        if isinstance(user_cfg, Mapping):
+                            if "min_off_steps" in user_cfg:
+                                post_entry["min_off_steps"] = int(user_cfg["min_off_steps"])
+                            if "max_power" in user_cfg:
+                                post_entry["max_power"] = float(user_cfg["max_power"])
+                        per_device_post[name] = post_entry
                     if per_device_post:
                         expes_config["postprocess_per_device"] = per_device_post
                         try:
@@ -487,7 +494,7 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     )
 
     if "loss_type" not in expes_config and str(getattr(expes_config, "name_model", "")).lower() == "nilmformer":
-        expes_config["loss_type"] = "ga_eaec"
+        expes_config["loss_type"] = "multi_nilm"
     if str(getattr(expes_config, "name_model", "")).lower() == "nilmformer":
         warm_default = 10 if device_type == "long_cycle" else 5
         ramp_default = 10 if device_type == "long_cycle" else 5

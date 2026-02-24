@@ -3,6 +3,10 @@
 # Each baseline gets neutral/standard training settings (not NILMFormer-centric).
 # NILMFormer keeps its own optimized config from expes.yaml + models.yaml.
 #
+# V11: All batch sizes scaled to fill RTX 5090 32GB VRAM.
+#      LR scaled with sqrt rule: new_lr = old_lr * sqrt(new_bs / old_bs)
+#      Baselines don't use PCGrad (no retain_graph), so can use larger batches.
+#
 # Author: Siyi Li
 
 # === Shared baseline defaults (neutral, non-NILMFormer-centric) ===
@@ -21,36 +25,41 @@ _baseline_defaults: &baseline_defaults
   off_high_agg_penalty_weight: 0     # No agg penalty
   use_gradient_conflict_resolution: false  # No PCGrad
   balance_window_sampling: false     # No balanced sampling
+  limit_train_batches: 1.0           # V11: USE ALL DATA
+  limit_val_batches: 1.0             # V11: Full validation
 
 # === Per-model configs ===
+# V11: batch_size=2048 for all (no PCGrad → ~3-5GB VRAM, well within 32GB)
+#      LR scaled with sqrt rule from original batch sizes
+
 BiLSTM:
   <<: *baseline_defaults
-  lr: 1e-4
-  batch_size: 256                    # Kelly et al.: 1000 (at 6s); scale for 1min
+  lr: 3e-4                           # sqrt(2048/256) * 1e-4 ≈ 2.83e-4
+  batch_size: 2048                   # V11: Fill 5090 VRAM (was 256)
   epochs: 50
 
 BiGRU:
   <<: *baseline_defaults
-  lr: 1e-4
-  batch_size: 256
+  lr: 3e-4                           # sqrt(2048/256) * 1e-4 ≈ 2.83e-4
+  batch_size: 2048                   # V11: Fill 5090 VRAM (was 256)
   epochs: 50
 
 CNN1D:
   <<: *baseline_defaults
-  lr: 1e-4
-  batch_size: 128
+  lr: 4e-4                           # sqrt(2048/128) * 1e-4 = 4e-4
+  batch_size: 2048                   # V11: Fill 5090 VRAM (was 128)
   epochs: 50
 
 FCN:
   <<: *baseline_defaults
-  lr: 1e-3                           # Zhang et al. AAAI 2018: higher LR
-  batch_size: 256
+  lr: 3e-3                           # sqrt(2048/256) * 1e-3 ≈ 2.83e-3
+  batch_size: 2048                   # V11: Fill 5090 VRAM (was 256)
   epochs: 50
 
 UNET_NILM:
   <<: *baseline_defaults
-  lr: 1e-4
-  batch_size: 128
+  lr: 4e-4                           # sqrt(2048/128) * 1e-4 = 4e-4
+  batch_size: 2048                   # V11: Fill 5090 VRAM (was 128)
   epochs: 50
 
 BERT4NILM:
@@ -58,8 +67,8 @@ BERT4NILM:
   scheduler_type: cosine_warmup      # Transformers need warmup, not plateau
   n_warmup_epochs: 5                 # Linear warmup prevents early collapse
   p_es: 15                           # More patience (transformers learn slowly)
-  lr: 1e-4
-  batch_size: 256                    # Original: 128-512
+  lr: 3e-4                           # sqrt(2048/256) * 1e-4 ≈ 2.83e-4
+  batch_size: 2048                   # V11: Fill 5090 VRAM (was 256)
   epochs: 50
 
 Energformer:
@@ -67,48 +76,48 @@ Energformer:
   scheduler_type: cosine_warmup      # Transformers need warmup, not plateau
   n_warmup_epochs: 5                 # Linear warmup prevents early collapse
   p_es: 15                           # More patience (transformers learn slowly)
-  lr: 1e-4
-  batch_size: 256
+  lr: 3e-4                           # sqrt(2048/256) * 1e-4 ≈ 2.83e-4
+  batch_size: 2048                   # V11: Fill 5090 VRAM (was 256)
   epochs: 50
 
 DResNet:
   <<: *baseline_defaults
-  lr: 1e-4
-  batch_size: 256
+  lr: 3e-4                           # sqrt(2048/256) * 1e-4 ≈ 2.83e-4
+  batch_size: 2048                   # V11: Fill 5090 VRAM (was 256)
   epochs: 50
 
 DAResNet:
   <<: *baseline_defaults
-  lr: 1e-4
-  batch_size: 256
+  lr: 3e-4                           # sqrt(2048/256) * 1e-4 ≈ 2.83e-4
+  batch_size: 2048                   # V11: Fill 5090 VRAM (was 256)
   epochs: 50
 
 STNILM:
   <<: *baseline_defaults
-  lr: 1e-3                           # Original paper: 1e-3
-  batch_size: 128
+  lr: 4e-3                           # sqrt(2048/128) * 1e-3 = 4e-3
+  batch_size: 2048                   # V11: Fill 5090 VRAM (was 128)
   epochs: 50
 
 TSILNet:
   <<: *baseline_defaults
-  lr: 1e-4
-  batch_size: 128
+  lr: 4e-4                           # sqrt(2048/128) * 1e-4 = 4e-4
+  batch_size: 2048                   # V11: Fill 5090 VRAM (was 128)
   epochs: 50
 
 DiffNILM:
   <<: *baseline_defaults
-  lr: 3e-5                           # DiffNILM paper: very low LR
-  batch_size: 64                     # Diffusion models need smaller batch
+  lr: 8e-5                           # sqrt(512/64) * 3e-5 ≈ 8.5e-5
+  batch_size: 512                    # V11: Diffusion needs more memory per sample (was 64)
   epochs: 100                        # Diffusion needs more epochs
 
 # NILMFormer keeps its full optimized config (from expes.yaml + models.yaml)
 NILMFormer:
   loss_type: multi_nilm              # Custom adaptive loss
   scheduler_type: cosine_warmup      # Optimized scheduler
-  output_ratio: 0.75                 # Seq2SubSeq
-  train_num_crops: 4                 # Multi-crop augmentation
-  n_warmup_epochs: 3
-  epochs: 25
-  limit_train_batches: 0.1           # 10% sampling per epoch (prevents collapse)
-  limit_val_batches: 0.2             # 20% validation
-  # lr/batch from models.yaml (1.21e-4, 128)
+  output_ratio: 0.9                  # V10: Wider supervision with full data
+  train_num_crops: 4                 # V11: Increased for gradient diversity with large batch
+  n_warmup_epochs: 5                 # V11: Longer warmup crucial for batch=2048 stability
+  epochs: 50                         # V10: More epochs for full-data training
+  limit_train_batches: 1.0           # V10: USE ALL DATA
+  limit_val_batches: 1.0             # V10: Full validation
+  # lr=3e-4, batch_size=2048 from models.yaml + expes.yaml

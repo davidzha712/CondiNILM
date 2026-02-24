@@ -16,6 +16,8 @@ from src.helpers.loss_tuning import AdaptiveLossTuner
 from src.helpers.postprocess import (
     suppress_short_activations,
     suppress_long_off_with_gate,
+    fill_short_off_gaps,
+    clip_max_power,
     _off_run_stats,
 )
 from src.helpers.inference import _crop_center_tensor
@@ -237,7 +239,7 @@ class ValidationNILMMetricCallback(pl.Callback):
                     per_device_cfg = getattr(
                         self.expes_config, "postprocess_per_device", None
                     )
-                    if isinstance(per_device_cfg, dict) and per_device_cfg:
+                    if isinstance(per_device_cfg, Mapping) and per_device_cfg:
                         per_device_cfg_norm = {
                             str(k).strip().lower(): v for k, v in per_device_cfg.items()
                         }
@@ -254,7 +256,9 @@ class ValidationNILMMetricCallback(pl.Callback):
                             cfg_j = per_device_cfg_norm.get(str(name_j).strip().lower())
                             thr_j = float(threshold_postprocess)
                             min_on_j = int(min_on_steps)
-                            if isinstance(cfg_j, dict):
+                            min_off_j = 0
+                            max_power_j = 0.0
+                            if isinstance(cfg_j, Mapping):
                                 thr_j = float(
                                     cfg_j.get("postprocess_threshold", thr_j)
                                 )
@@ -263,12 +267,18 @@ class ValidationNILMMetricCallback(pl.Callback):
                                         "postprocess_min_on_steps", min_on_j
                                     )
                                 )
+                                min_off_j = int(cfg_j.get("min_off_steps", 0))
+                                max_power_j = float(cfg_j.get("max_power", 0.0))
                             ch = pred_inv[:, j : j + 1, :]
+                            if max_power_j > 0:
+                                ch = torch.clamp(ch, max=max_power_j)
                             ch[ch < thr_j] = 0
                             if min_on_j > 1:
                                 ch = suppress_short_activations(
                                     ch, thr_j, min_on_j
                                 )
+                            if min_off_j > 1:
+                                ch = fill_short_off_gaps(ch, thr_j, min_off_j)
                             pred_inv[:, j : j + 1, :] = ch
                     else:
                         pred_inv[pred_inv < threshold_postprocess] = 0
@@ -530,7 +540,7 @@ class ValidationNILMMetricCallback(pl.Callback):
                 pred_win_flat = pred_win_np_all.reshape(-1)
                 y_hat_state_flat = np.array([], dtype=np.int8)
                 if state is not None:
-                    if pred_np_all.ndim == 3 and isinstance(per_device_cfg, dict) and per_device_cfg:
+                    if pred_np_all.ndim == 3 and isinstance(per_device_cfg, Mapping) and per_device_cfg:
                         per_device_cfg_norm = {
                             str(k).strip().lower(): v for k, v in per_device_cfg.items()
                         }
@@ -545,7 +555,7 @@ class ValidationNILMMetricCallback(pl.Callback):
                             name_j = device_names[j] if j < len(device_names) else str(j)
                             cfg_j = per_device_cfg_norm.get(str(name_j).strip().lower())
                             thr_j = float(threshold_postprocess)
-                            if isinstance(cfg_j, dict):
+                            if isinstance(cfg_j, Mapping):
                                 thr_j = float(cfg_j.get("postprocess_threshold", thr_j))
                             y_hat_state_np_all[:, j, :] = (pred_np_all[:, j, :] > thr_j).astype(np.int8)
                         y_hat_state_flat = y_hat_state_np_all.reshape(-1)
@@ -795,13 +805,19 @@ class ValidationNILMMetricCallback(pl.Callback):
         _append_jsonl(os.path.join(group_dir, "val_report.jsonl"), record)
         logging.info("VAL_REPORT_JSON: %s", json.dumps(_to_jsonable(record), ensure_ascii=False))
 
+        # V13: Log val_F1 for ModelCheckpoint monitoring (F1-based best checkpoint)
+        if isinstance(metrics_timestamp, dict):
+            f1_val = metrics_timestamp.get("F1_SCORE", 0.0)
+            if f1_val is not None and np.isfinite(f1_val):
+                pl_module.log("val_F1", float(f1_val), prog_bar=True, sync_dist=True)
+
         # V9: Track per-epoch metrics for training curves
         curve_rec = {
             "epoch": int(trainer.current_epoch),
             "val_loss": float(trainer.callback_metrics.get("val_loss_main", float("nan"))),
         }
         if isinstance(metrics_timestamp, dict):
-            curve_rec["f1"] = metrics_timestamp.get("F1", None)
+            curve_rec["f1"] = metrics_timestamp.get("F1_SCORE", None)
             curve_rec["mae"] = metrics_timestamp.get("MAE", None)
         self.epoch_records.append(curve_rec)
 

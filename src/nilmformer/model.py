@@ -204,7 +204,7 @@ class NILMFormer(nn.Module):
         #
         # This allows the SAME Transformer to handle both device types optimally!
         self.sparse_device_indices = []
-        sparse_device_names = getattr(NFConfig, "sparse_device_names", ["kettle", "microwave"])
+        sparse_device_names = getattr(NFConfig, "sparse_device_names", ["kettle"])  # V14: removed microwave - CNN bypass feeds raw aggregate, causing MW to learn aggregate identity
         self.sparse_device_names = [n.lower() for n in sparse_device_names]
 
         # Device task modes: "regression" or "classification_first"

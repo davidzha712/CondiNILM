@@ -298,7 +298,6 @@ class AdaptiveDeviceLoss(nn.Module):
         recall_scale = float(self.config_overrides.get("recall_weight_scale", 1.0))
 
         if device_type == self.SPARSE_HIGH_POWER:
-            # V8: Reduced ON-bias from 25:1 to 8:1 ratio to improve precision.
             params["alpha_on"] = 2.8 * alpha_on_scale
             params["alpha_off"] = 0.35 * alpha_off_scale
             params["w_main"] = 0.40
@@ -309,6 +308,7 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_hard_zero"] = 0.05
             params["off_margin"] = 0.02
             params["w_peak"] = 0.0
+            params["w_grad"] = 0.04  # V31: temporal gradient smoothness (short events, low weight)
             params["recall_coef_base"] = 0.25
             params["recall_coef_scale"] = 0.40
             params["recall_coef_max"] = 1.0
@@ -323,6 +323,7 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_hard_zero"] = 0.04
             params["off_margin"] = 0.015
             params["w_peak"] = 0.0
+            params["w_grad"] = 0.10  # V31: high — multi-phase transitions need smoothing
             params["recall_coef_base"] = 0.20
             params["recall_coef_scale"] = 0.40
             params["recall_coef_max"] = 0.70
@@ -337,6 +338,7 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_hard_zero"] = 0.05
             params["off_margin"] = 0.015
             params["w_peak"] = 0.0
+            params["w_grad"] = 0.10  # V31: high — multi-phase DW/WM need temporal structure
             params["recall_coef_base"] = 0.20
             params["recall_coef_scale"] = 0.40
             params["recall_coef_max"] = 0.70
@@ -351,13 +353,14 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_hard_zero"] = 0.03
             params["off_margin"] = 0.015
             params["w_peak"] = 0.0
+            params["w_grad"] = 0.06  # V31: moderate — cycling devices have regular transitions
             params["recall_coef_base"] = 0.10
             params["recall_coef_scale"] = 0.10
             params["recall_coef_max"] = 0.70
         else:
             # Default/always-on devices
             params["alpha_on"] = 1.0 * alpha_on_scale
-            params["alpha_off"] = 1.1 * alpha_off_scale
+            params["alpha_off"] = 1.0 * alpha_off_scale
             params["w_main"] = 0.50
             params["w_recall"] = 0.08 * recall_scale
             params["w_off_fp"] = 0.09
@@ -369,6 +372,7 @@ class AdaptiveDeviceLoss(nn.Module):
             params["recall_coef_base"] = 0.10
             params["recall_coef_scale"] = 0.10
             params["recall_coef_max"] = 0.70
+
 
         return params
 
@@ -515,7 +519,6 @@ class AdaptiveDeviceLoss(nn.Module):
         alpha_off = float(params.get("alpha_off", 1.0))
         threshold = float(params.get("threshold", 0.01))
 
-        # Soft ON/OFF weights for smooth gradients
         soft_temp = max(threshold * 2.0, 0.02)
         p_on = torch.sigmoid((target - threshold) / soft_temp)
         p_off = 1.0 - p_on
@@ -572,21 +575,31 @@ class AdaptiveDeviceLoss(nn.Module):
             hard_zero_loss = torch.clamp(hard_zero_loss, 0.0, 3.0)
 
         # === Component 7: Peak amplitude loss ===
-        # V7.5: Incentivize matching peak power (e.g., fridge compressor startup spikes).
-        # w_peak was defined in device_config but never used since V6 simplification.
         w_peak = float(params.get("w_peak", 0.0))
         peak_loss = pred.new_tensor(0.0)
         if w_peak > 0 and on_mask.sum() > 0:
-            # Per-sample max ON power comparison
             pred_on = pred * on_mask
             target_on = target * on_mask
-            pred_peak = pred_on.amax(dim=-1)   # (B, C) or (B, 1)
+            pred_peak = pred_on.amax(dim=-1)
             target_peak = target_on.amax(dim=-1)
             active = (target_peak > threshold).float()
             if active.sum() > 0:
                 peak_error = torch.abs(pred_peak - target_peak) / (target_peak + eps)
                 peak_loss = (peak_error * active).sum() / (active.sum() + eps)
                 peak_loss = torch.clamp(peak_loss, 0.0, 3.0)
+
+        # === Component 8: Temporal gradient smoothness loss ===
+        # V31: Re-added from T5 era. Penalizes predictions that don't match
+        # the target's temporal pattern. Critical for multi-phase devices (WM):
+        # - All-ON flat predictions have pred_grad≈0 but target has transitions → penalized
+        # - Forces model to learn temporal structure, not just average power
+        w_grad = float(params.get("w_grad", 0.0))
+        grad_loss = pred.new_tensor(0.0)
+        if w_grad > 0 and pred.shape[-1] > 1:
+            pred_diff = pred[:, :, 1:] - pred[:, :, :-1]
+            target_diff = target[:, :, 1:] - target[:, :, :-1]
+            grad_loss = torch.nn.functional.smooth_l1_loss(pred_diff, target_diff)
+            grad_loss = torch.clamp(grad_loss, 0.0, 3.0)
 
         # === Combine all components with FIXED weights ===
         w_main = float(params.get("w_main", 0.45))
@@ -598,7 +611,8 @@ class AdaptiveDeviceLoss(nn.Module):
                  w_on_power * on_power_loss +
                  w_energy * energy_loss +
                  w_hard_zero * hard_zero_loss +
-                 w_peak * peak_loss)
+                 w_peak * peak_loss +
+                 w_grad * grad_loss)
 
         return total
 

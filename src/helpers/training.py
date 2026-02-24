@@ -349,6 +349,17 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         filename=ckpt_name + "_{epoch:03d}",
     )
     callbacks.append(checkpoint_callback)
+    # V13: Second checkpoint that tracks best F1 score (most important metric)
+    # val_loss_main may not correlate with F1 — save both to avoid losing best F1 model
+    f1_checkpoint_callback = pl.callbacks.ModelCheckpoint(
+        monitor="val_F1",
+        mode="max",
+        save_top_k=1,
+        save_last=False,
+        dirpath=ckpt_root,
+        filename="best_f1_{epoch:03d}",
+    )
+    callbacks.append(f1_checkpoint_callback)
     if expes_config.name_model == "DiffNILM":
         lightning_module = DiffNILMLightningModule(inst_model)
     elif expes_config.name_model == "STNILM":
@@ -474,44 +485,29 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             output_ratio = float(getattr(expes_config, "output_ratio", 1.0))
 
             config_overrides = {}
-            if n_app > 1:
-                # V14: Apply HPO params for multi-device training
-                # These scaling factors were tuned for multi-device and are safe there
-                lambda_energy = float(getattr(expes_config, "loss_lambda_energy", 1.0))
-                if lambda_energy > 0.0:
-                    config_overrides["energy_weight_scale"] = lambda_energy
-                alpha_on = float(getattr(expes_config, "loss_alpha_on", 1.0))
-                if alpha_on > 0.0:
-                    config_overrides["alpha_on_scale"] = alpha_on / 2.0
-                alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
-                if alpha_off > 0.0:
-                    config_overrides["alpha_off_scale"] = alpha_off
-                lambda_recall = float(getattr(expes_config, "loss_lambda_on_recall", 1.0))
-                if lambda_recall > 0.0:
-                    config_overrides["recall_weight_scale"] = lambda_recall
-                lambda_off_hard = float(getattr(expes_config, "loss_lambda_off_hard", 0.0))
-                if lambda_off_hard > 0.0:
-                    config_overrides["lambda_off_hard_scale"] = lambda_off_hard
+            # V35f: Removed V10 caps. T5 baseline (F1=0.658, WM=0.257) used UNCAPPED values.
+            # V10's caps (recall→3.0, alpha→1.5) were added "for full data" but caused WM
+            # all-ON collapse in ALL subsequent experiments (V17-V35e, 25+ experiments).
+            # Restoring T5 behavior: pass raw config values as scaling factors.
+            lambda_energy = float(getattr(expes_config, "loss_lambda_energy", 1.0))
+            if lambda_energy > 0.0:
+                config_overrides["energy_weight_scale"] = lambda_energy
+            alpha_on = float(getattr(expes_config, "loss_alpha_on", 1.0))
+            if alpha_on > 0.0:
+                config_overrides["alpha_on_scale"] = alpha_on / 2.0
+            alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
+            if alpha_off > 0.0:
+                config_overrides["alpha_off_scale"] = alpha_off
+            lambda_recall = float(getattr(expes_config, "loss_lambda_on_recall", 1.0))
+            if lambda_recall > 0.0:
+                config_overrides["recall_weight_scale"] = lambda_recall
+            lambda_off_hard = float(getattr(expes_config, "loss_lambda_off_hard", 0.0))
+            if lambda_off_hard > 0.0:
+                config_overrides["lambda_off_hard_scale"] = lambda_off_hard
+            if n_app == 1:
+                logging.info("AdaptiveDeviceLoss: single-device mode, uncapped config_overrides")
             else:
-                # V9-fix: Single-device mode — cap HPO scaling to prevent collapse.
-                # The expes.yaml HPO params were tuned for the old ga_eaec loss.
-                # When applied as multiplicative scales to AdaptiveDeviceLoss, they are
-                # too extreme for sparse devices (e.g., recall becomes 0.20 * 5.368 = 1.074).
-                # Solution: apply capped versions so cycling devices still get adequate
-                # ON-state incentive, but sparse devices don't get overwhelmed.
-                lambda_energy = float(getattr(expes_config, "loss_lambda_energy", 1.0))
-                if lambda_energy > 0.0:
-                    config_overrides["energy_weight_scale"] = min(lambda_energy, 1.0)
-                alpha_on = float(getattr(expes_config, "loss_alpha_on", 1.0))
-                if alpha_on > 0.0:
-                    config_overrides["alpha_on_scale"] = min(alpha_on / 2.0, 1.5)
-                alpha_off = float(getattr(expes_config, "loss_alpha_off", 1.0))
-                if alpha_off > 0.0:
-                    config_overrides["alpha_off_scale"] = min(alpha_off, 1.0)
-                lambda_recall = float(getattr(expes_config, "loss_lambda_on_recall", 1.0))
-                if lambda_recall > 0.0:
-                    config_overrides["recall_weight_scale"] = min(lambda_recall, 2.0)
-                logging.info("AdaptiveDeviceLoss: single-device mode, capped HPO config_overrides")
+                logging.info("AdaptiveDeviceLoss: multi-device mode (%d devices), uncapped config_overrides", n_app)
             if config_overrides:
                 logging.info("AdaptiveDeviceLoss config overrides: %s", config_overrides)
 
@@ -544,18 +540,12 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         else:
             raise ValueError(f"Unsupported loss_type: {loss_type}")
 
-        # For multi_nilm (AdaptiveDeviceLoss), disable all auxiliary penalties (handled internally)
-        if loss_type == "multi_nilm":
-            state_zero_penalty_weight = 0.0
-            zero_run_kernel = 0
-            zero_run_ratio = 0.0
-            off_high_agg_penalty_weight = 0.0
-            off_state_penalty_weight = 0.0
-            off_state_margin = 0.0
-            off_state_long_penalty_weight = 0.0
-            off_state_long_kernel = 0
-            off_state_long_margin = 0.0
-            logging.info("%s loss: disabled all auxiliary trainer penalties", loss_type)
+        # V35f: Removed multi_nilm penalty override. T5 baseline trained with penalties ACTIVE
+        # alongside multi_nilm loss. The override (added in V10) disabled all trainer penalties,
+        # but T5's WM stability depended on state_zero_penalty (kernel=32) and off_high_agg_penalty
+        # to prevent all-ON collapse. Removing this override restores T5 behavior.
+        if False:  # was: loss_type == "multi_nilm"
+            pass
         else:
             state_zero_penalty_weight = float(
                 getattr(expes_config, "state_zero_penalty_weight", 0.0)
@@ -662,6 +652,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             balance_max_ratio = float(getattr(expes_config, "gradient_conflict_balance_max_ratio", 3.0))
             randomize_order = bool(getattr(expes_config, "gradient_conflict_randomize_order", True))
 
+            pcgrad_every_n = int(getattr(expes_config, "pcgrad_every_n_steps", 1))
             lightning_module.set_gradient_conflict_config(
                 use_gradient_conflict_resolution=True,
                 use_pcgrad=bool(getattr(expes_config, "gradient_conflict_use_pcgrad", True)),
@@ -670,12 +661,14 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                 balance_method=balance_method,
                 balance_max_ratio=balance_max_ratio,
                 randomize_order=randomize_order,
+                pcgrad_every_n_steps=pcgrad_every_n,
             )
             logging.info(
-                "[PCGRAD] Gradient conflict resolution enabled for %d devices (balance=%s, max_ratio=%.1f)",
+                "[PCGRAD] Gradient conflict resolution enabled for %d devices (balance=%s, max_ratio=%.1f, every_n=%d)",
                 n_devices_for_gcr,
                 balance_method,
                 balance_max_ratio,
+                pcgrad_every_n,
             )
         elif use_gcr and n_devices_for_gcr <= 1:
             logging.info("[PCGRAD] Disabled: single-device training does not need gradient conflict resolution")
@@ -849,6 +842,8 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         limit_train_batches = 1.0
     if limit_val_batches <= 0:
         limit_val_batches = 1.0
+    # V12: Validate every 2 epochs to reduce overhead (callbacks do full forward + postprocess)
+    check_val_n = int(getattr(expes_config, "check_val_every_n_epoch", 1))
     trainer_kwargs = dict(
         max_epochs=max_epochs,
         accelerator=accelerator,
@@ -862,6 +857,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         accumulate_grad_batches=accumulate_grad_batches,
         limit_train_batches=limit_train_batches,
         limit_val_batches=limit_val_batches,
+        check_val_every_n_epoch=check_val_n,
         # deterministic=True causes cascade collapse via AdaptiveTuner
     )
     trainer = pl.Trainer(**trainer_kwargs)
@@ -880,11 +876,15 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             train_dataloaders=train_loader,
             val_dataloaders=valid_loader,
         )
-    best_model_path = getattr(checkpoint_callback, "best_model_path", None)
+    # V13: Prefer F1-best checkpoint over loss-best for final evaluation
+    best_f1_path = getattr(f1_checkpoint_callback, "best_model_path", None)
+    best_loss_path = getattr(checkpoint_callback, "best_model_path", None)
+    best_model_path = best_f1_path if best_f1_path else best_loss_path
     if best_model_path:
         try:
             ckpt = torch.load(best_model_path, weights_only=False, map_location="cpu")
             lightning_module.load_state_dict(ckpt["state_dict"], strict=False)
+            logging.info("Loaded best checkpoint for eval: %s", best_model_path)
         except Exception as e:
             logging.warning(
                 "Could not load best checkpoint %s, keeping latest weights: %s",
@@ -1002,11 +1002,13 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     # V9: Save training curves after training completes
     _save_training_curves(trainer, expes_config)
 
+    f1_best_score = getattr(f1_checkpoint_callback, "best_model_score", None)
     logging.info(
-        "Training and eval completed! Best checkpoint: %s, TensorBoard logdir: %s, HTML: %s",
-        best_model_path,
+        "Training and eval completed! Best F1 ckpt: %s (F1=%.4f), Best loss ckpt: %s, TB: %s",
+        best_f1_path or "N/A",
+        float(f1_best_score) if f1_best_score is not None else 0.0,
+        best_loss_path or "N/A",
         os.path.join(tb_root, tb_name),
-        html_path,
     )
     result = {
         "best_loss": float(best_loss),

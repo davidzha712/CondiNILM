@@ -771,14 +771,18 @@ class UKDALE_DataBuilder(object):
         house_label = pd.read_csv(path_house + "labels.dat", sep=" ", header=None)
         house_label.columns = ["id", "appliance_name"]
 
-        # Load aggregate load curve and resample to lowest sampling rate
+        # Load aggregate load curve and resample to a base rate.
+        # UKDALE raw data is ~6s. When target sampling_rate <= 10s (e.g. "6s"),
+        # resample directly to the target to preserve native resolution.
+        # Otherwise, resample to 10s first (cheaper merge), then downsample later.
         house_data = pd.read_csv(path_house + "channel_1.dat", sep=" ", header=None)
         house_data.columns = ["time", "aggregate"]
         house_data["time"] = pd.to_datetime(house_data["time"], unit="s")
         house_data = house_data.set_index("time")  # Set index to time
+        _base_rate = self.sampling_rate if self.sampling_rate in ("6s", "6S") else "10s"
         house_data = (
-            house_data.resample("10s").mean().ffill(limit=6)
-        )  # Resample to minimum of 10s and ffill for 1min30
+            house_data.resample(_base_rate).mean().ffill(limit=6)
+        )
         house_data[house_data < 5] = 0  # Remove small value
 
         if self.flag_week:
@@ -827,7 +831,7 @@ class UKDALE_DataBuilder(object):
                 appl_data.columns = ["time", appliance]
                 appl_data["time"] = pd.to_datetime(appl_data["time"], unit="s")
                 appl_data = appl_data.set_index("time")
-                appl_data = appl_data.resample("10s").mean().ffill(limit=6)
+                appl_data = appl_data.resample(_base_rate).mean().ffill(limit=6)
                 appl_data[appl_data < 5] = 0  # Remove small value
 
                 # Merge aggregate load curve with appliance load curve
@@ -870,7 +874,7 @@ class UKDALE_DataBuilder(object):
                 # Finally replacing nan values put to -1 by nan
                 house_data[appliance] = house_data[appliance].replace(-1, np.nan)
 
-        if self.sampling_rate != "10s":
+        if self.sampling_rate not in ("10s", _base_rate):
             house_data = house_data.resample(self.sampling_rate).mean().ffill(limit=6)
 
         for appliance in self.mask_app[1:]:

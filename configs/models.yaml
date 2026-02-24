@@ -176,9 +176,6 @@ NILMFormer:
     n_head: 4                    # Increased from 2 to 4 (moderate increase)
     norm_eps: 1e-5
   model_training_param:
-    lr: 1.21e-4                  # HPO optimized (was 3.0e-4)
-    wd: 3.0e-5                   # HPO optimized (was 0.04)
+    lr: 3e-4                     # V11: Moderate scaling for batch=2048 (sqrt rule=4.5e-4, reduced for PCGrad stability)
+    wd: 1e-4                     # V10: Increased WD for better regularization with full data
     training_in_model: false
-  model_training_param_eaec:
-    lr: 5e-5
-    wd: 0.01

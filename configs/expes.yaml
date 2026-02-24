@@ -13,58 +13,47 @@ list_exo_variables:
 power_scaling_type:  MaxScaling
 appliance_scaling_type:  MaxScaling
 
-batch_size:  128
-epochs:  25
-p_es:  10                        # V7.5: Increased from 5 for more stable training
-p_rlr:  3
-n_warmup_epochs:  3
+batch_size:  2048                # V11: Fill 5090 32GB VRAM (~17GB peak, full-data still has ~63 steps/epoch)
+epochs:  50                      # V10: More epochs for full-data training (was 25 with 10% data)
+p_es:  12                        # V10: Slightly more patience for full-data training
+p_rlr:  5                        # V10: More patience before LR reduction
+n_warmup_epochs:  3              # V35c: Match T5 (was 5)
 scheduler_type:  cosine_warmup   # cosine_warmup (recommended) / plateau
 rlr_min_lr:  1e-6
 
 device:  auto          # auto / cuda / mps / cpu
-accumulate_grad_batches: 1
-limit_train_batches: 0.1   # V9-fix: Restored — 10% sampling per epoch prevents collapse
-limit_val_batches: 0.2     # V9-fix: Restored — 20% validation matches working config
+accumulate_grad_batches: 1       # V12: PCGrad uses manual optimization
+limit_train_batches: 1.0         # V10: USE ALL DATA — previous 0.1 starved the model
+limit_val_batches: 1.0           # V10: Full validation for reliable early stopping
 
 num_workers: 8
 prefetch_factor: 4
+check_val_every_n_epoch: 2       # V12: Reduce validation overhead (callbacks do 2x forward + full postprocess per val epoch)
 
-train_num_crops: 4
-train_crop_ratio: 0.75
-train_crop_event_bias: 0.8
+train_num_crops: 4               # V11: Keep 4 crops to maintain ~98% VRAM utilization (batch=2048 * 4 = 8192 effective)
+train_crop_ratio: 0.75           # V11: More aggressive cropping → more diversity per sample
+train_crop_event_bias: 0.8       # V35c: Match T5. Higher event bias → more WM ON events per batch
 
 # V8: Disable aggressive sparse oversampling (causes multi-task negative transfer)
 balance_window_sampling: false
 
-# EAEC Related Parameters
-p_es_eaec:  null
-p_rlr_eaec:  5
-n_warmup_epochs_eaec:  3
-warmup_type_eaec:  linear
-neg_penalty_weight_eaec: 0.02
-rlr_factor_eaec: 0.5
-rlr_min_lr_eaec: 1e-6
-gradient_clip_val_eaec: 1.0
-gate_cls_weight_eaec: 1.0
-gate_window_weight_eaec: 0.5
-gate_focal_gamma_eaec: 2.0
+# EAEC parameters removed (V12+: replaced by AdaptiveDeviceLoss / multi_nilm)
 
 # seq2subseq: Only supervise center region of output to reduce boundary effects
-# HPO best: 0.75 (supervise middle 75%)
-output_ratio: 0.75
+# seq2subseq: Only supervise center region of output to reduce boundary effects
+output_ratio: 0.75              # V35c: Match T5
 
-# Zero-run penalty for target=0 segments
-state_zero_penalty_weight: 0.1
-state_zero_kernel: 48
-state_zero_ratio: 0.9
+# V32b: Global penalties still disabled — V32 showed they hurt FR badly with batch=2048.
+# The real T5 difference is batch_size (128 vs 2048), not penalty weights.
+state_zero_penalty_weight: 0.0
+state_zero_kernel: 0
+state_zero_ratio: 0.0
 
 postprocess_min_on_steps: 3
 
-off_high_agg_penalty_weight: 0.3
+off_high_agg_penalty_weight: 0.0
 
-# Anti-collapse penalty to prevent model from outputting all zeros
-# Reduced from 1.5 to 0.8 - too high causes over-prediction
-anti_collapse_weight: 0.8
+anti_collapse_weight: 0.5        # V35c: Match T5
 
 # ============== Loss function hyperparameters (auto-adjusted by appliance type) ==============
 # These are default values and will be overridden by _configure_nilm_loss_hyperparams based on appliance type
@@ -80,20 +69,26 @@ anti_collapse_weight: 0.8
 loss_type: multi_nilm
 
 # ===== HPO best params (Trial 4, weighted F1=0.527) =====
+# V10: These are multiplicative scales applied to AdaptiveDeviceLoss base params.
+# Previous values were tuned for 10% data, causing extreme amplification.
+# With full data, use conservative scales to let AdaptiveDeviceLoss's internal params work.
+
 # lambda_off_hard: OFF-state hard constraint weight
-loss_lambda_off_hard: 0.01368
+loss_lambda_off_hard: 0.01368   # V35e: Match T5
 
 # lambda_sparse: sparsity penalty
-loss_lambda_sparse: 0.00725
+loss_lambda_sparse: 0.00725     # V35e: Match T5
 
 # off_margin: power tolerance margin in OFF state
 loss_off_margin: 0.02
 
 # ===== ON missed-detection penalty (critical!) =====
-# lambda_on_recall: ON missed-detection penalty weight
+# V35e: Restored to T5 values. V10's reduction (5.368→2.0, 2.67→1.5) was wrong:
+# These are CAPPED in training.py (recall→min(val,3.0), alpha→min(val/2,1.5))
+# T5 effective: recall_scale=3.0, alpha_on_scale=1.335 → WM stable.
+# V35d effective: recall_scale=2.0, alpha_on_scale=0.75 → WM collapsed.
 loss_lambda_on_recall: 5.368
 
-# alpha_on/alpha_off: class weighting for ON/OFF
 loss_alpha_on: 2.67
 loss_alpha_off: 0.96
 
@@ -126,8 +121,7 @@ loss_w_range: 0.10
 loss_w_on_power: 0.12
 
 # ===== Gate classification (TWO-STAGE approach for sparse devices) =====
-# gate_cls_weight: EXPLICIT gate classification loss weight (overrides loss_lambda_gate_cls)
-# Set high (1.0) to prioritize binary ON/OFF classification before power regression
+# V35e: Restored to T5 value (was 0.5)
 gate_cls_weight: 0.3
 
 # lambda_gate_cls: legacy parameter (keep for compatibility)
@@ -165,7 +159,8 @@ postprocess_gate_max_threshold: 0.5
 #
 # Enable this for multi-device training (>1 appliance):
 # NOTE: Disabled when using gradient_isolation (more aggressive isolation)
-use_gradient_conflict_resolution: true
+use_gradient_conflict_resolution: true   # V12: Re-enabled (essential for training stability — disabling causes mode collapse by epoch 3)
+pcgrad_every_n_steps: 1                  # V28: Every step (was 2). Non-PCGrad steps allow WM all-ON collapse — T5 used 1 and didn't collapse
 
 # PCGrad sub-options:
 # - use_pcgrad: Apply gradient projection when conflicts detected (default: true)
@@ -200,7 +195,7 @@ gradient_conflict_randomize_order: true
 # This is more aggressive than PCGrad: devices train TRULY independently.
 #
 # Enable this for multi-device training with collapse issues:
-use_gradient_isolation: false
+use_gradient_isolation: false   # V35c: Match T5 (false). Isolation prevents WM from getting shared backbone features.
 
 # Backbone training mode:
 # - "frozen": Shared backbone receives NO gradients (most isolated, devices are independent)

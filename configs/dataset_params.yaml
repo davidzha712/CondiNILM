@@ -34,10 +34,13 @@ UKDALE:
       device_type: "long_cycle"
       houses: [1, 2, 3, 4, 5]
       loss_override:
-        w_recall: 0.28       # Complex multi-phase cycle needs stronger recall
-        w_energy: 0.22       # Better energy tracking for variable power
-        alpha_on: 2.8        # Stronger ON detection
-        w_on_power: 0.14     # Better ON power accuracy
+        w_recall: 0.28       # V14fix: 0.20→0.28 (WM had F1=0.021, near-zero output; needs recall push)
+        w_energy: 0.10       # V14fix: 0.22→0.10 (high energy loss rewards all-zero for 5.6% duty)
+        alpha_on: 3.0        # V14fix: 2.2→3.0 (stronger ON asymmetry for rare events)
+        w_on_power: 0.12     # V14fix: 0.14→0.12
+        w_off_fp: 0.10       # V14fix: 0.14→0.10 (was over-suppressing all output)
+        off_margin: 0.01     # V14fix: NEW (base 0.015=120W → 0.01=80W, more appropriate for WM)
+        w_hard_zero: 0.06    # V14fix: NEW (enforce zeros in true OFF regions)
 
     dishwasher:
       min_threshold: 10
@@ -47,9 +50,9 @@ UKDALE:
       min_activation_time: 12
       device_type: "long_cycle"
       houses: [1, 2]
-      loss_override:
-        w_off_fp: 0.14        # Stronger FP penalty (UKDALE DW over-predicts: P=0.39 R=0.97)
-        off_margin: 0.02      # Wider OFF dead zone to reduce false positives
+      # V16: REMOVED loss_override — V12 achieved F1=0.554 with NO override (LONG_CYCLE defaults).
+      # V14/V15 overrides caused all-ON collapse (P→0.10, R→0.99). Root cause: overrides
+      # break PCGrad gradient balance for long_cycle devices. Let base params handle DW.
 
     kettle:
       min_threshold: 2000
@@ -59,6 +62,15 @@ UKDALE:
       min_activation_time: 1
       device_type: "sparse_high_power"
       houses: [1, 2]
+      loss_override:
+        off_margin: 0.005    # V14fix: 0.02→0.005 (dead zone 160W→40W)
+        w_off_fp: 0.25       # V14fix2: 0.18→0.25 (KT R=0.997, need stronger FP suppression)
+        w_recall: 0.08       # V14fix2: 0.30→0.08 (0.30 caused R=0.999; KT over-predicts, DON'T push recall)
+        w_energy: 0.05       # V14fix: 0.15→0.05 (energy matching rewards all-zero for sparse)
+        w_hard_zero: 0.12    # V14fix2: 0.10→0.12 (enforce zeros during OFF)
+        alpha_on: 2.0        # V14fix2: 3.5→2.0 (3.5 caused fear-of-missing-ON → always-ON prediction)
+        alpha_off: 1.5       # V14fix2: NEW (strengthen OFF regression to combat CNN bypass aggregate leak)
+        w_main: 0.40         # V14fix2: 0.35→0.40 (restore main regression importance)
 
     microwave:
       min_threshold: 200
@@ -69,8 +81,14 @@ UKDALE:
       device_type: "sparse_high_power"
       houses: [1, 2]
       loss_override:
-        w_off_fp: 0.09       # Reduced from 0.12 (MW regressed -0.055 in V8.1, FP penalty too strict)
-        off_margin: 0.03     # Wider OFF dead zone
+        w_off_fp: 0.40       # V14fix: 0.35→0.40 (MW P=0.054, needs even stronger FP suppression)
+        off_margin: 0.008    # V16fix: 0.003→0.008 (64W dead zone; old 24W too small for 90-100W device)
+        alpha_off: 2.0       # V14fix: 1.5→2.0 (stronger OFF regression)
+        w_hard_zero: 0.20    # V14fix: 0.15→0.20 (aggressively suppress false activations)
+        w_energy: 0.05       # V14fix: 0.08→0.05 (further reduce aggregate tracking incentive)
+        w_main: 0.30         # V14fix: 0.35→0.30 (make room for penalties)
+        w_recall: 0.05       # V14fix: (base 0.20)→0.05 (MW has R=0.456/P=0.054; recall push is the ENEMY)
+        alpha_on: 2.0        # V14fix: (base 2.8)→2.0 (reduce ON asymmetry; MW over-detects)
 
     fridge:
       min_threshold: 50
@@ -80,18 +98,25 @@ UKDALE:
       min_activation_time: 1
       device_type: "cycling_low_power"
       houses: [1, 2, 4]
+      loss_override:
+        off_margin: 0.003    # V14: 0.015→0.003 (dead zone 120W→24W; fridge is ~100W, old margin covered ENTIRE fridge range!)
+        w_off_fp: 0.22       # V14: 0.09→0.22 (strong OFF FP penalty - fridge has clear ON/OFF cycling)
+        w_hard_zero: 0.10    # V14: 0.03→0.10 (enforce zero during OFF periods)
+        alpha_off: 2.0       # V14: 1.0→2.0 (penalize OFF regression errors 2x)
+        w_energy: 0.10       # V14: 0.20→0.10 (reduce energy matching to curb aggregate tracking)
+        w_main: 0.45         # V14: 0.50→0.45 (make room for penalty components)
 
   training:
     default_sampling_rate: "1min"
     default_window_size: 128
     overlap: 0.75
-    batch_size: 128
-    epochs: 25
-    learning_rate: 1e-4
-    weight_decay: 0.01
-    early_stopping_patience: 5
-    limit_train_batches: 0.1   # V9-fix: 10% sampling per epoch (prevents collapse)
-    limit_val_batches: 0.2     # V9-fix: 20% validation matches working config
+    batch_size: 2048             # V11: Fill 5090 32GB VRAM (~17GB peak, ~63 steps/epoch)
+    epochs: 50                   # V10: Full-data training needs more epochs
+    learning_rate: 3e-4          # V11: Moderate scaling for batch=2048 (PCGrad stability)
+    weight_decay: 1e-4           # V10: Better regularization
+    early_stopping_patience: 12
+    limit_train_batches: 1.0     # V14: Full data training
+    limit_val_batches: 1.0       # Keep full validation for accurate F1 measurement
     # Default multi-device house split (used when datasets.yaml has no entry)
     # Houses 1,2 have all 5 devices with clean data; 3,4,5 have MW quality issues
     default_multi_train: [1]
@@ -99,28 +124,35 @@ UKDALE:
 
   loss:
     loss_type: "multi_nilm"
-    output_ratio: 0.75
-    anti_collapse_weight: 0.5
-    state_zero_penalty_weight: 0.05
-    state_zero_kernel: 32
-    off_high_agg_penalty_weight: 0.15
+    output_ratio: 0.9            # V10: Wider supervision window with full data
+    anti_collapse_weight: 0.3    # V10: Reduced — full data prevents collapse naturally
+    state_zero_penalty_weight: 0.0
+    state_zero_kernel: 0
+    off_high_agg_penalty_weight: 0.0
 
   postprocess:
     washing_machine:
-      threshold: 20
-      min_on_steps: 2
+      threshold: 60              # V14fix: 80→60 (WM low-power wash phases 50-150W, don't clip them)
+      min_on_steps: 10           # V14fix: 12→10 (slightly more permissive for sub-cycles)
+      min_off_steps: 5           # Keep: fill short OFF gaps in multi-phase WM cycles
+      max_power: 2500            # Clip to training max_threshold
     dishwasher:
-      threshold: 50            # Raised from 20 (UKDALE DW over-predicts, need stricter filter)
-      min_on_steps: 8          # Raised from 6 (filter short false-positive bursts)
+      threshold: 30              # V14fix: 50→30 (DW low-power phases ~30-80W; 50 clips real signal)
+      min_on_steps: 6            # V14fix: 8→6 (more permissive for short DW sub-cycles)
+      min_off_steps: 3           # Keep: fill short OFF gaps
+      max_power: 2500            # Clip to training max_threshold
     kettle:
-      threshold: 800
-      min_on_steps: 2
+      threshold: 350             # V14fix2: 200→350 (200 too low, lets CNN bypass aggregate noise through; KT peaks 500-1200W at 1min)
+      min_on_steps: 2            # V14fix2: 1→2 (require 2 consecutive bins to filter noise)
+      max_power: 3100            # Clip to training max_threshold
     microwave:
-      threshold: 260       # Lowered from 300 (gate attenuates MW preds, need lower threshold)
-      min_on_steps: 1
+      threshold: 120             # V16fix: 70→120 (MW min=200W; 70W lets 40-60W noise through. KT=350/2000=17.5%, MW=120/200=60%)
+      min_on_steps: 2            # V16fix: 1→2 (require 2 consecutive bins above threshold to filter single-point noise)
+      max_power: 3000            # Clip to training max_threshold
     fridge:
       threshold: 18
       min_on_steps: 3
+      max_power: 300             # Clip to training max_threshold
 
 # ============================================================
 # REDD Dataset Configuration
@@ -243,13 +275,13 @@ REDD:
     default_window_size: 128
     overlap: 0.75
     batch_size: 32             # Small dataset: fewer samples per batch for more updates
-    epochs: 50                 # Small dataset: more epochs to compensate for few batches
+    epochs: 80                 # V10: More epochs for small dataset with full data
     train_num_crops: 1         # Small dataset: no cropping (preserve all samples)
     learning_rate: 5e-5
     weight_decay: 0.02
-    early_stopping_patience: 15
-    limit_train_batches: 0.1   # V9-fix: 10% sampling per epoch (prevents collapse)
-    limit_val_batches: 0.2     # V9-fix: 20% validation matches working config
+    early_stopping_patience: 20
+    limit_train_batches: 1.0   # V10: USE ALL DATA
+    limit_val_batches: 1.0     # V10: Full validation
     postprocess_use_gate: false   # REDD MW too sparse for gate postprocess (activity <1.2%)
     # Houses 1,2,3 have fridge+microwave+dishwasher with good activity
     default_multi_train: [1, 2]
@@ -258,12 +290,12 @@ REDD:
   # Only override anti-collapse and output_ratio; let HPO handle other loss params
   loss:
     loss_type: "multi_nilm"
-    output_ratio: 0.85          # Small dataset: wider output window to capture more signal
+    output_ratio: 0.9           # V10: Wider output window
 
-    anti_collapse_weight: 0.15
-    state_zero_penalty_weight: 0.01
-    state_zero_kernel: 12
-    off_high_agg_penalty_weight: 0.05
+    anti_collapse_weight: 0.2   # V10: Reduced for full-data stability
+    state_zero_penalty_weight: 0.0
+    state_zero_kernel: 0
+    off_high_agg_penalty_weight: 0.0
 
   postprocess:
     dishwasher:
@@ -321,13 +353,14 @@ REFIT:
       min_on_duration: 18      # 180s = 3min (in 10s units)
       min_off_duration: 2      # 20s (in 10s units; WM has rapid phase transitions)
       min_activation_time: 12  # 120s = 2min (in 10s units)
-      device_type: "long_cycle"
+      device_type: "long_cycle"  # V31: Restored from "cycling". Gradient smoothness loss
+      # (Component 8, w_grad) now prevents the all-ON collapse that plagued V17-V30.
+      # LONG_CYCLE base: alpha_on=2.5, alpha_off=0.8, w_recall=0.22, recall_coef_base=0.20
       houses: [2, 5, 6, 7, 9, 15]
+      # V35c: Match T5 settings (lr=1e-4, wd=0.01, isolation=false, event_bias=0.8).
+      # Remove w_recall override — use LONG_CYCLE default (0.22). Keep w_grad for smoothness.
       loss_override:
-        w_recall: 0.28       # WM needs stronger recall (complex multi-phase)
-        w_energy: 0.22       # Better energy tracking for variable power
-        alpha_on: 2.8        # Stronger ON detection
-        w_on_power: 0.14     # Better ON power accuracy
+        w_grad: 0.20         # Keep: gradient smoothness is beneficial
 
     Kettle:
       min_threshold: 2000
@@ -354,25 +387,28 @@ REFIT:
     default_sampling_rate: "1min"
     default_window_size: 128
     overlap: 0.5
-    batch_size: 128
-    epochs: 25
-    learning_rate: 1e-4
-    weight_decay: 0.01
-    early_stopping_patience: 5
-    limit_train_batches: 0.1   # V9-fix: 10% sampling per epoch (prevents collapse)
-    limit_val_batches: 0.2     # V9-fix: 20% validation matches working config
+    batch_size: 128              # V35d: Match T5. batch=2048 causes WM all-ON collapse (confirmed V31-V35c).
+    epochs: 50                   # V10: More epochs for full-data training
+    learning_rate: 1e-4          # V35b: Match T5.
+    weight_decay: 0.01           # V35: Match T5 (100x increase). T5 wd=0.01 prevented WM all-ON collapse; wd=1e-4 always collapses by ep3.
+    early_stopping_patience: 12
+    limit_train_batches: 1.0     # V10: USE ALL DATA
+    limit_val_batches: 1.0       # V10: Full validation
     # Houses [2,5,6,9] train, [7,15] test — good coverage for all 4 devices
     default_multi_train: [2, 5, 6, 9]
     default_multi_test: [7, 15]
 
-  # output_ratio=0.75 is CRITICAL for Kettle - HPO's 0.63 causes Kettle collapse
+  # V33: Re-enable T5-era global penalties in REFIT loss section (this overrides expes.yaml!).
+  # V32's expes.yaml changes didn't take effect because this section overrides.
+  # Using moderate weights (40-50% of T5) since batch=2048 gives stronger per-step signal.
   loss:
     loss_type: "multi_nilm"
-    output_ratio: 0.75
-    anti_collapse_weight: 0.5
-    state_zero_penalty_weight: 0.05
-    state_zero_kernel: 32
-    off_high_agg_penalty_weight: 0.15
+    output_ratio: 0.75             # V35c: Match T5 (was 0.9)
+    anti_collapse_weight: 0.5      # V35c: Match T5 (was 0.3)
+    state_zero_penalty_weight: 0.05   # V35f: Restore T5 value. multi_nilm override removed, penalties now active.
+    state_zero_kernel: 32             # V35f: Restore T5 value (was 0)
+    state_zero_ratio: 0.9             # V35f: Restore T5 value
+    off_high_agg_penalty_weight: 0.15  # V35f: Restore T5 value (was 0.0)
 
   postprocess:
     Dishwasher:

@@ -111,7 +111,7 @@ def main():
         default=None,
         help=(
             "Forwarded to scripts.run_experiment. Choices: "
-            "'eaec', 'smoothl1', 'mse', 'mae'."
+            "'multi_nilm', 'smoothl1', 'mse', 'mae'."
         ),
     )
     parser.add_argument(

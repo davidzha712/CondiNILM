@@ -16,6 +16,8 @@ from src.helpers.metrics import NILMmetrics
 from src.helpers.postprocess import (
     suppress_short_activations,
     suppress_long_off_with_gate,
+    fill_short_off_gaps,
+    clip_max_power,
 )
 from src.helpers.inference import _crop_center_tensor
 
@@ -151,6 +153,8 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
                         cfg_j = per_device_cfg_norm.get(str(name_j).strip().lower())
                         thr_j = float(threshold_postprocess)
                         min_on_j = int(min_on_steps)
+                        min_off_j = 0
+                        max_power_j = 0.0
                         if isinstance(cfg_j, Mapping):
                             thr_j = float(
                                 cfg_j.get("postprocess_threshold", thr_j)
@@ -160,12 +164,18 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
                                     "postprocess_min_on_steps", min_on_j
                                 )
                             )
+                            min_off_j = int(cfg_j.get("min_off_steps", 0))
+                            max_power_j = float(cfg_j.get("max_power", 0.0))
                         ch = pred_inv[:, j : j + 1, :]
+                        if max_power_j > 0:
+                            ch = torch.clamp(ch, max=max_power_j)
                         ch[ch < thr_j] = 0.0
                         if min_on_j > 1:
                             ch = suppress_short_activations(
                                 ch, thr_j, min_on_j
                             )
+                        if min_off_j > 1:
+                            ch = fill_short_off_gaps(ch, thr_j, min_off_j)
                         pred_inv[:, j : j + 1, :] = ch
                 else:
                     pred_inv[pred_inv < threshold_postprocess] = 0.0
@@ -779,13 +789,22 @@ def evaluate_nilm_split(
                     cfg_j = per_device_cfg_norm.get(str(name_j).strip().lower())
                     thr_j = float(threshold_postprocess)
                     min_on_j = int(min_on_duration_steps or 0)
+                    min_off_j = 0
+                    max_power_j = 0.0
                     if isinstance(cfg_j, Mapping):
                         thr_j = float(cfg_j.get("postprocess_threshold", thr_j))
                         min_on_j = int(cfg_j.get("postprocess_min_on_steps", min_on_j))
+                        min_off_j = int(cfg_j.get("min_off_steps", 0))
+                        max_power_j = float(cfg_j.get("max_power", 0.0))
                     ch = pred_inv[:, j : j + 1, :]
+                    # Clip to max power first (prevents peak overshoot)
+                    if max_power_j > 0:
+                        ch = torch.clamp(ch, max=max_power_j)
                     ch[ch < thr_j] = 0.0
                     if min_on_j > 1:
                         ch = suppress_short_activations(ch, thr_j, min_on_j)
+                    if min_off_j > 1:
+                        ch = fill_short_off_gaps(ch, thr_j, min_off_j)
                     pred_inv[:, j : j + 1, :] = ch
             else:
                 pred_inv[pred_inv < threshold_postprocess] = 0

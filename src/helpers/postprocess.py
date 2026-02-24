@@ -75,6 +75,77 @@ def suppress_long_off_with_gate(pred_inv, gate_prob, kernel_size, gate_avg_thr, 
     return out
 
 
+def fill_short_off_gaps(pred_inv, threshold, min_off_steps):
+    """Fill short OFF gaps between ON segments to reduce fragmentation.
+
+    When a device has a brief dip below threshold between two ON segments,
+    this fills the gap with interpolated values instead of zero.
+
+    Args:
+        pred_inv: (B, C, L) prediction tensor in watts
+        threshold: Power threshold for ON detection
+        min_off_steps: Minimum OFF duration to keep; shorter gaps are filled
+    """
+    if min_off_steps <= 1:
+        return pred_inv
+    if pred_inv.dim() != 3:
+        return pred_inv
+    pred_np = pred_inv.detach().cpu().numpy()
+    b, c, t = pred_np.shape
+    thr = float(threshold)
+    for i in range(b):
+        for j in range(c):
+            series = pred_np[i, j]
+            off_mask = series < thr
+            if not off_mask.any():
+                continue
+            idx = np.nonzero(off_mask)[0]
+            if idx.size == 0:
+                continue
+            splits = np.split(idx, np.where(np.diff(idx) > 1)[0] + 1)
+            for seg in splits:
+                if seg.size >= min_off_steps:
+                    continue
+                # Short OFF gap: check if bounded by ON on both sides
+                start = int(seg[0])
+                end = int(seg[-1])
+                if start > 0 and end < t - 1:
+                    left_on = series[start - 1] >= thr
+                    right_on = series[end + 1] >= thr
+                    if left_on and right_on:
+                        # Linearly interpolate across the gap
+                        left_val = series[start - 1]
+                        right_val = series[end + 1]
+                        n = seg.size
+                        for k, s_idx in enumerate(seg):
+                            frac = (k + 1) / (n + 1)
+                            series[s_idx] = left_val + frac * (right_val - left_val)
+    return torch.from_numpy(pred_np).to(pred_inv.device)
+
+
+def clip_max_power(pred_inv, max_power_per_device):
+    """Clip prediction to per-device max power to prevent peak overshoot.
+
+    Args:
+        pred_inv: (B, C, L) prediction tensor in watts
+        max_power_per_device: list/dict of max power values per device channel
+    """
+    if pred_inv.dim() != 3:
+        return pred_inv
+    if not max_power_per_device:
+        return pred_inv
+    n_ch = pred_inv.size(1)
+    if isinstance(max_power_per_device, dict):
+        return pred_inv  # dict mode handled by caller per-name
+    if not isinstance(max_power_per_device, (list, tuple)):
+        return pred_inv
+    for j in range(min(n_ch, len(max_power_per_device))):
+        cap = float(max_power_per_device[j])
+        if cap > 0:
+            pred_inv[:, j, :] = torch.clamp(pred_inv[:, j, :], max=cap)
+    return pred_inv
+
+
 def _off_run_stats(target_np, pred_np, thr, min_len, pred_thr=None):
     off_mask = target_np <= float(thr)
     pred_off = pred_np[off_mask]

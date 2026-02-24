@@ -143,6 +143,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
         balance_method: str = "soft",
         balance_max_ratio: float = 3.0,
         randomize_order: bool = True,
+        pcgrad_every_n_steps: int = 1,
     ):
         """
         Configure gradient conflict resolution for multi-device training.
@@ -160,6 +161,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
                            - "unit": Normalize to unit length (original, may cause instability)
             balance_max_ratio: Maximum allowed gradient norm ratio for soft balancing (default: 3.0)
             randomize_order: Whether to randomize device order in PCGrad (default: True)
+            pcgrad_every_n_steps: Apply full PCGrad every N steps, use normal backward on other steps (default: 1 = every step)
         """
         self._use_gradient_conflict_resolution = use_gradient_conflict_resolution
         self._pcgrad_use_pcgrad = use_pcgrad
@@ -168,6 +170,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
         self._pcgrad_balance_method = balance_method
         self._pcgrad_balance_max_ratio = balance_max_ratio
         self._pcgrad_randomize_order = randomize_order
+        self._pcgrad_every_n_steps = max(1, pcgrad_every_n_steps)
 
     def set_gradient_isolation_config(
         self,
@@ -1099,6 +1102,13 @@ class SeqToSeqLightningModule(pl.LightningModule):
         if output_ratio < 1.0:
             pred = self.criterion._crop_center(pred, output_ratio)
             target = self.criterion._crop_center(target, output_ratio)
+            ts_agg = self.criterion._crop_center(ts_agg, output_ratio)
+            if state is not None:
+                state = self.criterion._crop_center(state, output_ratio)
+            if gate is not None:
+                gate = self.criterion._crop_center(gate, output_ratio)
+            if gate_prob is not None:
+                gate_prob = self.criterion._crop_center(gate_prob, output_ratio)
 
         # Compute per-device losses
         n_devices = pred.shape[1]
@@ -1168,12 +1178,21 @@ class SeqToSeqLightningModule(pl.LightningModule):
         for i in range(len(per_device_losses)):
             per_device_losses[i] = per_device_losses[i] + aux_per_device
 
-        # PCGrad: Compute per-device gradients and resolve conflicts
-        device_grads = self._gradient_resolver.compute_per_device_gradients(
-            self.model, per_device_losses
-        )
-        resolved_grads = self._gradient_resolver.resolve_conflicts(device_grads)
-        self._gradient_resolver.apply_gradients(self.model, resolved_grads)
+        # Decide whether to use full PCGrad or normal backward this step
+        pcgrad_every_n = getattr(self, '_pcgrad_every_n_steps', 1)
+        use_pcgrad_this_step = (self.global_step % pcgrad_every_n == 0)
+
+        if use_pcgrad_this_step:
+            # Full PCGrad: per-device backward + conflict resolution
+            device_grads = self._gradient_resolver.compute_per_device_gradients(
+                self.model, per_device_losses
+            )
+            resolved_grads = self._gradient_resolver.resolve_conflicts(device_grads)
+            self._gradient_resolver.apply_gradients(self.model, resolved_grads)
+        else:
+            # Normal backward: sum per-device losses, single backward pass
+            total_loss_for_backward = sum(per_device_losses)
+            self.manual_backward(total_loss_for_backward)
 
         # Manual gradient clipping (since automatic clipping is disabled for manual optimization)
         # Use max_norm=1.0 as safety net
@@ -1320,6 +1339,13 @@ class SeqToSeqLightningModule(pl.LightningModule):
         if output_ratio < 1.0:
             pred = self.criterion._crop_center(pred, output_ratio)
             target = self.criterion._crop_center(target, output_ratio)
+            ts_agg = self.criterion._crop_center(ts_agg, output_ratio)
+            if state is not None:
+                state = self.criterion._crop_center(state, output_ratio)
+            if gate is not None:
+                gate = self.criterion._crop_center(gate, output_ratio)
+            if gate_prob is not None:
+                gate_prob = self.criterion._crop_center(gate_prob, output_ratio)
 
         # Compute per-device losses
         n_devices = pred.shape[1]
@@ -1380,7 +1406,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
 
         # Collect gradients for shared parameters (for averaging mode)
         shared_grads_accum = None
-        n_contributing_devices = 0
+        total_backbone_weight = 0.0
 
         for c in range(n_devices):
             device_name = self.criterion.device_names[c].lower()
@@ -1391,6 +1417,11 @@ class SeqToSeqLightningModule(pl.LightningModule):
                 len(isolated_device_names) == 0 or  # All devices isolated if list empty
                 device_name in isolated_device_names
             )
+
+            # Per-device backbone gradient weight (default 1.0).
+            # Set to 0.0 in loss_override to exclude a device from backbone training
+            # while keeping it isolated (adapter-only training for that device).
+            bgw = float(self.criterion.device_params[c].get("backbone_grad_weight", 1.0))
 
             if is_isolated and backbone_training == "frozen":
                 # Only update device-specific parameters
@@ -1406,36 +1437,36 @@ class SeqToSeqLightningModule(pl.LightningModule):
                 # Backward through all parameters
                 device_loss.backward(retain_graph=(c < n_devices - 1))
 
-                # Accumulate shared gradients for averaging
-                if shared_grads_accum is None:
-                    shared_grads_accum = {}
-                    for param in param_groups["shared"]:
-                        if param.grad is not None:
-                            shared_grads_accum[param] = param.grad.clone()
-                else:
-                    for param in param_groups["shared"]:
-                        if param.grad is not None:
-                            if param in shared_grads_accum:
-                                shared_grads_accum[param] += param.grad
-                            else:
-                                shared_grads_accum[param] = param.grad.clone()
+                # Accumulate shared gradients for averaging (weighted by backbone_grad_weight)
+                if bgw > 0:
+                    if shared_grads_accum is None:
+                        shared_grads_accum = {}
+                        for param in param_groups["shared"]:
+                            if param.grad is not None:
+                                shared_grads_accum[param] = param.grad.clone() * bgw
+                    else:
+                        for param in param_groups["shared"]:
+                            if param.grad is not None:
+                                if param in shared_grads_accum:
+                                    shared_grads_accum[param] += param.grad * bgw
+                                else:
+                                    shared_grads_accum[param] = param.grad.clone() * bgw
+                    total_backbone_weight += bgw
 
                 # Zero shared grads to prevent accumulation in optimizer
                 for param in param_groups["shared"]:
                     if param.grad is not None:
                         param.grad.zero_()
 
-                n_contributing_devices += 1
-
             else:
                 # Non-isolated device: normal backward (updates backbone)
                 device_loss.backward(retain_graph=(c < n_devices - 1))
-                n_contributing_devices += 1
+                total_backbone_weight += bgw
 
         # Apply averaged shared gradients if using "average" mode
-        if backbone_training == "average" and shared_grads_accum is not None and n_contributing_devices > 0:
+        if backbone_training == "average" and shared_grads_accum is not None and total_backbone_weight > 0:
             for param, grad_sum in shared_grads_accum.items():
-                param.grad = grad_sum / n_contributing_devices
+                param.grad = grad_sum / total_backbone_weight
 
         # Manual gradient clipping
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
