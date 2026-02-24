@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CondiNILM Feature Engineering</title>
+    <style>
+        :root {
+            --bg-color: #1a1a2e;
+            --panel-bg: rgba(20, 20, 35, 0.85);
+            --border-color: rgba(255, 255, 255, 0.1);
+            --text-main: #ffffff;
+            --text-muted: #a0a0b0;
+            --color-kettle: #ef5350;
+            --color-fridge: #42a5f5;
+            --color-idle: #9e9e9e;
+            --color-mean: #ffa726;
+            --color-std: rgba(255, 167, 38, 0.2);
+            --color-rms: #ab47bc;
+            --color-peak: #ef5350;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+        }
+
+        /* Header */
+        .header {
+            padding: 15px 30px;
+            background: linear-gradient(to bottom, #111122, transparent);
+            z-index: 10;
+        }
+        .header h1 { margin: 0; font-size: 22px; }
+        .header p { margin: 5px 0 0 0; color: var(--text-muted); font-size: 14px; }
+
+        /* Main Dashboard Layout */
+        .dashboard {
+            display: flex;
+            flex: 1;
+            padding: 0 20px 20px 20px;
+            gap: 20px;
+            height: calc(100vh - 140px);
+        }
+
+        .left-column {
+            display: flex;
+            flex-direction: column;
+            flex: 2;
+            gap: 20px;
+        }
+
+        .right-column {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            position: relative;
+        }
+
+        /* Panels */
+        .panel {
+            background: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .waveform-panel { flex: 3; }
+        .fft-panel { flex: 2; }
+
+        .panel-title {
+            position: absolute;
+            top: 15px;
+            left: 20px;
+            font-weight: bold;
+            font-size: 14px;
+            color: #fff;
+            z-index: 10;
+            pointer-events: none;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.8);
+        }
+
+        /* Canvases */
+        #webgl-canvas { width: 100%; height: 100%; display: block; }
+        #fft-canvas { width: 100%; height: 100%; display: block; }
+        #vector-canvas { width: 100%; height: 100%; display: block; flex: 1; margin-top: 10px; }
+
+        /* Controls */
+        .controls {
+            height: 60px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 15px;
+            background: #111122;
+            border-top: 1px solid var(--border-color);
+        }
+
+        button {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: white;
+            padding: 10px 20px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+
+        button:hover { background: rgba(255, 255, 255, 0.15); }
+        button.active { box-shadow: 0 0 15px rgba(255,255,255,0.2); }
+        
+        #btn-kettle.active { background: rgba(239, 83, 80, 0.3); border-color: var(--color-kettle); }
+        #btn-fridge.active { background: rgba(66, 165, 245, 0.3); border-color: var(--color-fridge); }
+        #btn-idle.active { background: rgba(158, 158, 158, 0.3); border-color: var(--color-idle); }
+
+        /* CSS2D Labels */
+        .label {
+            color: white;
+            font-size: 12px;
+            font-family: monospace;
+            padding: 2px 6px;
+            background: rgba(0,0,0,0.7);
+            border: 1px solid rgba(255,255,255,0.2);
+            border-radius: 4px;
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+
+        /* Flow Arrow */
+        .flow-container {
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px dashed var(--border-color);
+            text-align: center;
+        }
+        
+        .film-box {
+            display: inline-block;
+            background: rgba(244, 143, 177, 0.2);
+            border: 1px solid #f48fb1;
+            color: #f48fb1;
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-weight: bold;
+            margin-top: 10px;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(244, 143, 177, 0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(244, 143, 177, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(244, 143, 177, 0); }
+        }
+        
+        /* Tooltip */
+        #tooltip {
+            position: absolute;
+            background: rgba(0, 0, 0, 0.9);
+            border: 1px solid rgba(255,255,255,0.2);
+            color: white;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            pointer-events: none;
+            opacity: 0;
+            z-index: 100;
+            transform: translate(-50%, -100%);
+            margin-top: -10px;
+            white-space: pre-line;
+            font-family: monospace;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .dashboard {
+                flex-direction: column;
+                height: auto;
+                min-height: 0;
+            }
+            body { overflow: auto; min-height: 0; height: auto; }
+            .left-column, .right-column { flex: none; }
+        }
+        @media (max-width: 640px) {
+            .header { padding: 10px 15px; }
+            .header h1 { font-size: 18px; }
+            .header p { font-size: 12px; }
+            .dashboard { padding: 0 10px 10px 10px; gap: 10px; }
+            .controls { height: 50px; gap: 8px; }
+            .controls button { padding: 8px 14px; font-size: 12px; }
+        }
+    </style>
+    
+    <!-- Three.js Import Maps -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+<style>.nav-back{display:inline-flex;align-items:center;gap:6px;color:#4fc3f7;text-decoration:none;font-size:13px;font-family:-apple-system,BlinkMacSystemFont,monospace;opacity:0.7;transition:opacity .2s;white-space:nowrap}.nav-back:hover{opacity:1;color:#81d4fa}.nav-back svg{width:14px;height:14px;fill:currentColor}</style>
+</head>
+<body data-condinilm="true">
+
+    <div class="header">
+        <a class="nav-back" href="/">&larr; Home</a>
+        <h1>Condition Features Extraction</h1>
+        <p>CondiNILM transforms power windows into a 13-dim context vector for FiLM modulation.</p>
+    </div>
+
+    <div class="dashboard">
+        <!-- Left Side: Visualizations -->
+        <div class="left-column">
+            <div class="panel waveform-panel">
+                <div class="panel-title">1. Electrical Features (Time Domain)</div>
+                <div id="webgl-canvas"></div>
+            </div>
+            <div class="panel fft-panel">
+                <div class="panel-title">2. Frequency Features (FFT Spectrum)</div>
+                <canvas id="fft-canvas"></canvas>
+            </div>
+        </div>
+
+        <!-- Right Side: Condition Vector -->
+        <div class="right-column">
+            <div class="panel-title" style="position:relative; top:0; left:0; margin-bottom:10px;">3. Condition Vector (13-dim)</div>
+            <p style="font-size: 12px; color: var(--text-muted); margin: 0 0 10px 0;">
+                Concatenated electrical + frequency features representing the window's context.
+            </p>
+            <canvas id="vector-canvas"></canvas>
+            
+            <div class="flow-container">
+                <div>↓ Vector passed as condition ↓</div>
+                <div class="film-box">FiLM Network Module</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bottom Controls -->
+    <div class="controls">
+        <span style="color: var(--text-muted); font-size: 14px;">Scenarios:</span>
+        <button id="btn-kettle" class="active">Kettle ON (Spike)</button>
+        <button id="btn-fridge">Fridge Cycling (Periodic)</button>
+        <button id="btn-idle">Idle (Noise)</button>
+    </div>
+
+    <div id="tooltip"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
+        // --- Data & Math Utilities ---
+        const SIGNAL_LENGTH = 480;
+        
+        // Data Structures for 3 Scenarios
+        const scenarios = {
+            kettle: {
+                power: [], fft: [4.5, 3.2, 1.0, 0.5, 0.2, 0.1, 0.1, 0.1],
+                color: 0xef5350
+            },
+            fridge: {
+                power: [], fft: [1.2, 1.5, 3.8, 2.5, 1.0, 0.5, 0.2, 0.1],
+                color: 0x42a5f5
+            },
+            idle: {
+                power: [], fft: [0.3, 0.3, 0.3, 0.3, 0.4, 0.5, 0.6, 0.5],
+                color: 0x9e9e9e
+            }
+        };
+
+        // Generate Synthetic Power Windows
+        for(let i=0; i<SIGNAL_LENGTH; i++) {
+            let noise = Math.random() * 0.05;
+            
+            // Kettle: Huge spike in the middle
+            let k = 0.05 + noise;
+            if (i > 200 && i < 240) k += 0.85 + Math.random()*0.1;
+            if (i === 200 || i === 240) k += 0.4; // edges
+            scenarios.kettle.power.push(k);
+
+            // Fridge: Periodic square waves
+            let f = 0.05 + noise;
+            if ((i % 80) < 30) f += 0.2 + Math.random()*0.05;
+            scenarios.fridge.power.push(f);
+
+            // Idle: Just baseline noise
+            let id = 0.02 + noise;
+            scenarios.idle.power.push(id);
+        }
+
+        // Feature Calculation function
+        function calcStats(arr) {
+            let sum = 0;
+            let sqSum = 0;
+            let peak = 0;
+            for(let i=0; i<arr.length; i++) {
+                sum += arr[i];
+                sqSum += arr[i] * arr[i];
+                if (arr[i] > peak) peak = arr[i];
+            }
+            const mean = sum / arr.length;
+            const rms = Math.sqrt(sqSum / arr.length);
+            
+            let varSum = 0;
+            for(let i=0; i<arr.length; i++) {
+                varSum += Math.pow(arr[i] - mean, 2);
+            }
+            const std = Math.sqrt(varSum / arr.length);
+            const crest = peak / (rms + 1e-6);
+
+            return { mean, std, rms, peak, crest };
+        }
+
+        // Precalculate stats
+        for (const key in scenarios) {
+            scenarios[key].stats = calcStats(scenarios[key].power);
+        }
+
+        // Current & Target State for interpolation
+        let currentData = {
+            power: [...scenarios.kettle.power],
+            fft: [...scenarios.kettle.fft],
+            stats: {...scenarios.kettle.stats},
+            color: new THREE.Color(scenarios.kettle.color)
+        };
+        let targetScenario = scenarios.kettle;
+        
+        // Animation Sequence State
+        // 0: wave, 1: mean, 2: std, 3: rms, 4: peak/crest
+        let featureAnimState = 0; 
+        let featureTimer = 0;
+
+        // --- WebGL Setup (Time Domain) ---
+        const glContainer = document.getElementById('webgl-canvas');
+        const scene = new THREE.Scene();
+        const camera = new THREE.PerspectiveCamera(45, glContainer.clientWidth / glContainer.clientHeight, 0.1, 100);
+        camera.position.set(0, 0.5, 4);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(glContainer.clientWidth, glContainer.clientHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        glContainer.appendChild(renderer.domElement);
+
+        const labelRenderer = new CSS2DRenderer();
+        labelRenderer.setSize(glContainer.clientWidth, glContainer.clientHeight);
+        labelRenderer.domElement.style.position = 'absolute';
+        labelRenderer.domElement.style.top = '0px';
+        labelRenderer.domElement.style.pointerEvents = 'none';
+        glContainer.appendChild(labelRenderer.domElement);
+
+        // Resize handler
+        window.addEventListener('resize', () => {
+            camera.aspect = glContainer.clientWidth / glContainer.clientHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(glContainer.clientWidth, glContainer.clientHeight);
+            labelRenderer.setSize(glContainer.clientWidth, glContainer.clientHeight);
+            resizeCanvases();
+        });
+
+        // WebGL Objects
+        const MAX_X = 6;
+        const lineGeo = new THREE.BufferGeometry();
+        const positions = new Float32Array(SIGNAL_LENGTH * 3);
+        lineGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        const lineMat = new THREE.LineBasicMaterial({ color: 0xffffff, linewidth: 2 });
+        const waveLine = new THREE.Line(lineGeo, lineMat);
+        scene.add(waveLine);
+
+        // Feature Overlays
+        function createHLine(color) {
+            const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(-MAX_X/2, 0, 0), new THREE.Vector3(MAX_X/2, 0, 0)]);
+            const mat = new THREE.LineDashedMaterial({ color: color, dashSize: 0.1, gapSize: 0.05 });
+            const line = new THREE.Line(geo, mat);
+            line.computeLineDistances();
+            line.visible = false;
+            scene.add(line);
+            return line;
+        }
+
+        const meanLine = createHLine(0xffa726);
+        const rmsLine = createHLine(0xab47bc);
+        
+        // Std Band
+        const stdGeo = new THREE.PlaneGeometry(MAX_X, 1);
+        const stdMat = new THREE.MeshBasicMaterial({ color: 0xffa726, transparent: true, opacity: 0.15, side: THREE.DoubleSide });
+        const stdBand = new THREE.Mesh(stdGeo, stdMat);
+        stdBand.visible = false;
+        scene.add(stdBand);
+
+        // Peak Arrow
+        const arrowDir = new THREE.Vector3(0, -1, 0);
+        const arrowOrigin = new THREE.Vector3(0, 2, 0);
+        const peakArrow = new THREE.ArrowHelper(arrowDir, arrowOrigin, 0.5, 0xef5350, 0.1, 0.1);
+        peakArrow.visible = false;
+        scene.add(peakArrow);
+
+        // CSS Labels
+        function createLabel(text, color) {
+            const div = document.createElement('div');
+            div.className = 'label';
+            div.style.color = color;
+            div.style.borderColor = color;
+            div.innerHTML = text;
+            const obj = new CSS2DObject(div);
+            scene.add(obj);
+            return { obj, div };
+        }
+
+        const lblMean = createLabel("Mean", "#ffa726");
+        const lblRms = createLabel("RMS", "#ab47bc");
+        const lblPeak = createLabel("Peak", "#ef5350");
+        const lblCrest = createLabel("Crest Ratio", "#ffffff");
+
+        // Coordinates mapping
+        function mapX(index) {
+            return (index / SIGNAL_LENGTH) * MAX_X - (MAX_X / 2);
+        }
+        function mapY(val) {
+            return val * 2.5 - 1.0; // Scale to fit screen vertically
+        }
+
+        // --- 2D Canvas Setup (FFT & Vector) ---
+        const fftCanvas = document.getElementById('fft-canvas');
+        const fftCtx = fftCanvas.getContext('2d');
+        const vecCanvas = document.getElementById('vector-canvas');
+        const vecCtx = vecCanvas.getContext('2d');
+
+        function resizeCanvases() {
+            const fRect = fftCanvas.parentElement.getBoundingClientRect();
+            fftCanvas.width = fRect.width * window.devicePixelRatio;
+            fftCanvas.height = (fRect.height - 40) * window.devicePixelRatio; // account for title
+            fftCtx.scale(window.devicePixelRatio, window.devicePixelRatio);
+
+            const vRect = vecCanvas.parentElement.getBoundingClientRect();
+            vecCanvas.width = vRect.width * window.devicePixelRatio;
+            vecCanvas.height = (vRect.height - 120) * window.devicePixelRatio;
+            vecCtx.scale(window.devicePixelRatio, window.devicePixelRatio);
+        }
+        resizeCanvases();
+
+        // Color Gradients
+        function getFreqColor(index, total) {
+            // Warm to cool: 0 is red/orange, max is blue
+            const hue = (index / (total - 1)) * 240; // 0 to 240
+            return `hsl(${hue}, 80%, 60%)`;
+        }
+
+        // --- Draw Functions ---
+
+        function updateWebGL() {
+            // Interpolate waveform
+            let maxCurrentVal = 0;
+            let peakIndex = 0;
+
+            const pos = waveLine.geometry.attributes.position.array;
+            for(let i=0; i<SIGNAL_LENGTH; i++) {
+                // LERP power
+                currentData.power[i] += (targetScenario.power[i] - currentData.power[i]) * 0.1;
+                
+                pos[i*3] = mapX(i);
+                pos[i*3+1] = mapY(currentData.power[i]);
+                pos[i*3+2] = 0;
+
+                if (currentData.power[i] > maxCurrentVal) {
+                    maxCurrentVal = currentData.power[i];
+                    peakIndex = i;
+                }
+            }
+            waveLine.geometry.attributes.position.needsUpdate = true;
+            
+            // LERP Stats
+            currentData.stats.mean += (targetScenario.stats.mean - currentData.stats.mean) * 0.1;
+            currentData.stats.std += (targetScenario.stats.std - currentData.stats.std) * 0.1;
+            currentData.stats.rms += (targetScenario.stats.rms - currentData.stats.rms) * 0.1;
+            currentData.stats.peak += (targetScenario.stats.peak - currentData.stats.peak) * 0.1;
+            currentData.stats.crest += (targetScenario.stats.crest - currentData.stats.crest) * 0.1;
+            
+            // LERP Color
+            currentData.color.lerp(new THREE.Color(targetScenario.color), 0.1);
+            waveLine.material.color = currentData.color;
+
+            // Update Overlays Positions
+            const yMean = mapY(currentData.stats.mean);
+            meanLine.position.y = yMean;
+            lblMean.obj.position.set(MAX_X/2 + 0.2, yMean, 0);
+            lblMean.div.innerHTML = `Mean: ${currentData.stats.mean.toFixed(2)}`;
+
+            const yRms = mapY(currentData.stats.rms);
+            rmsLine.position.y = yRms;
+            lblRms.obj.position.set(MAX_X/2 + 0.2, yRms, 0);
+            lblRms.div.innerHTML = `RMS: ${currentData.stats.rms.toFixed(2)}`;
+
+            stdBand.position.y = yMean;
+            stdBand.scale.y = currentData.stats.std * 2.5 * 2; // scale full height (std up and down)
+
+            const yPeak = mapY(currentData.stats.peak);
+            const xPeak = mapX(peakIndex);
+            peakArrow.position.set(xPeak, yPeak + 0.6, 0);
+            lblPeak.obj.position.set(xPeak, yPeak + 0.8, 0);
+            lblPeak.div.innerHTML = `Peak: ${currentData.stats.peak.toFixed(2)}`;
+            
+            lblCrest.obj.position.set(xPeak, yPeak + 1.1, 0);
+            lblCrest.div.innerHTML = `Crest (Peak/RMS): ${currentData.stats.crest.toFixed(1)}`;
+
+            // Visibility based on sequence state
+            meanLine.visible = featureAnimState >= 1;
+            lblMean.div.style.opacity = featureAnimState >= 1 ? 1 : 0;
+            
+            stdBand.visible = featureAnimState >= 2;
+            
+            rmsLine.visible = featureAnimState >= 3;
+            lblRms.div.style.opacity = featureAnimState >= 3 ? 1 : 0;
+            
+            peakArrow.visible = featureAnimState >= 4;
+            lblPeak.div.style.opacity = featureAnimState >= 4 ? 1 : 0;
+            lblCrest.div.style.opacity = featureAnimState >= 4 ? 1 : 0;
+        }
+
+        function drawFFT() {
+            const w = fftCanvas.width / window.devicePixelRatio;
+            const h = fftCanvas.height / window.devicePixelRatio;
+            fftCtx.clearRect(0, 0, w, h);
+
+            const padding = 30;
+            const barW = (w - padding * 2) / 8 - 5;
+            const maxFFT = 5.0; // fixed visual scale
+
+            // LERP FFT data
+            for(let i=0; i<8; i++) {
+                currentData.fft[i] += (targetScenario.fft[i] - currentData.fft[i]) * 0.1;
+                
+                const val = currentData.fft[i];
+                const barH = (val / maxFFT) * (h - padding*2);
+                const x = padding + i * (barW + 5);
+                const y = h - padding - barH;
+
+                fftCtx.fillStyle = getFreqColor(i, 8);
+                fftCtx.fillRect(x, y, barW, barH);
+
+                // Label
+                fftCtx.fillStyle = '#a0a0b0';
+                fftCtx.font = '10px sans-serif';
+                fftCtx.textAlign = 'center';
+                fftCtx.fillText(`Band ${i}`, x + barW/2, h - 10);
+                
+                // Value
+                if(barH > 15) {
+                    fftCtx.fillStyle = '#fff';
+                    fftCtx.fillText(val.toFixed(1), x + barW/2, y + 12);
+                }
+            }
+
+            // Axes
+            fftCtx.strokeStyle = 'rgba(255,255,255,0.2)';
+            fftCtx.beginPath();
+            fftCtx.moveTo(padding, h - padding);
+            fftCtx.lineTo(w - padding, h - padding);
+            fftCtx.stroke();
+        }
+
+        function drawConditionVector() {
+            const w = vecCanvas.width / window.devicePixelRatio;
+            const h = vecCanvas.height / window.devicePixelRatio;
+            vecCtx.clearRect(0, 0, w, h);
+
+            // Assemble 13-dim vector
+            const vec = [
+                currentData.stats.mean,
+                currentData.stats.std,
+                currentData.stats.rms,
+                currentData.stats.peak,
+                currentData.stats.crest / 10, // scale crest visually
+                ...currentData.fft.map(v => v / 5.0) // scale fft visually
+            ];
+
+            const labels = [
+                "Mean", "Std", "RMS", "Peak", "Crest",
+                "F0", "F1", "F2", "F3", "F4", "F5", "F6", "F7"
+            ];
+
+            const barH = h / 13 - 4;
+            const labelW = 40;
+            const maxW = w - labelW - 10;
+
+            for(let i=0; i<13; i++) {
+                const y = i * (barH + 4);
+                const valW = Math.max(0, Math.min(1.0, vec[i])) * maxW;
+
+                // Color mapping: 0-4 Electrical (warm), 5-12 FFT (gradient)
+                let color;
+                if (i === 0) color = '#ffa726'; // mean
+                else if (i === 1) color = '#ffb74d'; // std
+                else if (i === 2) color = '#ab47bc'; // rms
+                else if (i === 3) color = '#ef5350'; // peak
+                else if (i === 4) color = '#e53935'; // crest
+                else color = getFreqColor(i-5, 8); // fft
+
+                // Background bar
+                vecCtx.fillStyle = 'rgba(255,255,255,0.05)';
+                vecCtx.fillRect(labelW, y, maxW, barH);
+
+                // Value bar
+                vecCtx.fillStyle = color;
+                vecCtx.fillRect(labelW, y, valW, barH);
+
+                // Label
+                vecCtx.fillStyle = '#a0a0b0';
+                vecCtx.font = '11px monospace';
+                vecCtx.textAlign = 'right';
+                vecCtx.textBaseline = 'middle';
+                vecCtx.fillText(labels[i], labelW - 5, y + barH/2);
+
+                // Value Text
+                vecCtx.fillStyle = '#fff';
+                vecCtx.textAlign = 'left';
+                let rawVal = (i === 4) ? vec[i]*10 : (i >= 5 ? vec[i]*5 : vec[i]);
+                vecCtx.fillText(rawVal.toFixed(2), labelW + valW + 5, y + barH/2);
+            }
+        }
+
+        // --- Interaction & Loop ---
+
+        function startSequence() {
+            featureAnimState = 0;
+            featureTimer = 0;
+        }
+
+        document.getElementById('btn-kettle').addEventListener('click', (e) => {
+            document.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+            e.target.classList.add('active');
+            targetScenario = scenarios.kettle;
+            startSequence();
+        });
+
+        document.getElementById('btn-fridge').addEventListener('click', (e) => {
+            document.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+            e.target.classList.add('active');
+            targetScenario = scenarios.fridge;
+            startSequence();
+        });
+
+        document.getElementById('btn-idle').addEventListener('click', (e) => {
+            document.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+            e.target.classList.add('active');
+            targetScenario = scenarios.idle;
+            startSequence();
+        });
+
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Sequence Timer (every 0.5s = 30 frames roughly)
+            featureTimer++;
+            if (featureTimer > 30 && featureAnimState < 4) {
+                featureAnimState++;
+                featureTimer = 0;
+            }
+
+            // Slow idle drift to make signal look alive
+            if (targetScenario === scenarios.idle || targetScenario === scenarios.fridge) {
+                for(let i=0; i<SIGNAL_LENGTH; i++) {
+                    targetScenario.power[i] += (Math.random() - 0.5) * 0.01;
+                }
+            }
+
+            updateWebGL();
+            drawFFT();
+            drawConditionVector();
+
+            renderer.render(scene, camera);
+            labelRenderer.render(scene, camera);
+        }
+
+        // Start
+        startSequence();
+        animate();
+
+        // Tooltip logic for Condition Vector
+        const tooltip = document.getElementById('tooltip');
+        vecCanvas.addEventListener('mousemove', (e) => {
+            const rect = vecCanvas.getBoundingClientRect();
+            const y = e.clientY - rect.top;
+            const h = rect.height / window.devicePixelRatio;
+            const barH = h / 13;
+            
+            const index = Math.floor((y / rect.height) * 13);
+            
+            if (index >= 0 && index < 13) {
+                tooltip.style.opacity = 1;
+                tooltip.style.left = e.clientX + 'px';
+                tooltip.style.top = e.clientY + 'px';
+                
+                let desc = "";
+                if(index === 0) desc = "Mean:\nAverage power level";
+                else if(index === 1) desc = "Std:\nPower variability";
+                else if(index === 2) desc = "RMS:\nEffective power level";
+                else if(index === 3) desc = "Peak:\nMaximum instant power";
+                else if(index === 4) desc = "Crest Factor:\nPeak / RMS (Spikiness)";
+                else desc = `Freq Band ${index-5}:\nEnergy magnitude via FFT`;
+                
+                tooltip.innerHTML = desc;
+            } else {
+                tooltip.style.opacity = 0;
+            }
+        });
+        vecCanvas.addEventListener('mouseleave', () => tooltip.style.opacity = 0);
+
+    </script>
+</body>
+</html>

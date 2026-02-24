@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CondiNILM Data Preprocessing Pipeline</title>
+    <style>
+        :root {
+            --bg-color: #1a1a2e;
+            --text-main: #ffffff;
+            --text-muted: #a0a0b0;
+            --panel-bg: rgba(20, 20, 35, 0.85);
+            --border-color: rgba(255, 255, 255, 0.1);
+            --primary: #4fc3f7;
+            --accent: #ffa726;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: var(--bg-color);
+            font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            color: var(--text-main);
+        }
+
+        /* Layout */
+        #chart-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 45vh;
+            border-bottom: 1px solid var(--border-color);
+            background: linear-gradient(to bottom, #111122, #1a1a2e);
+            z-index: 2;
+        }
+
+        #chart-canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        #webgl-container {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            width: 100vw;
+            height: 55vh;
+            z-index: 1;
+        }
+
+        /* UI Overlays */
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 10;
+            pointer-events: none;
+        }
+
+        .header {
+            position: absolute;
+            top: 20px;
+            left: 30px;
+            pointer-events: auto;
+        }
+
+        .header h1 {
+            margin: 0;
+            font-size: 22px;
+            font-weight: 600;
+            letter-spacing: 1px;
+            text-shadow: 0 0 10px rgba(0, 0, 0, 0.8);
+        }
+
+        .header p {
+            margin: 5px 0 0 0;
+            color: var(--text-muted);
+            font-size: 14px;
+        }
+
+        /* Step Card */
+        #step-card {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            background: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 20px;
+            backdrop-filter: blur(10px);
+            pointer-events: auto;
+            width: 320px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            transition: all 0.3s ease;
+        }
+
+        .step-badge {
+            background: rgba(79, 195, 247, 0.2);
+            color: var(--primary);
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: bold;
+            margin-bottom: 10px;
+            display: inline-block;
+        }
+
+        #step-title {
+            margin: 0 0 10px 0;
+            font-size: 18px;
+            color: #fff;
+        }
+
+        #step-desc {
+            font-size: 14px;
+            line-height: 1.5;
+            color: #d0d0d0;
+            margin-bottom: 15px;
+        }
+
+        #step-shape {
+            font-family: monospace;
+            background: rgba(0,0,0,0.5);
+            padding: 8px;
+            border-radius: 4px;
+            font-size: 13px;
+            color: var(--accent);
+            border: 1px solid rgba(255,167,38,0.2);
+        }
+
+        /* Controls */
+        .controls {
+            position: absolute;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            pointer-events: auto;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            background: var(--panel-bg);
+            padding: 10px 20px;
+            border-radius: 30px;
+            border: 1px solid var(--border-color);
+            backdrop-filter: blur(10px);
+        }
+
+        button {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: white;
+            padding: 8px 16px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: all 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        button:hover {
+            background: rgba(255, 255, 255, 0.15);
+            border-color: rgba(255, 255, 255, 0.3);
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .play-btn {
+            background: rgba(79, 195, 247, 0.2);
+            border-color: rgba(79, 195, 247, 0.4);
+            color: var(--primary);
+        }
+
+        .play-btn:hover {
+            background: rgba(79, 195, 247, 0.3);
+        }
+
+        .progress-dots {
+            display: flex;
+            gap: 6px;
+            margin: 0 10px;
+        }
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.2);
+            transition: all 0.3s;
+        }
+
+        .dot.active {
+            background: var(--primary);
+            box-shadow: 0 0 8px var(--primary);
+            transform: scale(1.2);
+        }
+
+        /* Loading */
+        #loader {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 20px;
+            z-index: 1000;
+            pointer-events: none;
+        }
+
+        /* Responsive */
+        @media (max-width: 640px) {
+            .header { top: 10px; left: 15px; }
+            .header h1 { font-size: 18px; }
+            .header p { font-size: 12px; }
+            #step-card {
+                top: auto;
+                bottom: 80px;
+                right: 10px;
+                left: 10px;
+                width: auto;
+            }
+            .controls { padding: 8px 12px; gap: 8px; bottom: 15px; }
+            .controls button { padding: 6px 12px; font-size: 12px; }
+        }
+    </style>
+    
+    <!-- Import maps for Three.js -->
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+<style>.nav-back{display:inline-flex;align-items:center;gap:6px;color:#4fc3f7;text-decoration:none;font-size:13px;font-family:-apple-system,BlinkMacSystemFont,monospace;opacity:0.7;transition:opacity .2s;white-space:nowrap}.nav-back:hover{opacity:1;color:#81d4fa}.nav-back svg{width:14px;height:14px;fill:currentColor}</style>
+</head>
+<body data-condinilm="true">
+    <div id="loader">Initializing Pipeline...</div>
+
+    <!-- Top 2D Chart for Signal -->
+    <div id="chart-container">
+        <canvas id="chart-canvas"></canvas>
+    </div>
+
+    <!-- Bottom 3D Scene for Tensors -->
+    <div id="webgl-container"></div>
+
+    <div id="ui-layer">
+        <div class="header">
+            <a class="nav-back" href="/">&larr; Home</a>
+            <h1>CondiNILM Preprocessing</h1>
+            <p>Data Transformation Pipeline</p>
+        </div>
+
+        <div id="step-card">
+            <div class="step-badge" id="step-badge">STEP 1 / 7</div>
+            <h2 id="step-title">Raw Data Loading</h2>
+            <p id="step-desc">Loads household power measurements from CSV. The data contains noise and high-power anomalies.</p>
+            <div id="step-shape">Tensor Shape: (T,)</div>
+        </div>
+
+        <div class="controls">
+            <button id="btn-prev">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"/></svg> Prev
+            </button>
+            <button id="btn-play" class="play-btn">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg> Play
+            </button>
+            <div class="progress-dots" id="dots-container">
+                <!-- Dots added by JS -->
+            </div>
+            <button id="btn-next">
+                Next <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18l6-6-6-6"/></svg>
+            </button>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- Data & Steps Configuration ---
+        const STEPS = [
+            { id: 0, title: "1. Raw Data Loading", desc: "System loads household power measurements. The data contains noise, fridge cycles, and extremely high kettle spikes (e.g., >8000W errors).", shape: "(T,)", targetYMax: 10000 },
+            { id: 1, title: "2. Power Cutoff", desc: "Anomalous readings above the maximum threshold (6000W) are clipped to remove sensor errors.", shape: "(T,)", targetYMax: 6500 },
+            { id: 2, title: "3. Normalization", desc: "Power values are scaled using MaxScaling (x / 6000). The Y-axis smoothly rescales to [0, 1].", shape: "(T,)", targetYMax: 1.1 },
+            { id: 3, title: "4. State Detection", desc: "A binary ON/OFF state mask is generated for each appliance by applying power thresholds (green bands show ON states).", shape: "(M, 2, T)", targetYMax: 1.1 },
+            { id: 4, title: "5. Sliding Windows", desc: "The continuous time series is sliced into 480-timestep (8 hour) windows with 75% overlap. Splits are assigned to Train/Val/Test.", shape: "(N, M, 2, W)", targetYMax: 1.1 },
+            { id: 5, title: "6. Temporal Encoding", desc: "Cyclical exogenous features (sin/cos of hour, day, month) are generated and concatenated to the power signal.", shape: "(N, 1+E, W)", targetYMax: 1.1 },
+            { id: 6, title: "7. Model Input Batch", desc: "Windows are grouped into random batches of 32 for the NILMFormer model training process.", shape: "(B, 7, 480)", targetYMax: 1.1 }
+        ];
+
+        const TOTAL_STEPS = STEPS.length;
+        const SIGNAL_LENGTH = 480; // Represents total T for visual simplicity
+        let rawPower = [];
+        let states = []; // Binary states
+
+        // Generate synthetic data
+        function generateData() {
+            for(let i=0; i<SIGNAL_LENGTH; i++) {
+                // Baseline noise (30-60W)
+                let p = 30 + Math.random() * 30;
+                
+                // Fridge (Cycles on for 20 mins, off for 40 mins)
+                let isFridgeOn = (i % 60) < 20;
+                if(isFridgeOn) p += 120 + Math.random() * 10;
+                
+                // Kettle spikes (Short duration, high power)
+                let isKettleOn = false;
+                if ((i > 80 && i < 85) || (i > 250 && i < 256) || (i > 400 && i < 404)) {
+                    isKettleOn = true;
+                    p += 2500 + Math.random() * 500;
+                }
+                
+                // Sensor Error / Anomaly
+                if (i === 150 || i === 151) p += 8000;
+
+                rawPower.push(p);
+                states.push((isKettleOn || isFridgeOn) ? 1 : 0);
+            }
+        }
+        generateData();
+
+        // --- State Management ---
+        let currentStepTarget = 0;
+        let animProgress = 0; // Continuous float from 0.0 to 6.0
+        let isPlaying = false;
+        let playTimer = 0;
+
+        // --- UI Setup ---
+        const dotsContainer = document.getElementById('dots-container');
+        for(let i=0; i<TOTAL_STEPS; i++) {
+            const dot = document.createElement('div');
+            dot.className = i === 0 ? 'dot active' : 'dot';
+            dotsContainer.appendChild(dot);
+        }
+
+        function updateUI() {
+            const idx = Math.min(Math.floor(animProgress + 0.5), TOTAL_STEPS - 1);
+            const step = STEPS[idx];
+            
+            document.getElementById('step-badge').textContent = `STEP ${idx + 1} / ${TOTAL_STEPS}`;
+            document.getElementById('step-title').textContent = step.title;
+            document.getElementById('step-desc').textContent = step.desc;
+            document.getElementById('step-shape').textContent = `Tensor Shape: ${step.shape}`;
+
+            // Update dots
+            const dots = dotsContainer.children;
+            for(let i=0; i<dots.length; i++) {
+                dots[i].className = i === idx ? 'dot active' : 'dot';
+            }
+
+            // Buttons
+            document.getElementById('btn-prev').disabled = currentStepTarget === 0;
+            document.getElementById('btn-next').disabled = currentStepTarget === TOTAL_STEPS - 1;
+        }
+
+        // Controls Event Listeners
+        document.getElementById('btn-next').addEventListener('click', () => {
+            if(currentStepTarget < TOTAL_STEPS - 1) currentStepTarget++;
+            pauseAutoPlay();
+        });
+        document.getElementById('btn-prev').addEventListener('click', () => {
+            if(currentStepTarget > 0) currentStepTarget--;
+            pauseAutoPlay();
+        });
+        document.getElementById('btn-play').addEventListener('click', () => {
+            isPlaying = !isPlaying;
+            const btn = document.getElementById('btn-play');
+            if(isPlaying) {
+                btn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M6 4h4v16H6zm8 0h4v16h-4z"/></svg> Pause`;
+                if(currentStepTarget === TOTAL_STEPS - 1) currentStepTarget = 0; // loop back
+            } else {
+                btn.innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg> Play`;
+            }
+        });
+
+        function pauseAutoPlay() {
+            isPlaying = false;
+            document.getElementById('btn-play').innerHTML = `<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg> Play`;
+        }
+
+        // --- 2D Canvas Chart Logic ---
+        const canvas = document.getElementById('chart-canvas');
+        const ctx = canvas.getContext('2d');
+        
+        function resizeCanvas() {
+            const container = document.getElementById('chart-container');
+            canvas.width = container.clientWidth * window.devicePixelRatio;
+            canvas.height = container.clientHeight * window.devicePixelRatio;
+            ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        function lerp(start, end, amt) {
+            return (1 - amt) * start + amt * end;
+        }
+        function clamp(val, min, max) {
+            return Math.min(Math.max(val, min), max);
+        }
+
+        // Dynamic Y Max for chart
+        let currentYMax = 10000;
+
+        function drawChart() {
+            const width = canvas.width / window.devicePixelRatio;
+            const height = canvas.height / window.devicePixelRatio;
+            
+            ctx.clearRect(0, 0, width, height);
+
+            // Calculate current Y max based on progress
+            const stepFloor = Math.floor(animProgress);
+            const stepCeil = Math.min(stepFloor + 1, TOTAL_STEPS - 1);
+            const localT = animProgress - stepFloor;
+            const targetY = lerp(STEPS[stepFloor].targetYMax, STEPS[stepCeil].targetYMax, localT);
+            currentYMax = lerp(currentYMax, targetY, 0.1); // Smooth transition
+
+            const padding = { top: 40, right: 40, bottom: 40, left: 60 };
+            const graphWidth = width - padding.left - padding.right;
+            const graphHeight = height - padding.top - padding.bottom;
+
+            function getY(val) {
+                return padding.top + graphHeight - (val / currentYMax) * graphHeight;
+            }
+            function getX(i) {
+                return padding.left + (i / SIGNAL_LENGTH) * graphWidth;
+            }
+
+            // Draw Grid
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            for(let i=0; i<=5; i++) {
+                const y = padding.top + (i/5)*graphHeight;
+                ctx.moveTo(padding.left, y);
+                ctx.lineTo(width - padding.right, y);
+            }
+            ctx.stroke();
+
+            // Y Axis Labels
+            ctx.fillStyle = '#a0a0b0';
+            ctx.font = '12px sans-serif';
+            ctx.textAlign = 'right';
+            ctx.textBaseline = 'middle';
+            for(let i=0; i<=5; i++) {
+                const y = padding.top + (i/5)*graphHeight;
+                let val = currentYMax * (1 - i/5);
+                let label = val > 10 ? Math.round(val) + "W" : val.toFixed(1);
+                ctx.fillText(label, padding.left - 10, y);
+            }
+
+            // Step 3: State Detection (Green bands)
+            let stateOpacity = clamp(animProgress - 2.5, 0, 1) - clamp(animProgress - 5.5, 0, 1);
+            if (stateOpacity > 0) {
+                ctx.fillStyle = `rgba(102, 187, 106, ${stateOpacity * 0.15})`;
+                for(let i=0; i<SIGNAL_LENGTH; i++) {
+                    if (states[i] === 1) {
+                        ctx.fillRect(getX(i), padding.top, graphWidth/SIGNAL_LENGTH + 1, graphHeight);
+                    }
+                }
+            }
+
+            // Step 4: Sliding Window (Sweeping rect)
+            let sweepOpacity = clamp(animProgress - 3.5, 0, 1) - clamp(animProgress - 4.5, 0, 1);
+            if (sweepOpacity > 0) {
+                const windowSize = 80; // Visual representation
+                const sweepTime = Date.now() * 0.001;
+                const windowX = (sweepTime % 3) / 3 * (SIGNAL_LENGTH - windowSize);
+                
+                ctx.fillStyle = `rgba(255, 167, 38, ${sweepOpacity * 0.2})`;
+                ctx.strokeStyle = `rgba(255, 167, 38, ${sweepOpacity * 0.8})`;
+                ctx.lineWidth = 2;
+                
+                const sx = getX(windowX);
+                const sw = getX(windowX + windowSize) - sx;
+                
+                ctx.fillRect(sx, padding.top, sw, graphHeight);
+                ctx.strokeRect(sx, padding.top, sw, graphHeight);
+            }
+
+            // Step 5: Temporal Features (Sin/Cos waves)
+            let tempOpacity = clamp(animProgress - 4.5, 0, 1);
+            if (tempOpacity > 0) {
+                ctx.lineWidth = 1.5;
+                const timeScale = Date.now() * 0.002;
+                // Draw a few fake exogenous sine waves
+                for(let w=0; w<3; w++) {
+                    ctx.strokeStyle = w === 0 ? `rgba(244, 143, 177, ${tempOpacity * 0.6})` : `rgba(206, 147, 216, ${tempOpacity * 0.6})`;
+                    ctx.beginPath();
+                    for(let i=0; i<SIGNAL_LENGTH; i++) {
+                        // Math.sin for visual encoding
+                        let sinVal = Math.sin(i * 0.05 * (w+1) + timeScale) * 0.3 + 0.5; 
+                        // Map 0-1 to current graph height
+                        let actualVal = sinVal * currentYMax; 
+                        if(i===0) ctx.moveTo(getX(i), getY(actualVal));
+                        else ctx.lineTo(getX(i), getY(actualVal));
+                    }
+                    ctx.stroke();
+                }
+            }
+
+            // Draw Main Power Signal
+            ctx.beginPath();
+            ctx.lineWidth = 2;
+            let signalColor = 'rgba(79, 195, 247, 1)'; // Default blue
+            if (animProgress > 1 && animProgress < 2) signalColor = 'rgba(38, 198, 218, 1)'; // Cyan during cutoff
+            ctx.strokeStyle = signalColor;
+
+            // Cutoff threshold logic (Step 1 -> 2)
+            let cutoffVal = lerp(10000, 6000, clamp(animProgress, 0, 1));
+            // Normalization logic (Step 2 -> 3)
+            let normDiv = lerp(1, 6000, clamp(animProgress - 1, 0, 1));
+
+            for(let i=0; i<SIGNAL_LENGTH; i++) {
+                let p = rawPower[i];
+                
+                // Cutoff
+                let clipped = Math.min(p, cutoffVal);
+                
+                // Draw red spike if clipped
+                if (p > cutoffVal && p > 6000) {
+                    let redOpacity = 1 - clamp(animProgress - 1, 0, 1); // Fade out red after cutoff step
+                    if(redOpacity > 0) {
+                        ctx.strokeStyle = `rgba(255, 82, 82, ${redOpacity})`;
+                        ctx.beginPath();
+                        ctx.moveTo(getX(i), getY(cutoffVal / normDiv));
+                        ctx.lineTo(getX(i), getY(p / normDiv));
+                        ctx.stroke();
+                        ctx.beginPath(); // reset for main line
+                        ctx.strokeStyle = signalColor;
+                    }
+                }
+
+                // Normalize
+                let finalVal = clipped / normDiv;
+
+                let x = getX(i);
+                let y = getY(finalVal);
+
+                if(i===0) ctx.moveTo(x, y);
+                else ctx.lineTo(x, y);
+            }
+            ctx.stroke();
+            
+            // Draw Cutoff Line
+            let lineOpacity = clamp(animProgress, 0, 1) - clamp(animProgress - 1.5, 0, 1);
+            if(lineOpacity > 0) {
+                ctx.strokeStyle = `rgba(255, 82, 82, ${lineOpacity})`;
+                ctx.setLineDash([5, 5]);
+                ctx.beginPath();
+                ctx.moveTo(padding.left, getY(6000 / normDiv));
+                ctx.lineTo(width - padding.right, getY(6000 / normDiv));
+                ctx.stroke();
+                ctx.setLineDash([]);
+                
+                ctx.fillStyle = `rgba(255, 82, 82, ${lineOpacity})`;
+                ctx.fillText("6000W Cutoff", width - padding.right - 10, getY(6000 / normDiv) - 10);
+            }
+        }
+
+        // --- 3D WebGL Scene Logic ---
+        let scene, camera, renderer, controls;
+        let tensorGroups = [];
+
+        function init3D() {
+            document.getElementById('loader').style.display = 'none';
+            const container = document.getElementById('webgl-container');
+
+            scene = new THREE.Scene();
+            
+            camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 100);
+            camera.position.set(0, 15, 25);
+            camera.lookAt(0, 0, 0);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            container.appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.enablePan = false;
+
+            // Lighting
+            scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+            dirLight.position.set(10, 20, 10);
+            scene.add(dirLight);
+
+            createTensorModels();
+
+            window.addEventListener('resize', () => {
+                camera.aspect = container.clientWidth / container.clientHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(container.clientWidth, container.clientHeight);
+            });
+        }
+
+        function createColoredBox(w, h, d, color, wireframeColor) {
+            const geom = new THREE.BoxGeometry(w, h, d);
+            const mat = new THREE.MeshStandardMaterial({ 
+                color: color, 
+                transparent: true, 
+                opacity: 0.9,
+                roughness: 0.2,
+                metalness: 0.1
+            });
+            const mesh = new THREE.Mesh(geom, mat);
+            
+            const edges = new THREE.EdgesGeometry(geom);
+            const lineMat = new THREE.LineBasicMaterial({ color: wireframeColor || 0xffffff, transparent: true, opacity: 0.4 });
+            const wireframe = new THREE.LineSegments(edges, lineMat);
+            mesh.add(wireframe);
+            
+            return mesh;
+        }
+
+        function createTensorModels() {
+            // Group 0: Raw Data (1D vector visually stretched) -> Steps 0, 1, 2
+            const group0 = new THREE.Group();
+            const mesh0 = createColoredBox(20, 0.5, 1, 0x4fc3f7);
+            group0.add(mesh0);
+            tensorGroups.push({ stepRange: [0, 2.5], obj: group0 });
+            scene.add(group0);
+
+            // Group 1: State Detection (M, 2, T) -> Step 3
+            const group1 = new THREE.Group();
+            const mesh1 = createColoredBox(20, 2, 4, 0x66bb6a); // Ticker in Y, wider in Z
+            group1.add(mesh1);
+            tensorGroups.push({ stepRange: [2.5, 3.5], obj: group1 });
+            scene.add(group1);
+
+            // Group 2: Sliding Windows Stack (Overlapping) -> Step 4
+            const group2 = new THREE.Group();
+            const windowCount = 15;
+            for(let i=0; i<windowCount; i++) {
+                // Colors: Train(Blue), Val(Yellow), Test(Green)
+                let color = 0x4fc3f7; // Train
+                if (i > 8 && i <= 10) color = 0xffa726; // Val
+                if (i > 11) color = 0x66bb6a; // Test
+                
+                // Gap simulation: Skip drawing if i==8 or i==11
+                if (i === 8 || i === 11) continue;
+
+                const winMesh = createColoredBox(8, 2, 4, color);
+                // Stagger them
+                winMesh.position.set(-6 + i*0.8, -i*0.3, i*0.5 - 3);
+                group2.add(winMesh);
+            }
+            tensorGroups.push({ stepRange: [3.5, 4.5], obj: group2 });
+            scene.add(group2);
+
+            // Group 3: Temporal Encoding (Added channels) -> Step 5
+            const group3 = new THREE.Group();
+            const mesh3 = createColoredBox(8, 5, 4, 0xce93d8); // Taller Y for E=6 features
+            group3.add(mesh3);
+            tensorGroups.push({ stepRange: [4.5, 5.5], obj: group3 });
+            scene.add(group3);
+
+            // Group 4: Final Batch Block (B, 7, 480) -> Step 6
+            const group4 = new THREE.Group();
+            const mesh4 = createColoredBox(6, 6, 12, 0xffa726, 0xffffff); // Big block
+            group4.add(mesh4);
+            tensorGroups.push({ stepRange: [5.5, 7.0], obj: group4 });
+            scene.add(group4);
+
+            // Initial hide all
+            tensorGroups.forEach(g => {
+                g.obj.visible = false;
+                g.obj.children.forEach(c => {
+                    if(c.material) c.material.opacity = 0;
+                });
+            });
+        }
+
+        function update3DObjects() {
+            // Smoothly rotate the scene slightly
+            scene.rotation.y = Math.sin(Date.now() * 0.0005) * 0.1;
+            
+            tensorGroups.forEach(group => {
+                const [min, max] = group.stepRange;
+                // Calculate visibility weight (triangle function around the range)
+                let weight = 0;
+                if (animProgress >= min && animProgress <= max) {
+                    const mid = (min + max) / 2;
+                    const span = (max - min) / 2;
+                    weight = 1.0 - Math.abs(animProgress - mid) / span;
+                }
+                
+                weight = clamp(weight * 2, 0, 1); // Sharpen transitions
+
+                if (weight > 0.01) {
+                    group.obj.visible = true;
+                    // Float animation
+                    group.obj.position.y = Math.sin(Date.now() * 0.002) * 0.5;
+                    
+                    // Specific morphing within ranges
+                    if(group.obj.children.length === 1 && animProgress < 2.5) {
+                        // Morph raw data to normalized
+                        let scaleY = lerp(1, 0.2, clamp(animProgress - 1, 0, 1));
+                        group.obj.children[0].scale.setY(scaleY);
+                    }
+
+                    // Apply opacity
+                    group.obj.children.forEach(mesh => {
+                        if(mesh.material) mesh.material.opacity = weight * 0.9;
+                        if(mesh.children[0] && mesh.children[0].material) {
+                            mesh.children[0].material.opacity = weight * 0.4; // wireframe
+                        }
+                    });
+                } else {
+                    group.obj.visible = false;
+                }
+            });
+        }
+
+        // --- Main Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Logic to step forward if playing
+            if (isPlaying) {
+                playTimer++;
+                if (playTimer > 180) { // ~3 seconds per step
+                    playTimer = 0;
+                    currentStepTarget++;
+                    if (currentStepTarget >= TOTAL_STEPS) {
+                        currentStepTarget = TOTAL_STEPS - 1;
+                        pauseAutoPlay();
+                    }
+                }
+            } else {
+                playTimer = 0;
+            }
+
+            // Interpolate progress
+            animProgress += (currentStepTarget - animProgress) * 0.08;
+
+            updateUI();
+            drawChart();
+            
+            if(scene) {
+                update3DObjects();
+                controls.update();
+                renderer.render(scene, camera);
+            }
+        }
+
+        init3D();
+        animate();
+
+    </script>
+</body>
+</html>

@@ -1,0 +1,838 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Multi-Head Attention Visualization</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --panel-bg: #1e293b;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --border-color: #334155;
+            --accent: #3b82f6;
+            
+            --h0: #ef4444; /* red */
+            --h1: #f97316; /* orange */
+            --h2: #eab308; /* yellow */
+            --h3: #22c55e; /* green */
+            --h4: #06b6d4; /* cyan */
+            --h5: #3b82f6; /* blue */
+            --h6: #6366f1; /* indigo */
+            --h7: #a855f7; /* violet */
+        }
+
+        body {
+            margin: 0;
+            padding: 20px;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+        }
+
+        .header {
+            max-width: 1400px;
+            width: 100%;
+            margin-bottom: 20px;
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            margin: 0 0 10px 0;
+            font-weight: 600;
+        }
+
+        .insight-panel {
+            background-color: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+            font-size: 0.95rem;
+            line-height: 1.5;
+            color: var(--text-muted);
+        }
+
+        .insight-panel strong {
+            color: var(--text-main);
+        }
+
+        .main-container {
+            display: grid;
+            grid-template-columns: 300px 1fr 300px;
+            gap: 20px;
+            max-width: 1400px;
+            width: 100%;
+        }
+
+        .panel {
+            background-color: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .panel-title {
+            font-size: 1rem;
+            font-weight: 600;
+            margin-bottom: 12px;
+            text-align: center;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 8px;
+        }
+
+        canvas {
+            display: block;
+            margin: 0 auto;
+        }
+
+        .controls {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            margin-bottom: 16px;
+        }
+
+        .control-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            justify-content: center;
+            align-items: center;
+        }
+
+        button {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            border: 1px solid var(--border-color);
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: all 0.2s;
+        }
+
+        button:hover {
+            background-color: var(--border-color);
+        }
+
+        button.active {
+            background-color: var(--accent);
+            border-color: var(--accent);
+            color: white;
+        }
+
+        .head-btn {
+            width: 30px;
+            height: 30px;
+            padding: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            border-width: 2px;
+        }
+
+        /* Head Colors */
+        .btn-h0.active { background-color: var(--h0); border-color: var(--h0); }
+        .btn-h1.active { background-color: var(--h1); border-color: var(--h1); }
+        .btn-h2.active { background-color: var(--h2); border-color: var(--h2); }
+        .btn-h3.active { background-color: var(--h3); border-color: var(--h3); }
+        .btn-h4.active { background-color: var(--h4); border-color: var(--h4); }
+        .btn-h5.active { background-color: var(--h5); border-color: var(--h5); }
+        .btn-h6.active { background-color: var(--h6); border-color: var(--h6); }
+        .btn-h7.active { background-color: var(--h7); border-color: var(--h7); }
+
+        .legend {
+            display: flex;
+            justify-content: center;
+            gap: 16px;
+            margin-top: 8px;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .color-box {
+            width: 12px;
+            height: 12px;
+            border-radius: 2px;
+        }
+
+        .anim-status {
+            text-align: center;
+            font-size: 0.85rem;
+            color: var(--h2);
+            min-height: 20px;
+            margin-bottom: 8px;
+        }
+
+        #webglCanvas {
+            cursor: pointer;
+            border: 1px solid var(--border-color);
+            background-color: #000;
+        }
+
+        /* Responsive */
+        @media (max-width: 1024px) {
+            .main-container {
+                grid-template-columns: 1fr 1fr;
+            }
+            .main-container > .panel:nth-child(2) {
+                grid-column: 1 / -1;
+                order: -1;
+            }
+        }
+        @media (max-width: 768px) {
+            body { padding: 10px; }
+            h1 { font-size: 1.2rem; }
+        }
+        @media (max-width: 640px) {
+            body { overflow: auto; }
+            .main-container {
+                grid-template-columns: 1fr;
+                gap: 12px;
+            }
+            .main-container > .panel:nth-child(2) {
+                grid-column: auto;
+            }
+            canvas { max-width: 100%; height: auto; }
+            .control-row { gap: 4px; }
+            .head-btn { width: 26px; height: 26px; font-size: 0.75rem; }
+        }
+    </style>
+<style>.nav-back{display:inline-flex;align-items:center;gap:6px;color:#4fc3f7;text-decoration:none;font-size:13px;font-family:-apple-system,BlinkMacSystemFont,monospace;opacity:0.7;transition:opacity .2s;white-space:nowrap}.nav-back:hover{opacity:1;color:#81d4fa}.nav-back svg{width:14px;height:14px;fill:currentColor}</style>
+</head>
+<body data-condinilm="true">
+
+    <div class="header">
+        <a class="nav-back" href="/">&larr; Home</a>
+        <h1>Multi-Head Self-Attention with Diagonal Masking</h1>
+        <div class="insight-panel">
+            The model uses an attention mechanism. This mechanism is the core innovation. We apply <strong>diagonal masking</strong>. The model cannot look at its own time step. This action forces the model to use context. Context helps separate the signals. The input is aggregate power. The output is device power. Copying the input is useless.
+        </div>
+    </div>
+
+    <div class="main-container">
+        <!-- LEFT PANEL: Projections & Split -->
+        <div class="panel">
+            <div class="panel-title">1 & 2: Q/K/V & Split</div>
+            <canvas id="leftCanvas" width="268" height="500"></canvas>
+            <div style="font-size: 0.8rem; color: var(--text-muted); text-align: center; margin-top: 8px;">
+                Input (96-dim) projects to Q, K, V.<br>Then splits into 8 heads (12-dim each).
+            </div>
+        </div>
+
+        <!-- CENTER PANEL: WebGL Heatmap -->
+        <div class="panel">
+            <div class="panel-title">3 & 4: Attention Matrix (32x32)</div>
+            
+            <div class="controls">
+                <div class="control-row">
+                    <span>Head:</span>
+                    <button class="head-btn btn-h0 active" onclick="setHead(0)">0</button>
+                    <button class="head-btn btn-h1" onclick="setHead(1)">1</button>
+                    <button class="head-btn btn-h2" onclick="setHead(2)">2</button>
+                    <button class="head-btn btn-h3" onclick="setHead(3)">3</button>
+                    <button class="head-btn btn-h4" onclick="setHead(4)">4</button>
+                    <button class="head-btn btn-h5" onclick="setHead(5)">5</button>
+                    <button class="head-btn btn-h6" onclick="setHead(6)">6</button>
+                    <button class="head-btn btn-h7" onclick="setHead(7)">7</button>
+                </div>
+                
+                <div class="control-row" style="margin-top: 4px;">
+                    <button id="btnMask" class="active" onclick="toggleMask()">Diagonal Mask: ON</button>
+                    <button id="btnAnim" onclick="playMaskAnimation()">Play Sequence</button>
+                </div>
+            </div>
+
+            <div id="animStatus" class="anim-status"></div>
+
+            <canvas id="webglCanvas" width="400" height="400"></canvas>
+            
+            <div class="legend">
+                <div class="legend-item"><div class="color-box" style="background: #000080;"></div> Low (0)</div>
+                <div class="legend-item"><div class="color-box" style="background: #ffffff;"></div> Med (0.5)</div>
+                <div class="legend-item"><div class="color-box" style="background: #ff0000;"></div> High (1.0)</div>
+                <div class="legend-item"><div class="color-box" style="background: #000000; border: 1px solid #444;"></div> Masked</div>
+            </div>
+            <div style="font-size: 0.8rem; color: var(--text-muted); text-align: center; margin-top: 8px;">
+                Click a row to select Query position.
+            </div>
+        </div>
+
+        <!-- RIGHT PANEL: Aggregation & Merge -->
+        <div class="panel">
+            <div class="panel-title">5 & 6: Aggregate & Merge</div>
+            <canvas id="rightCanvas" width="268" height="500"></canvas>
+            <div style="font-size: 0.8rem; color: var(--text-muted); text-align: center; margin-top: 8px;">
+                Top 5 attended Values combine.<br>8 heads merge back to 96-dim output.
+            </div>
+        </div>
+    </div>
+
+<script>
+/**
+ * Data & Math Setup
+ */
+const L = 32; // Sequence length (simplified for viz)
+const H = 8;  // Heads
+const D = 96; // Total dimension
+
+// Head colors mapping
+const headColors = [
+    '#ef4444', '#f97316', '#eab308', '#22c55e', 
+    '#06b6d4', '#3b82f6', '#6366f1', '#a855f7'
+];
+
+let state = {
+    head: 0,
+    maskOn: true,
+    selectedRow: 16,
+    animating: false,
+    animStep: 0, // 0: Normal, 1: Raw, 2: Masked(-1e4), 3: Softmax
+    time: 0
+};
+
+// Generate simulated raw attention scores
+// Different heads learn different patterns (local, periodic, spikes)
+const rawScores = [];
+for (let h = 0; h < H; h++) {
+    let mat = new Float32Array(L * L);
+    for (let i = 0; i < L; i++) {
+        for (let j = 0; j < L; j++) {
+            let val = 0;
+            let dist = Math.abs(i - j);
+            if (h === 0 || h === 4) {
+                // Local attention
+                val = 3.0 - dist * 0.5 + (Math.random() * 0.5);
+            } else if (h === 1 || h === 5) {
+                // Periodic attention
+                val = Math.sin(dist * 0.5) * 2.0 + (Math.random() * 0.5);
+            } else if (h === 2 || h === 6) {
+                // Spikes / High power events
+                val = (Math.random() > 0.9) ? 4.0 : -2.0;
+                if (dist === 0) val += 3.0; // self is still high
+            } else {
+                // Generic smoothed
+                val = 1.0 - dist * 0.1 + (Math.random());
+            }
+            mat[i * L + j] = val;
+        }
+    }
+    rawScores.push(mat);
+}
+
+// Generate random V vectors (32 steps, 8 heads, 12 dim)
+const vVectors = [];
+for (let i = 0; i < L; i++) {
+    let stepV = [];
+    for (let h = 0; h < H; h++) {
+        let headV = new Float32Array(12);
+        for (let d = 0; d < 12; d++) {
+            headV[d] = Math.random();
+        }
+        stepV.push(headV);
+    }
+    vVectors.push(stepV);
+}
+
+function computeAttention(h) {
+    let scores = new Float32Array(rawScores[h]);
+    let out = new Float32Array(L * L);
+    
+    // Apply animation step logic
+    let applyMask = state.maskOn;
+    let doSoftmax = true;
+    let cleanZero = true;
+    
+    if (state.animating) {
+        if (state.animStep === 1) {
+            applyMask = false; doSoftmax = false; cleanZero = false;
+        } else if (state.animStep === 2) {
+            applyMask = true; doSoftmax = false; cleanZero = false;
+        } else if (state.animStep === 3) {
+            applyMask = true; doSoftmax = true; cleanZero = false;
+        }
+    }
+
+    // Apply diagonal mask
+    if (applyMask) {
+        for (let i = 0; i < L; i++) {
+            scores[i * L + i] = -10000.0;
+        }
+    }
+
+    if (!doSoftmax) {
+        return scores; // return raw
+    }
+
+    // Softmax per row
+    for (let i = 0; i < L; i++) {
+        let maxVal = -Infinity;
+        for (let j = 0; j < L; j++) {
+            if (scores[i * L + j] > maxVal) maxVal = scores[i * L + j];
+        }
+        
+        let sum = 0;
+        let rowExp = new Float32Array(L);
+        for (let j = 0; j < L; j++) {
+            let e = Math.exp(scores[i * L + j] - maxVal);
+            rowExp[j] = e;
+            sum += e;
+        }
+        
+        for (let j = 0; j < L; j++) {
+            let val = rowExp[j] / sum;
+            if (cleanZero && i === j && applyMask) {
+                val = 0.0; // Post-softmax cleanup
+            }
+            out[i * L + j] = val;
+        }
+    }
+    
+    return out;
+}
+
+/**
+ * WebGL Heatmap Rendering
+ */
+const glCanvas = document.getElementById('webglCanvas');
+const gl = glCanvas.getContext('webgl', { preserveDrawingBuffer: true });
+
+const vsSource = `
+    attribute vec2 a_position;
+    varying vec2 v_uv;
+    void main() {
+        gl_Position = vec4(a_position, 0.0, 1.0);
+        v_uv = a_position * 0.5 + 0.5;
+        v_uv.y = 1.0 - v_uv.y; // flip Y for matrix coords
+    }
+`;
+
+const fsSource = `
+    precision mediump float;
+    varying vec2 v_uv;
+    uniform sampler2D u_tex;
+    uniform float u_selRow;
+    uniform float u_isRaw;
+
+    vec3 colormap(float v) {
+        // Dark blue (0) -> White (0.5) -> Red (1.0)
+        if (v < 0.5) {
+            return mix(vec3(0.0, 0.0, 0.5), vec3(1.0, 1.0, 1.0), v * 2.0);
+        } else {
+            return mix(vec3(1.0, 1.0, 1.0), vec3(1.0, 0.0, 0.0), (v - 0.5) * 2.0);
+        }
+    }
+
+    void main() {
+        vec4 data = texture2D(u_tex, v_uv);
+        // We pack data into R channel (0-255). 
+        // If it's pure black (0,0,0) and alpha is 1.0, it's masked.
+        
+        vec3 color;
+        if (data.r == 0.0 && data.g == 0.0 && data.b == 0.0) {
+            color = vec3(0.0, 0.0, 0.0); // Masked
+        } else if (data.b == 1.0 && u_isRaw > 0.5) {
+            color = vec3(0.8, 0.0, 0.0); // Highlight raw mask -10000
+        } else {
+            color = colormap(data.r);
+        }
+
+        // Grid lines
+        vec2 grid = fract(v_uv * 32.0);
+        if (grid.x < 0.05 || grid.y < 0.05) {
+            color *= 0.8; // darken borders
+        }
+
+        // Highlight selected row
+        float row = floor(v_uv.y * 32.0);
+        if (abs(row - u_selRow) < 0.1) {
+            color += vec3(0.2, 0.2, 0.0); // yellow tint
+        }
+
+        gl_FragColor = vec4(color, 1.0);
+    }
+`;
+
+function compileShader(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        console.error(gl.getShaderInfoLog(shader));
+        gl.deleteShader(shader);
+        return null;
+    }
+    return shader;
+}
+
+const shaderProgram = gl.createProgram();
+gl.attachShader(shaderProgram, compileShader(gl, gl.VERTEX_SHADER, vsSource));
+gl.attachShader(shaderProgram, compileShader(gl, gl.FRAGMENT_SHADER, fsSource));
+gl.linkProgram(shaderProgram);
+gl.useProgram(shaderProgram);
+
+const posBuffer = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    -1.0, -1.0,  1.0, -1.0,  -1.0,  1.0,
+    -1.0,  1.0,  1.0, -1.0,   1.0,  1.0
+]), gl.STATIC_DRAW);
+
+const posLoc = gl.getAttribLocation(shaderProgram, "a_position");
+gl.enableVertexAttribArray(posLoc);
+gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+const selRowLoc = gl.getUniformLocation(shaderProgram, "u_selRow");
+const isRawLoc = gl.getUniformLocation(shaderProgram, "u_isRaw");
+
+// Handle canvas clicks
+glCanvas.addEventListener('mousedown', (e) => {
+    const rect = glCanvas.getBoundingClientRect();
+    const y = e.clientY - rect.top;
+    const row = Math.floor((y / rect.height) * L);
+    state.selectedRow = Math.max(0, Math.min(L - 1, row));
+    updateViz();
+});
+
+function updateWebGL() {
+    const data = computeAttention(state.head);
+    const texData = new Uint8Array(L * L * 4);
+    
+    let isRaw = state.animating && (state.animStep === 1 || state.animStep === 2);
+    gl.uniform1f(isRawLoc, isRaw ? 1.0 : 0.0);
+
+    for (let i = 0; i < L * L; i++) {
+        let val = data[i];
+        let r=0, g=0, b=0, a=255;
+        
+        if (isRaw) {
+            if (val === -10000) {
+                // Specific signal for masked out
+                b = 255; 
+            } else {
+                // Map raw scores roughly [-2, 4] to [0, 1]
+                let norm = (val + 2.0) / 6.0;
+                norm = Math.max(0, Math.min(1, norm));
+                r = norm * 255;
+            }
+        } else {
+            if (val === 0.0) {
+                // Exact zero (masked diagonal)
+                r = 0; g = 0; b = 0;
+            } else {
+                // Map probability [0, 0.5] to [0, 1] for better contrast
+                let norm = val * 2.0; 
+                norm = Math.max(0, Math.min(1, norm));
+                r = Math.floor(norm * 255);
+                g = 1; // Prevent pure black detection
+            }
+        }
+        
+        texData[i*4] = r;
+        texData[i*4+1] = g;
+        texData[i*4+2] = b;
+        texData[i*4+3] = a;
+    }
+
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, L, L, 0, gl.RGBA, gl.UNSIGNED_BYTE, texData);
+    
+    gl.uniform1f(selRowLoc, state.selectedRow);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+
+/**
+ * Canvas 2D Rendering
+ */
+const leftCtx = document.getElementById('leftCanvas').getContext('2d');
+const rightCtx = document.getElementById('rightCanvas').getContext('2d');
+
+function drawRoundedRect(ctx, x, y, w, h, r, fill) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+    ctx.fillStyle = fill;
+    ctx.fill();
+}
+
+function renderLeftCanvas() {
+    const ctx = leftCtx;
+    ctx.clearRect(0, 0, 268, 500);
+    
+    // Draw Input X
+    drawRoundedRect(ctx, 20, 50, 24, 400, 4, '#475569');
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px sans-serif';
+    ctx.fillText('X', 28, 40);
+
+    // Draw W matrices
+    const wColors = ['#94a3b8', '#94a3b8', '#94a3b8'];
+    const wLabels = ['Wq', 'Wk', 'Wv'];
+    for(let i=0; i<3; i++) {
+        let y = 80 + i * 140;
+        drawRoundedRect(ctx, 80, y, 30, 60, 4, wColors[i]);
+        ctx.fillStyle = '#111';
+        ctx.fillText(wLabels[i], 86, y + 34);
+        
+        // Lines from X
+        ctx.strokeStyle = '#334155';
+        ctx.beginPath();
+        ctx.moveTo(44, y + 30);
+        ctx.lineTo(80, y + 30);
+        ctx.stroke();
+    }
+
+    // Draw Q, K, V
+    const qkvLabels = ['Q', 'K', 'V'];
+    const outY = [80, 220, 360];
+    for(let i=0; i<3; i++) {
+        drawRoundedRect(ctx, 140, outY[i] - 30, 16, 120, 2, '#64748b');
+        ctx.fillStyle = '#fff';
+        ctx.fillText(qkvLabels[i], 144, outY[i] - 40);
+        
+        ctx.beginPath();
+        ctx.moveTo(110, outY[i] + 30);
+        ctx.lineTo(140, outY[i] + 30);
+        ctx.stroke();
+
+        // Split into heads
+        for(let h=0; h<H; h++) {
+            let hy = outY[i] - 30 + (h * 15);
+            ctx.beginPath();
+            ctx.moveTo(156, hy + 7);
+            ctx.lineTo(190, hy + 7);
+            ctx.strokeStyle = headColors[h] + '88';
+            ctx.stroke();
+            
+            // Draw head block
+            drawRoundedRect(ctx, 190, hy, 20, 13, 2, headColors[h]);
+            
+            // Highlight active head
+            if (h === state.head) {
+                ctx.strokeStyle = '#fff';
+                ctx.strokeRect(189, hy - 1, 22, 15);
+            }
+        }
+    }
+
+    // Flow Animation particles
+    const t = (state.time * 2) % 1;
+    ctx.fillStyle = '#fff';
+    for(let i=0; i<3; i++) {
+        let y = 80 + i * 140;
+        ctx.beginPath(); ctx.arc(44 + t * 36, y + 30, 3, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(110 + t * 30, outY[i] + 30, 3, 0, Math.PI*2); ctx.fill();
+    }
+}
+
+function renderRightCanvas() {
+    const ctx = rightCtx;
+    ctx.clearRect(0, 0, 268, 500);
+
+    const data = computeAttention(state.head);
+    const rowStart = state.selectedRow * L;
+    const rowData = data.slice(rowStart, rowStart + L);
+
+    // 1. Draw Histogram
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px sans-serif';
+    ctx.fillText(`Attention Weights (t=${state.selectedRow})`, 20, 30);
+    
+    const chartY = 120;
+    const barW = 6;
+    const spacing = 1;
+    
+    // Find top 5 values
+    let indexedData = Array.from(rowData).map((v, i) => ({v, i}));
+    indexedData.sort((a,b) => b.v - a.v);
+    let top5Indices = new Set(indexedData.slice(0, 5).map(x => x.i));
+
+    for (let i = 0; i < L; i++) {
+        let val = rowData[i];
+        if (state.animating && val < 0) val = 0; // hide negative in chart
+        let h = val * 100; // scale up for viz
+        if (h > 80) h = 80;
+        
+        let x = 20 + i * (barW + spacing);
+        
+        if (i === state.selectedRow) {
+            ctx.fillStyle = '#475569'; // The diagonal position
+        } else if (top5Indices.has(i)) {
+            ctx.fillStyle = headColors[state.head]; // Top attended
+        } else {
+            ctx.fillStyle = '#334155';
+        }
+        
+        ctx.fillRect(x, chartY - h, barW, h);
+    }
+    // Baseline
+    ctx.strokeStyle = '#475569';
+    ctx.beginPath(); ctx.moveTo(20, chartY); ctx.lineTo(20 + L * 7, chartY); ctx.stroke();
+
+    // 2. Value Vectors Aggregation
+    ctx.fillStyle = '#fff';
+    ctx.fillText('Top 5 Values (Weighted)', 20, 160);
+    
+    let topArr = Array.from(top5Indices);
+    let aggV = new Float32Array(12);
+
+    for (let k = 0; k < topArr.length; k++) {
+        let idx = topArr[k];
+        let weight = rowData[idx];
+        if (weight < 0) weight = 0;
+        let vVec = vVectors[idx][state.head];
+        
+        let y = 180 + k * 20;
+        ctx.fillStyle = '#94a3b8';
+        ctx.fillText(`t=${idx}`, 20, y + 10);
+        ctx.fillText(`${(weight*100).toFixed(0)}%`, 50, y + 10);
+        
+        for (let d = 0; d < 12; d++) {
+            let val = vVec[d];
+            aggV[d] += val * weight;
+            
+            // Draw mini box
+            let alpha = Math.max(0.1, val * weight * 3); // brighten for viz
+            ctx.fillStyle = `rgba(255,255,255,${alpha})`;
+            ctx.fillRect(90 + d * 10, y, 8, 12);
+        }
+
+        // Connect line
+        ctx.strokeStyle = headColors[state.head] + '44';
+        ctx.beginPath(); ctx.moveTo(220, y + 6); ctx.lineTo(240, 230); ctx.stroke();
+    }
+
+    // Draw aggregated head output
+    ctx.fillStyle = '#fff';
+    ctx.fillText('Head Output', 200, 280);
+    for (let d = 0; d < 12; d++) {
+        ctx.fillStyle = `rgba(255,255,255,${aggV[d]*1.5})`;
+        ctx.fillRect(220, 290 + d * 10, 16, 8);
+    }
+    // Color border
+    ctx.strokeStyle = headColors[state.head];
+    ctx.strokeRect(219, 289, 18, 120);
+
+    // 3. Head Merge
+    ctx.fillStyle = '#fff';
+    ctx.fillText('Merge 8 Heads', 20, 310);
+    
+    for(let h=0; h<H; h++) {
+        let hx = 20 + h * 18;
+        drawRoundedRect(ctx, hx, 330, 14, 80, 2, headColors[h]);
+        
+        // Lines merging
+        ctx.strokeStyle = headColors[h] + '66';
+        ctx.beginPath();
+        ctx.moveTo(hx + 7, 410);
+        ctx.lineTo(90, 440);
+        ctx.stroke();
+    }
+
+    // Final Wo Projection
+    drawRoundedRect(ctx, 40, 440, 100, 20, 4, '#475569');
+    ctx.fillStyle = '#fff';
+    ctx.fillText('Linear(96, 96)', 50, 454);
+
+    drawRoundedRect(ctx, 80, 470, 20, 20, 2, '#3b82f6');
+    ctx.fillText('Out', 80, 498);
+}
+
+/**
+ * Interaction & Animation Logic
+ */
+function updateViz() {
+    updateWebGL();
+    renderRightCanvas();
+}
+
+function setHead(h) {
+    state.head = h;
+    document.querySelectorAll('.head-btn').forEach((btn, i) => {
+        btn.classList.toggle('active', i === h);
+    });
+    updateViz();
+}
+
+function toggleMask() {
+    if (state.animating) return; // Block during animation
+    state.maskOn = !state.maskOn;
+    const btn = document.getElementById('btnMask');
+    btn.textContent = state.maskOn ? 'Diagonal Mask: ON' : 'Diagonal Mask: OFF';
+    btn.classList.toggle('active', state.maskOn);
+    updateViz();
+}
+
+function playMaskAnimation() {
+    if (state.animating) return;
+    state.animating = true;
+    state.maskOn = true; // force mask path
+    document.getElementById('btnMask').classList.add('active');
+    document.getElementById('btnMask').textContent = 'Diagonal Mask: ON';
+    
+    const status = document.getElementById('animStatus');
+    
+    // Sequence
+    state.animStep = 1; 
+    status.textContent = "Step 1: Raw Dot Product (Diagonal is highest)";
+    updateViz();
+
+    setTimeout(() => {
+        state.animStep = 2;
+        status.textContent = "Step 2: Mask Diagonal with -10000";
+        updateViz();
+        
+        setTimeout(() => {
+            state.animStep = 3;
+            status.textContent = "Step 3: Softmax (Masked cells become 0)";
+            updateViz();
+            
+            setTimeout(() => {
+                state.animStep = 0;
+                state.animating = false;
+                status.textContent = "Step 4: Complete (Clean zeros)";
+                updateViz();
+                setTimeout(() => { status.textContent = ""; }, 2000);
+            }, 2500);
+        }, 2500);
+    }, 2500);
+}
+
+function tick() {
+    state.time += 0.016; // ~60fps
+    renderLeftCanvas();
+    requestAnimationFrame(tick);
+}
+
+// Init
+updateViz();
+tick();
+
+</script>
+</body>
+</html>

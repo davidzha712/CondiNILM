@@ -1,0 +1,914 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Transformer Encoder with FiLM</title>
+    <style>
+        :root {
+            --bg-color: #0f0f16;
+            --panel-bg: rgba(20, 20, 30, 0.85);
+            --border-color: rgba(255, 255, 255, 0.15);
+            --text-main: #ffffff;
+            --text-muted: #8b949e;
+            
+            --col-norm: #2196f3;
+            --col-attn: #ff9800;
+            --col-ffn: #4caf50;
+            --col-film: #e91e63;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+            overflow: hidden;
+            display: flex;
+            height: 100vh;
+            width: 100vw;
+        }
+
+        #webgl-container {
+            flex: 1;
+            position: relative;
+        }
+
+        /* Sidebar Panels */
+        #sidebar {
+            width: 500px;
+            background: var(--panel-bg);
+            border-left: 1px solid var(--border-color);
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+            backdrop-filter: blur(10px);
+            z-index: 10;
+        }
+
+        .section {
+            padding: 15px 20px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        h1 { font-size: 18px; margin: 0 0 5px 0; color: #fff; }
+        h2 { font-size: 15px; text-transform: uppercase; color: #4fc3f7; margin: 0 0 8px 0; letter-spacing: 1px; font-weight: bold; }
+        p { font-size: 13px; color: #ccc; margin: 0 0 10px 0; line-height: 1.5; }
+
+        .btn-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+
+        button {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: white;
+            padding: 8px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            flex: 1;
+            transition: all 0.2s;
+        }
+
+        button:hover { background: rgba(255, 255, 255, 0.15); }
+        button.active { background: rgba(33, 150, 243, 0.3); border-color: var(--col-norm); }
+
+        /* Canvas Elements */
+        .canvas-container {
+            width: 100%;
+            background: #000;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            margin-top: 5px;
+            position: relative;
+        }
+
+        #film-canvas, #ffn-canvas, #evolve-canvas {
+            width: 100%;
+            height: 140px;
+            display: block;
+        }
+
+        /* Attention Heatmaps */
+        .heatmap-grid {
+            display: flex;
+            gap: 10px;
+            justify-content: space-between;
+        }
+        
+        .heatmap-box {
+            flex: 1;
+            text-align: center;
+            padding: 5px;
+            border-radius: 6px;
+        }
+        
+        .heatmap-box canvas {
+            width: 100%;
+            aspect-ratio: 1;
+            background: #000;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+        }
+        
+        .heatmap-box span {
+            font-size: 12px;
+            color: #fff;
+            display: block;
+            margin-top: 6px;
+            font-weight: bold;
+        }
+
+        /* Floating 3D Labels */
+        .stage-label {
+            background: rgba(0, 0, 0, 0.85);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            padding: 6px 10px;
+            border-radius: 4px;
+            color: white;
+            font-family: sans-serif;
+            font-size: 12px;
+            pointer-events: none;
+            text-align: right;
+            white-space: nowrap;
+        }
+        .stage-label strong { color: #4fc3f7; }
+        .layer-title { font-weight: bold; font-size: 14px; color: #fff; background: rgba(255,255,255,0.1); border: 1px solid #fff; padding: 6px 12px; border-radius: 4px; }
+
+        /* Loader */
+        #loader {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 16px;
+            z-index: 100;
+        }
+
+        /* Sidebar Toggle Button */
+        .sidebar-toggle {
+            display: none;
+            position: fixed;
+            top: 15px;
+            right: 15px;
+            z-index: 20;
+            background: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            color: white;
+            width: 40px;
+            height: 40px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 20px;
+            align-items: center;
+            justify-content: center;
+            backdrop-filter: blur(10px);
+            padding: 0;
+            flex: none;
+        }
+
+        .sidebar-backdrop {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 9;
+        }
+
+        /* Responsive */
+        @media (max-width: 1024px) {
+            .sidebar-toggle { display: flex; }
+            #sidebar {
+                position: fixed;
+                right: -520px;
+                top: 0;
+                width: min(500px, 90vw);
+                z-index: 15;
+                transition: right 0.3s ease;
+            }
+            body.sidebar-open #sidebar { right: 0; }
+            body.sidebar-open .sidebar-backdrop { display: block; }
+            #webgl-container { width: 100vw; }
+        }
+        @media (max-width: 640px) {
+            #sidebar { width: 100vw; right: -100vw; }
+            .heatmap-box span { font-size: 10px; }
+        }
+    </style>
+
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+<style>.nav-back{display:inline-flex;align-items:center;gap:6px;color:#4fc3f7;text-decoration:none;font-size:13px;font-family:-apple-system,BlinkMacSystemFont,monospace;opacity:0.7;transition:opacity .2s;white-space:nowrap}.nav-back:hover{opacity:1;color:#81d4fa}.nav-back svg{width:14px;height:14px;fill:currentColor}</style>
+</head>
+<body data-condinilm="true">
+
+    <div id="loader">Loading WebGL Scene...</div>
+
+    <button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar">&#9776;</button>
+    <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
+
+    <div id="webgl-container"></div>
+
+    <div id="sidebar">
+        <div class="section">
+            <a class="nav-back" href="/">&larr; Home</a>
+            <h1>Transformer Encoder Stack</h1>
+            <p>Data flows from <strong>TOP to BOTTOM</strong>. The blue dots show the data flow. The model has 3 layers. Click a layer in the 3D view to expand it and see inside.</p>
+            <div class="btn-group">
+                <button id="btn-stack" class="active">Stacked View</button>
+                <button id="btn-side">Side-by-Side View</button>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 id="attn-title">Attention Pattern (All Layers)</h2>
+            <p>The model finds connections between time steps. Bright spots mean strong connections. The black diagonal line means a step cannot copy itself.</p>
+            <div class="heatmap-grid">
+                <div class="heatmap-box" id="box-0">
+                    <canvas id="attn-canvas-0"></canvas>
+                    <span>Layer 0 (Local)</span>
+                </div>
+                <div class="heatmap-box" id="box-1">
+                    <canvas id="attn-canvas-1"></canvas>
+                    <span>Layer 1 (Medium)</span>
+                </div>
+                <div class="heatmap-box" id="box-2">
+                    <canvas id="attn-canvas-2"></canvas>
+                    <span>Layer 2 (Global)</span>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 id="ffn-title">FFN Animation (All Layers)</h2>
+            <p>The Feed Forward Network (FFN) expands 96 features to 384 features to find patterns. It filters data using GELU. Then it shrinks back to 96 features.</p>
+            <div class="canvas-container">
+                <canvas id="ffn-canvas"></canvas>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2 id="film-title">FiLM Modulation (All Layers)</h2>
+            <p>FiLM modifies features for the specific appliance. <strong style="color:#f44336">Red bars</strong> scale up. <strong style="color:#2196f3">Blue bars</strong> scale down. The <strong style="color:#ffeb3b">Yellow line</strong> adds a shift.</p>
+            <div class="canvas-container">
+                <canvas id="film-canvas"></canvas>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>Feature Evolution</h2>
+            <p>This shows 96 features for one data point traveling down through Layer 0, 1, and 2. Bright colors mean larger values.</p>
+            <div class="canvas-container">
+                <canvas id="evolve-canvas"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
+        // --- Data Models ---
+        const DIM = 96;
+        const EXP_DIM = 384;
+        const NUM_LAYERS = 3;
+        
+        let expandedLayer = -1; // -1 means none expanded
+        let isStacked = true;
+        
+        // Pre-generate stable random data for smooth FFN animations (no flickering)
+        const layerData = [];
+        for(let i = 0; i < NUM_LAYERS; i++) {
+            const fIn = Array.from({length: DIM}, () => Math.random());
+            const fExp = Array.from({length: EXP_DIM}, (_, idx) => fIn[idx % DIM] * (0.5 + Math.random()*0.5));
+            const fGelu = fExp.map(v => v < 0.3 ? 0 : v * 1.2);
+            const fComp = Array.from({length: DIM}, () => Math.random());
+            const g = Array.from({length: DIM}, () => (Math.random() - 0.5) * 0.8);
+            const b = Array.from({length: DIM}, () => (Math.random() - 0.5) * 0.4);
+            const fFilm = fComp.map((v, idx) => Math.max(0, Math.min(1, (1 + g[idx]) * v + b[idx])));
+
+            layerData.push({
+                gamma: g,
+                beta: b,
+                featureIn: fIn,
+                featureExp: fExp,
+                featureGelu: fGelu,
+                featureComp: fComp,
+                featureOut: fFilm
+            });
+        }
+
+        // --- WebGL Setup ---
+        const container = document.getElementById('webgl-container');
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x0f0f16, 0.015);
+
+        const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 100);
+        camera.position.set(0, 15, 40);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(container.clientWidth, container.clientHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
+
+        const labelRenderer = new CSS2DRenderer();
+        labelRenderer.setSize(container.clientWidth, container.clientHeight);
+        labelRenderer.domElement.style.position = 'absolute';
+        labelRenderer.domElement.style.top = '0px';
+        labelRenderer.domElement.style.pointerEvents = 'none';
+        container.appendChild(labelRenderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.target.set(0, 10, 0);
+
+        // Lights
+        scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+        const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        dirLight.position.set(10, 20, 10);
+        scene.add(dirLight);
+
+        // --- Create 3D Layers ---
+        const layerGroups = [];
+        const blockGeo = new THREE.BoxGeometry(4, 1, 8); // X=batch, Y=height, Z=seq
+
+        const matNorm = new THREE.MeshStandardMaterial({ color: 0x2196f3, transparent: true, opacity: 0.8 });
+        const matAttn = new THREE.MeshStandardMaterial({ color: 0xff9800, transparent: true, opacity: 0.8 });
+        const matFFN = new THREE.MeshStandardMaterial({ color: 0x4caf50, transparent: true, opacity: 0.8 });
+        
+        // Helper to create a labeled block with label safely on the left
+        function createBlock(mat, name, shape, hScale) {
+            const mesh = new THREE.Mesh(blockGeo, mat);
+            mesh.scale.y = hScale;
+            mesh.userData.isBlock = true; // Mark for raycasting
+            
+            const edges = new THREE.EdgesGeometry(blockGeo);
+            const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0xffffff, transparent:true, opacity:0.3 }));
+            mesh.add(line);
+
+            const div = document.createElement('div');
+            div.className = 'stage-label';
+            // Use CSS transform to shift the label to the left so it doesn't overlap the block
+            div.style.transform = "translate(-100%, -50%)";
+            div.innerHTML = `<strong>${name}</strong><br>${shape}`;
+            const label = new CSS2DObject(div);
+            // Anchor point is placed further left to prevent overlap
+            label.position.set(-5.0, 0, 0);
+            mesh.add(label);
+            
+            return mesh;
+        }
+
+        // Create a clean schematic line for residual connections
+        function createResidualLine(color) {
+            const geo = new THREE.BufferGeometry();
+            const pos = new Float32Array(50 * 3); // 50 points for a curve
+            geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+            const mat = new THREE.LineBasicMaterial({ color: color || 0x4fc3f7, transparent: true, opacity: 0.8, linewidth: 2 });
+            return new THREE.Line(geo, mat);
+        }
+
+        // Create Data Flow Particles
+        function createFlowParticles() {
+            const particleCount = 80;
+            const pGeo = new THREE.BufferGeometry();
+            const pPos = new Float32Array(particleCount * 3);
+            for(let k=0; k<particleCount; k++) {
+                pPos[k*3] = (Math.random() - 0.5) * 3;     // X width
+                pPos[k*3+1] = Math.random() * 10 - 5;      // Y height (will be updated dynamically)
+                pPos[k*3+2] = (Math.random() - 0.5) * 7;     // Z depth
+            }
+            pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+            const pMat = new THREE.PointsMaterial({ color: 0x4fc3f7, size: 0.2, transparent: true, opacity: 0.8 });
+            const particles = new THREE.Points(pGeo, pMat);
+            // Disable raycasting for particles so they don't block clicks
+            particles.raycast = () => {}; 
+            return particles;
+        }
+
+        // Build 3 layers
+        for(let i = 0; i < NUM_LAYERS; i++) {
+            const group = new THREE.Group();
+            group.userData = { index: i, components: [] };
+
+            // Title label
+            const titleDiv = document.createElement('div');
+            titleDiv.className = 'layer-title';
+            titleDiv.textContent = `Encoder Layer ${i}`;
+            const titleLabel = new CSS2DObject(titleDiv);
+            group.add(titleLabel);
+            group.userData.titleLabel = titleLabel;
+
+            // 1. Pre-Norm
+            const norm1 = createBlock(matNorm, "LayerNorm", "(32, 480, 96)", 0.3);
+            group.add(norm1);
+            group.userData.components.push(norm1);
+
+            // 2. Attention
+            const attn = createBlock(matAttn, "Multi-Head Attn", "(32, 480, 96)", 1.2);
+            group.add(attn);
+            group.userData.components.push(attn);
+
+            // Residual 1 (Skips Attention)
+            const res1 = createResidualLine(0x4fc3f7);
+            group.add(res1);
+            group.userData.components.push(res1);
+
+            // 3. Pre-Norm 2
+            const norm2 = createBlock(matNorm, "LayerNorm", "(32, 480, 96)", 0.3);
+            group.add(norm2);
+            group.userData.components.push(norm2);
+
+            // 4. FFN
+            const ffn = createBlock(matFFN, "Feed Forward", "(32, 480, 96)", 1.5);
+            group.add(ffn);
+            group.userData.components.push(ffn);
+
+            // 5. FiLM (Solid transparent shell around FFN)
+            const filmGeo = new THREE.BoxGeometry(5.2, 2.5, 9.2);
+            const filmMat = new THREE.MeshBasicMaterial({ color: 0xe91e63, transparent: true, opacity: 0.35 });
+            const film = new THREE.Mesh(filmGeo, filmMat);
+            film.userData.isBlock = true; // Mark for raycasting
+            
+            // Add edge lines to make the box clearly visible
+            const filmEdges = new THREE.EdgesGeometry(filmGeo);
+            const filmLine = new THREE.LineSegments(filmEdges, new THREE.LineBasicMaterial({ color: 0xff80ab, linewidth: 2 }));
+            film.add(filmLine);
+
+            const filmDiv = document.createElement('div');
+            filmDiv.className = 'stage-label';
+            filmDiv.style.transform = "translate(0%, -50%)"; // Shift to the right
+            filmDiv.innerHTML = `<strong style="color:#ff80ab">FiLM Modulation</strong><br>(1+γ)x+β`;
+            const filmLabel = new CSS2DObject(filmDiv);
+            filmLabel.position.set(5.0, 0, 0); // Place on the right side
+            film.add(filmLabel);
+            
+            group.add(film);
+            group.userData.components.push(film);
+
+            // Residual 2 (Skips FFN and FiLM)
+            const res2 = createResidualLine(0x4fc3f7);
+            group.add(res2);
+            group.userData.components.push(res2);
+
+            // 6. Data Flow Particles
+            const particles = createFlowParticles();
+            group.add(particles);
+            group.userData.particles = particles;
+
+            scene.add(group);
+            layerGroups.push(group);
+        }
+
+        // Ground Plane
+        const grid = new THREE.GridHelper(50, 50, 0x444444, 0x222222);
+        grid.position.y = -2;
+        scene.add(grid);
+
+        // --- Interaction ---
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+
+        window.addEventListener('click', (event) => {
+            // Ignore clicks on sidebar (use dynamic container width)
+            const containerW = container.clientWidth;
+            if (event.clientX > containerW) return;
+
+            mouse.x = (event.clientX / containerW) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(mouse, camera);
+            
+            // Check intersection with any block inside layerGroups
+            let clickedLayer = -1;
+            for(let i=0; i<NUM_LAYERS; i++) {
+                // Filter out lines and points, only intersect meshes marked as blocks
+                const objectsToCheck = layerGroups[i].children.filter(obj => obj.userData.isBlock);
+                const intersects = raycaster.intersectObjects(objectsToCheck, false);
+                if(intersects.length > 0) {
+                    clickedLayer = i;
+                    break;
+                }
+            }
+
+            // Toggle expansion
+            if(clickedLayer === expandedLayer) {
+                expandedLayer = -1; // Collapse
+            } else {
+                expandedLayer = clickedLayer; // Expand
+            }
+            
+            updateSidebarTitles();
+        });
+
+        document.getElementById('btn-stack').addEventListener('click', (e) => {
+            isStacked = true;
+            document.getElementById('btn-stack').classList.add('active');
+            document.getElementById('btn-side').classList.remove('active');
+        });
+
+        document.getElementById('btn-side').addEventListener('click', (e) => {
+            isStacked = false;
+            document.getElementById('btn-side').classList.add('active');
+            document.getElementById('btn-stack').classList.remove('active');
+        });
+
+        function updateSidebarTitles() {
+            const activeStr = expandedLayer === -1 ? "All Layers" : `Layer ${expandedLayer}`;
+            document.getElementById('attn-title').textContent = `Attention Pattern (${activeStr})`;
+            document.getElementById('ffn-title').textContent = `FFN Animation (${activeStr})`;
+            document.getElementById('film-title').textContent = `FiLM Modulation (${activeStr})`;
+            
+            // Highlight active heatmap box
+            for(let i=0; i<3; i++) {
+                const box = document.getElementById(`box-${i}`);
+                if(expandedLayer === i) {
+                    box.style.border = '2px solid #2196f3';
+                    box.style.backgroundColor = 'rgba(33, 150, 243, 0.2)';
+                } else {
+                    box.style.border = '2px solid transparent';
+                    box.style.backgroundColor = 'transparent';
+                }
+            }
+        }
+
+        // --- Canvas Drawing Functions ---
+        
+        // 1. Attention Heatmaps
+        function initHeatmaps() {
+            for(let i=0; i<NUM_LAYERS; i++) {
+                const canvas = document.getElementById(`attn-canvas-${i}`);
+                const ctx = canvas.getContext('2d');
+                canvas.width = 60;
+                canvas.height = 60;
+                
+                const imgData = ctx.createImageData(60, 60);
+                for(let y=0; y<60; y++) {
+                    for(let x=0; x<60; x++) {
+                        const dist = Math.abs(x - y);
+                        let val = 0;
+                        // Layer 0: sharp diagonal
+                        if(i === 0) val = dist < 3 ? 255 : Math.random() * 50;
+                        // Layer 1: wider diagonal
+                        else if(i === 1) val = dist < 10 ? 200 : Math.random() * 80;
+                        // Layer 2: more global/blocky
+                        else val = (dist < 15 || (Math.floor(x/10) === Math.floor(y/10))) ? 180 : Math.random() * 120;
+                        
+                        const idx = (y * 60 + x) * 4;
+                        // Orange tint
+                        imgData.data[idx] = val; // R
+                        imgData.data[idx+1] = val * 0.6; // G
+                        imgData.data[idx+2] = 0; // B
+                        imgData.data[idx+3] = 255; // Alpha
+                    }
+                }
+                ctx.putImageData(imgData, 0, 0);
+            }
+        }
+        initHeatmaps();
+
+        // 2. FiLM Bar Charts
+        const filmCanvas = document.getElementById('film-canvas');
+        const filmCtx = filmCanvas.getContext('2d');
+        
+        function drawFiLM() {
+            const w = filmCanvas.clientWidth;
+            const h = filmCanvas.clientHeight;
+            if(filmCanvas.width !== w) {
+                filmCanvas.width = w;
+                filmCanvas.height = h;
+            }
+            
+            filmCtx.clearRect(0, 0, w, h);
+            
+            const activeData = layerData[expandedLayer === -1 ? 0 : expandedLayer];
+            
+            const barW = w / DIM;
+            const midY = h / 2;
+            
+            // Draw axis
+            filmCtx.strokeStyle = 'rgba(255,255,255,0.3)';
+            filmCtx.beginPath();
+            filmCtx.moveTo(0, midY); filmCtx.lineTo(w, midY);
+            filmCtx.stroke();
+            
+            // Draw Gamma as solid bars
+            for(let i=0; i<DIM; i++) {
+                const x = i * barW;
+                const g = activeData.gamma[i];
+                const gH = Math.abs(g) * (midY - 20);
+                filmCtx.fillStyle = g > 0 ? '#f44336' : '#2196f3'; // Red positive, Blue negative
+                if(g > 0) filmCtx.fillRect(x, midY - gH, barW - 1, gH);
+                else filmCtx.fillRect(x, midY, barW - 1, gH);
+            }
+            
+            // Draw Beta as a distinct yellow line overlay
+            filmCtx.beginPath();
+            filmCtx.strokeStyle = '#ffeb3b';
+            filmCtx.lineWidth = 2;
+            for(let i=0; i<DIM; i++) {
+                const x = i * barW + (barW / 2);
+                const b = activeData.beta[i];
+                const bY = midY - (b * (midY - 20));
+                if(i === 0) filmCtx.moveTo(x, bY);
+                else filmCtx.lineTo(x, bY);
+            }
+            filmCtx.stroke();
+            
+            // Legend
+            filmCtx.fillStyle = '#fff';
+            filmCtx.font = '11px sans-serif';
+            filmCtx.fillText("Bars: Gamma (Scale). Yellow Line: Beta (Shift).", 10, 16);
+        }
+
+        // 3. Feature Evolution
+        const evCanvas = document.getElementById('evolve-canvas');
+        const evCtx = evCanvas.getContext('2d');
+        
+        function drawEvolution() {
+            const w = evCanvas.clientWidth;
+            const h = evCanvas.clientHeight;
+            if(evCanvas.width !== w) {
+                evCanvas.width = w;
+                evCanvas.height = h;
+            }
+            evCtx.clearRect(0, 0, w, h);
+            
+            const rowH = h / 3;
+            const barW = w / DIM;
+            
+            for(let l=0; l<3; l++) {
+                const y = l * rowH;
+                const data = layerData[l].featureOut;
+                
+                for(let i=0; i<DIM; i++) {
+                    const x = i * barW;
+                    const val = data[i];
+                    // Color based on value intensity
+                    const cVal = Math.floor(val * 255);
+                    evCtx.fillStyle = `rgb(0, ${cVal}, ${Math.floor(cVal/2)})`;
+                    evCtx.fillRect(x, y + 2, barW - 1, rowH - 4);
+                }
+                
+                evCtx.fillStyle = '#fff';
+                evCtx.font = '11px sans-serif';
+                evCtx.fillText(`Layer ${l}`, 10, y + 20);
+            }
+        }
+
+        // 4. FFN Animation
+        const ffnCanvas = document.getElementById('ffn-canvas');
+        const ffnCtx = ffnCanvas.getContext('2d');
+        let ffnAnimTime = 0;
+        
+        // Helper to interpolate between two arrays
+        function lerpArrays(arr1, arr2, t) {
+            const res = [];
+            for(let i=0; i<arr1.length; i++) {
+                res.push(arr1[i] + (arr2[i] - arr1[i]) * t);
+            }
+            return res;
+        }
+
+        function drawFFN() {
+            const w = ffnCanvas.clientWidth;
+            const h = ffnCanvas.clientHeight;
+            if(ffnCanvas.width !== w) {
+                ffnCanvas.width = w;
+                ffnCanvas.height = h;
+            }
+            ffnCtx.clearRect(0, 0, w, h);
+            
+            // Very slow animation for readability
+            ffnAnimTime += 0.005; 
+            if(ffnAnimTime > 5) ffnAnimTime = 0;
+            
+            const state = Math.floor(ffnAnimTime); // 0 to 4
+            const progress = ffnAnimTime - state;
+            const ease = 0.5 - 0.5 * Math.cos(progress * Math.PI); // Smoothstep
+            
+            let currentDim = DIM;
+            let displayColors = [];
+            let label = "";
+            
+            const actData = layerData[expandedLayer === -1 ? 0 : expandedLayer];
+            
+            if(state === 0) {
+                // Wait at input
+                currentDim = DIM;
+                displayColors = actData.featureIn;
+                label = "1. Input: 96 features arrive.";
+            } else if (state === 1) {
+                // Expand 96 -> 384
+                currentDim = DIM + (EXP_DIM - DIM) * ease;
+                // Pad with zeros first, then lerp to exp
+                const paddedIn = Array.from({length: EXP_DIM}, (_, i) => i < DIM ? actData.featureIn[i] : 0);
+                displayColors = lerpArrays(paddedIn, actData.featureExp, ease);
+                label = "2. Expand: Increase to 384 features to find patterns.";
+            } else if (state === 2) {
+                // GELU 384 -> 384
+                currentDim = EXP_DIM;
+                displayColors = lerpArrays(actData.featureExp, actData.featureGelu, ease);
+                label = "3. GELU: Filter out weak signals.";
+            } else if (state === 3) {
+                // Compress 384 -> 96
+                currentDim = EXP_DIM - (EXP_DIM - DIM) * ease;
+                const paddedComp = Array.from({length: EXP_DIM}, (_, i) => i < DIM ? actData.featureComp[i] : 0);
+                displayColors = lerpArrays(actData.featureGelu, paddedComp, ease);
+                label = "4. Compress: Shrink back to the best 96 features.";
+            } else if (state === 4) {
+                // FiLM
+                currentDim = DIM;
+                displayColors = lerpArrays(actData.featureComp, actData.featureOut, ease);
+                label = "5. FiLM: Adjust features for the appliance.";
+            }
+
+            const barW = w / currentDim;
+            for(let i=0; i<currentDim; i++) {
+                const x = i * barW;
+                const v = displayColors[i] || 0;
+                const cVal = Math.floor(v * 255);
+                ffnCtx.fillStyle = `rgb(${cVal/2}, ${cVal}, ${100})`;
+                
+                // Bar height
+                const barH = (h - 40) * (0.2 + v * 0.8);
+                const y = (h - barH) / 2 + 10;
+                
+                ffnCtx.fillRect(x, y, Math.max(0.5, barW - 0.5), barH);
+            }
+            
+            ffnCtx.fillStyle = '#fff';
+            ffnCtx.font = '13px sans-serif';
+            ffnCtx.fillText(label, 10, 20);
+        }
+
+        // --- Render Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // Interpolate 3D objects based on view state and expansion
+            for(let i = 0; i < NUM_LAYERS; i++) {
+                const group = layerGroups[i];
+                
+                let targetX = 0, targetY = 0, targetZ = 0;
+                let spacing = (expandedLayer === i) ? 3.5 : 1.5;
+
+                if (isStacked) {
+                    targetX = 0;
+                    let baseOffsetY = 0;
+                    for(let j=0; j<i; j++) {
+                        baseOffsetY += (expandedLayer === j) ? 22 : 8;
+                    }
+                    targetY = 15 - baseOffsetY; // Data flows TOP to BOTTOM
+                    targetZ = 0;
+                } else {
+                    targetX = (i - 1) * 15; 
+                    targetY = 0;
+                    targetZ = 0;
+                }
+
+                group.position.x += (targetX - group.position.x) * 0.1;
+                group.position.y += (targetY - group.position.y) * 0.1;
+                group.position.z += (targetZ - group.position.z) * 0.1;
+
+                // Title label position
+                const titleLabel = group.userData.titleLabel;
+                titleLabel.position.set(0, 1.5, 0);
+
+                const comps = group.userData.components;
+                // Components flow DOWNWARDS (Negative Y)
+                comps[0].position.y += (0 - comps[0].position.y) * 0.1; // Norm1
+                comps[1].position.y += (-spacing * 1 - comps[1].position.y) * 0.1; // Attn
+                
+                // Update Residual Line 1 (Left Bracket, Skips Attn)
+                const pos1 = comps[2].geometry.attributes.position.array;
+                const y1 = comps[0].position.y;
+                const y2 = comps[3].position.y; // To Norm2
+                const offset1 = -8.0; // Control point X, curve peaks at X=-4
+                for(let k=0; k<50; k++) {
+                    const t = k / 49;
+                    const omt = 1 - t;
+                    pos1[k*3] = 2 * omt * t * offset1; // X
+                    pos1[k*3+1] = (omt * omt * y1) + (2 * omt * t * ((y1 + y2) / 2)) + (t * t * y2); // Y
+                    pos1[k*3+2] = 0; // Z
+                }
+                comps[2].geometry.attributes.position.needsUpdate = true;
+
+                // norm2
+                comps[3].position.y += (-spacing * 2 - comps[3].position.y) * 0.1;
+                // ffn
+                comps[4].position.y += (-spacing * 3.5 - comps[4].position.y) * 0.1;
+                // film (surrounds ffn)
+                comps[5].position.y += (-spacing * 3.5 - comps[5].position.y) * 0.1;
+                
+                if(expandedLayer === i) {
+                    comps[5].material.opacity = 0.5;
+                    // Pulse outline slightly
+                    const s = 1.0 + Math.sin(Date.now() * 0.005) * 0.02;
+                    comps[5].scale.set(s,s,s);
+                } else {
+                    comps[5].material.opacity = 0.2;
+                    comps[5].scale.set(1,1,1);
+                }
+
+                // Update Residual Line 2 (Right Bracket, Skips FFN/FiLM)
+                const pos2 = comps[6].geometry.attributes.position.array;
+                const y3 = comps[3].position.y; // From Norm2
+                const y4 = comps[5].position.y - spacing * 1.5; // Past FiLM (downwards)
+                const offset2 = 8.0; // Control point X, curve peaks at X=4
+                for(let k=0; k<50; k++) {
+                    const t = k / 49;
+                    const omt = 1 - t;
+                    pos2[k*3] = 2 * omt * t * offset2; // X
+                    pos2[k*3+1] = (omt * omt * y3) + (2 * omt * t * ((y3 + y4) / 2)) + (t * t * y4); // Y
+                    pos2[k*3+2] = 0; // Z
+                }
+                comps[6].geometry.attributes.position.needsUpdate = true;
+
+                // Animate Vertical Data Flow Particles
+                const particles = group.userData.particles;
+                const pPos = particles.geometry.attributes.position.array;
+                // Define flow boundaries for this layer
+                const flowTop = comps[0].position.y + 1;
+                const flowBottom = comps[5].position.y - 2; 
+                
+                for(let k=0; k<80; k++) {
+                    pPos[k*3+1] -= 0.15; // Move downwards
+                    if(pPos[k*3+1] < flowBottom) {
+                        pPos[k*3+1] = flowTop; // Reset to top
+                    }
+                }
+                particles.geometry.attributes.position.needsUpdate = true;
+            }
+
+            // Camera follow
+            const targetCamX = 0;
+            const targetCamZ = isStacked ? 40 : 50;
+            
+            // Find the Y center of the active area
+            let focusY = 5;
+            if (isStacked) {
+                if (expandedLayer !== -1) {
+                    let baseOffsetY = 0;
+                    for(let j=0; j<expandedLayer; j++) baseOffsetY += 8; 
+                    focusY = 15 - baseOffsetY - 5; // center of the expanded layer
+                } else {
+                    focusY = 5; // center of all 3 layers
+                }
+            } else {
+                focusY = 0;
+            }
+            
+            camera.position.x += (targetCamX - camera.position.x) * 0.05;
+            camera.position.y += (focusY + 5 - camera.position.y) * 0.05;
+            camera.position.z += (targetCamZ - camera.position.z) * 0.05;
+
+            controls.target.y += (focusY - controls.target.y) * 0.05;
+
+            controls.update();
+            renderer.render(scene, camera);
+            labelRenderer.render(scene, camera);
+
+            // 2D Drawings
+            drawFiLM();
+            drawEvolution();
+            drawFFN();
+        }
+
+        window.addEventListener('resize', () => {
+            const w = container.clientWidth;
+            const h = container.clientHeight;
+            camera.aspect = w / h;
+            camera.updateProjectionMatrix();
+            renderer.setSize(w, h);
+            labelRenderer.setSize(w, h);
+        });
+
+        // Sidebar toggle
+        document.getElementById('sidebarToggle').addEventListener('click', () => {
+            document.body.classList.toggle('sidebar-open');
+        });
+        document.getElementById('sidebarBackdrop').addEventListener('click', () => {
+            document.body.classList.remove('sidebar-open');
+        });
+
+        document.getElementById('loader').style.display = 'none';
+        updateSidebarTitles();
+        animate();
+
+    </script>
+</body>
+</html>

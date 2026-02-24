@@ -1,0 +1,858 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gate and Device Heads Visualization</title>
+    <style>
+        :root {
+            --bg-color: #1a1a2e;
+            --panel-bg: #16213e;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --border-color: #0f3460;
+            --accent: #e94560;
+            --blue: #4ea8de;
+            --green: #2ecc71;
+            --orange: #f39c12;
+            --red: #e74c3c;
+            
+            --dev-kettle: #ef4444;
+            --dev-micro: #f97316;
+            --dev-fridge: #eab308;
+            --dev-dish: #06b6d4;
+            --dev-washer: #a855f7;
+        }
+
+        body {
+            margin: 0;
+            padding: 20px;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+        }
+
+        .header {
+            max-width: 1200px;
+            width: 100%;
+            margin-bottom: 20px;
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            margin: 0 0 10px 0;
+            font-weight: 600;
+        }
+
+        .insight-panel {
+            background-color: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+            font-size: 0.95rem;
+            line-height: 1.5;
+            color: var(--text-muted);
+        }
+
+        .insight-panel strong {
+            color: var(--text-main);
+        }
+
+        /* Tabs Navigation */
+        .tab-nav {
+            display: flex;
+            width: 100%;
+            max-width: 1200px;
+            gap: 4px;
+            margin-bottom: 20px;
+        }
+
+        .tab-btn {
+            flex: 1;
+            background-color: var(--panel-bg);
+            color: var(--text-main);
+            border: 1px solid var(--border-color);
+            padding: 12px;
+            border-radius: 8px 8px 0 0;
+            cursor: pointer;
+            font-size: 1rem;
+            font-weight: bold;
+            transition: all 0.2s;
+            text-align: center;
+        }
+
+        .tab-btn.active {
+            background-color: var(--accent);
+            border-color: var(--accent);
+            color: white;
+        }
+
+        /* Tab Content Containers */
+        .tab-content {
+            display: none;
+            width: 100%;
+            max-width: 1200px;
+            background-color: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 0 0 8px 8px;
+            padding: 20px;
+            box-sizing: border-box;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .tab-content.active {
+            display: flex;
+        }
+
+        .canvas-container {
+            background: rgba(0,0,0,0.3);
+            border-radius: 8px;
+            padding: 16px;
+            border: 1px solid var(--border-color);
+            position: relative;
+        }
+
+        canvas {
+            display: block;
+            margin: 0 auto;
+            max-width: 100%;
+        }
+
+        .label {
+            font-size: 0.9rem;
+            color: var(--text-main);
+            margin-bottom: 8px;
+            font-weight: bold;
+            text-align: center;
+        }
+
+        /* Controls */
+        .controls {
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+            justify-content: center;
+            margin-bottom: 12px;
+        }
+
+        .control-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 0.85rem;
+        }
+
+        button.action-btn {
+            background: var(--bg-color);
+            color: var(--text-main);
+            border: 1px solid var(--border-color);
+            padding: 6px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: 0.2s;
+        }
+
+        button.action-btn.active {
+            background: var(--blue);
+            border-color: var(--blue);
+        }
+
+        .device-tabs {
+            display: flex;
+            gap: 8px;
+            justify-content: center;
+            margin-bottom: 10px;
+        }
+
+        .dev-btn {
+            background: transparent;
+            color: var(--text-muted);
+            border: 1px solid var(--border-color);
+            padding: 4px 12px;
+            border-radius: 12px;
+            cursor: pointer;
+            font-size: 0.8rem;
+        }
+        
+        .dev-btn.active {
+            color: white;
+            border-color: white;
+        }
+
+        input[type=range] {
+            width: 100px;
+        }
+        
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .tab-nav { flex-wrap: wrap; }
+            .tab-btn { flex: 1 1 45%; }
+            .grid-2 { grid-template-columns: 1fr; }
+        }
+        @media (max-width: 640px) {
+            body { padding: 10px; }
+            h1 { font-size: 1.2rem; }
+            .tab-btn { font-size: 0.85rem; padding: 8px; }
+            .insight-panel { font-size: 0.85rem; padding: 12px; }
+            canvas { max-width: 100%; height: auto; }
+            .controls { gap: 8px; }
+            .device-tabs { flex-wrap: wrap; gap: 4px; }
+        }
+    </style>
+<style>.nav-back{display:inline-flex;align-items:center;gap:6px;color:#4fc3f7;text-decoration:none;font-size:13px;font-family:-apple-system,BlinkMacSystemFont,monospace;opacity:0.7;transition:opacity .2s;white-space:nowrap}.nav-back:hover{opacity:1;color:#81d4fa}.nav-back svg{width:14px;height:14px;fill:currentColor}</style>
+</head>
+<body data-condinilm="true">
+
+    <div class="header">
+        <a class="nav-back" href="/">&larr; Home</a>
+        <h1>NILMFormer Architecture Visualization</h1>
+        <div class="insight-panel">
+            The model contains multiple parts. Prediction heads process different device features. The gate mechanism decides if a device is on. The loss function optimizes the model's predictions. The inference pipeline merges window data into a complete sequence. The PCGrad method prevents conflicts between device updates. All charts update in real time.
+        </div>
+    </div>
+
+    <div class="tab-nav">
+        <button class="tab-btn active" onclick="switchTab(1)">1. Head Architecture</button>
+        <button class="tab-btn" onclick="switchTab(2)">2. Gate Mechanism</button>
+        <button class="tab-btn" onclick="switchTab(3)">3. Loss & PCGrad</button>
+        <button class="tab-btn" onclick="switchTab(4)">4. Inference Pipeline</button>
+    </div>
+
+    <!-- TAB 1: Architecture -->
+    <div id="tab-1" class="tab-content active">
+        <div class="device-tabs" id="arch-dev-tabs">
+            <button class="dev-btn active" style="background:var(--dev-kettle)" onclick="setArchDev(0)">Kettle</button>
+            <button class="dev-btn" style="background:var(--dev-micro)" onclick="setArchDev(1)">Microwave</button>
+            <button class="dev-btn" style="background:var(--dev-fridge)" onclick="setArchDev(2)">Fridge</button>
+            <button class="dev-btn" style="background:var(--dev-dish)" onclick="setArchDev(3)">Dishwasher</button>
+            <button class="dev-btn" style="background:var(--dev-washer)" onclick="setArchDev(4)">Washer</button>
+        </div>
+        <div class="canvas-container">
+            <div class="label" id="arch-label">Current Architecture: SparseDeviceCNN (For ON/OFF devices)</div>
+            <canvas id="archCanvas" width="1000" height="400"></canvas>
+        </div>
+    </div>
+
+    <!-- TAB 2: Gate Mechanism -->
+    <div id="tab-2" class="tab-content">
+        <div class="grid-2">
+            <div class="canvas-container">
+                <div class="label">Gate Function Comparison</div>
+                <div class="controls">
+                    <div class="control-group">
+                        <span>Hard Threshold (Inference):</span>
+                        <input type="range" id="gateThresh" min="0.3" max="0.7" step="0.01" value="0.5">
+                        <span id="gateThreshVal">0.50</span>
+                    </div>
+                </div>
+                <canvas id="funcCanvas" width="450" height="300"></canvas>
+            </div>
+            <div class="canvas-container">
+                <div class="label">Time Series Example (Fridge Cycle)</div>
+                <div class="controls">
+                    <button class="action-btn active" id="btnSoftGate" onclick="setGateMode('soft')">Soft Gate (Training)</button>
+                    <button class="action-btn" id="btnHardGate" onclick="setGateMode('hard')">Hard Gate (Inference)</button>
+                </div>
+                <canvas id="timeCanvas" width="450" height="300"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 3: Loss Function -->
+    <div id="tab-3" class="tab-content">
+        <div class="grid-2">
+            <div class="canvas-container">
+                <div class="label">7-Part Adaptive Loss Function (Stacked Bar)</div>
+                <div class="controls" style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+                    <div class="control-group"><span>α_on:</span><input type="range" id="wOn" min="0" max="5" step="0.1" value="1.0"></div>
+                    <div class="control-group"><span>α_off:</span><input type="range" id="wOff" min="0" max="2" step="0.1" value="0.5"></div>
+                    <div class="control-group"><span>w_peak:</span><input type="range" id="wPeak" min="0" max="1" step="0.05" value="0.2"></div>
+                    <div class="control-group"><span>w_grad:</span><input type="range" id="wGrad" min="0" max="1" step="0.05" value="0.1"></div>
+                    <div class="control-group"><span>w_energy:</span><input type="range" id="wEng" min="0" max="1" step="0.05" value="0.3"></div>
+                    <div class="control-group"><span>λ_zero:</span><input type="range" id="wZero" min="0" max="0.5" step="0.01" value="0.1"></div>
+                </div>
+                <canvas id="lossCanvas" width="450" height="250"></canvas>
+            </div>
+            <div class="canvas-container">
+                <div class="label">PCGrad Gradient Conflict Resolution</div>
+                <div class="controls">
+                    <button class="action-btn active" id="btnPcgrad" onclick="togglePcgrad()">PCGrad ON</button>
+                </div>
+                <div style="font-size: 0.8rem; color: var(--text-muted); text-align: center; margin-bottom: 5px;">
+                    Device gradients conflict when their angle is greater than 90 degrees. PCGrad removes the conflicting perpendicular component.
+                </div>
+                <canvas id="gradCanvas" width="450" height="250"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 4: Inference Pipeline -->
+    <div id="tab-4" class="tab-content">
+        <div class="controls">
+            <button class="action-btn active" id="btnShortSup" onclick="toggleInfer('short')">Short Activation Suppression (ON)</button>
+            <button class="action-btn active" id="btnLongSup" onclick="toggleInfer('long')">Long OFF Suppression (ON)</button>
+        </div>
+        <div class="canvas-container">
+            <div class="label">Sliding Window and Output Stitching (Seq2Subseq)</div>
+            <canvas id="inferCanvas" width="1000" height="400"></canvas>
+        </div>
+    </div>
+
+<script>
+// --- Global State ---
+let currentTab = 1;
+let animTime = 0;
+
+// Tab 1 State
+let archDevType = 0; // 0,1=Sparse, 2,3,4=Simple
+
+// Tab 2 State
+let gateMode = 'soft';
+let gateThresh = 0.5;
+
+// Tab 3 State
+let pcgradOn = true;
+let lossWeights = { on: 1.0, off: 0.5, peak: 0.2, grad: 0.1, eng: 0.3, zero: 0.1, off_hard: 0.05 };
+
+// Tab 4 State
+let inferShort = true;
+let inferLong = true;
+
+// Utility functions
+function smoothstep(s) {
+    s = Math.max(0, Math.min(1, s));
+    return s * s * (3.0 - 2.0 * s);
+}
+
+// --- Tab Switching ---
+function switchTab(idx) {
+    currentTab = idx;
+    document.querySelectorAll('.tab-btn').forEach((b, i) => {
+        b.classList.toggle('active', i + 1 === idx);
+    });
+    document.querySelectorAll('.tab-content').forEach((c, i) => {
+        c.classList.toggle('active', i + 1 === idx);
+    });
+}
+
+// --- TAB 1: Architecture ---
+const archCtx = document.getElementById('archCanvas').getContext('2d');
+
+function setArchDev(idx) {
+    archDevType = idx;
+    document.querySelectorAll('#arch-dev-tabs .dev-btn').forEach((b, i) => {
+        b.classList.toggle('active', i === idx);
+    });
+    const label = document.getElementById('arch-label');
+    if (idx < 2) {
+        label.textContent = "Current Architecture: SparseDeviceCNN (For ON/OFF devices)";
+    } else {
+        label.textContent = "Current Architecture: SimpleDeviceHead (Dual-branch structure)";
+    }
+}
+
+function drawRoundRect(ctx, x, y, w, h, r, fill, stroke) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+    if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+    if (stroke) { ctx.strokeStyle = stroke; ctx.stroke(); }
+}
+
+function drawArrow(ctx, x1, y1, x2, y2) {
+    ctx.beginPath();
+    ctx.moveTo(x1, y1);
+    ctx.lineTo(x2, y2);
+    ctx.strokeStyle = '#94a3b8';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    
+    // arrowhead
+    const angle = Math.atan2(y2 - y1, x2 - x1);
+    ctx.beginPath();
+    ctx.moveTo(x2, y2);
+    ctx.lineTo(x2 - 10 * Math.cos(angle - Math.PI / 6), y2 - 10 * Math.sin(angle - Math.PI / 6));
+    ctx.lineTo(x2 - 10 * Math.cos(angle + Math.PI / 6), y2 - 10 * Math.sin(angle + Math.PI / 6));
+    ctx.fillStyle = '#94a3b8';
+    ctx.fill();
+}
+
+function drawTab1() {
+    const ctx = archCtx;
+    ctx.clearRect(0, 0, 1000, 400);
+
+    const isSparse = archDevType < 2;
+
+    // Input
+    drawRoundRect(ctx, 50, 180, 120, 40, 5, '#0f3460', '#4ea8de');
+    ctx.fillStyle = '#fff';
+    ctx.font = '14px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Encoder Output', 110, 200);
+    ctx.font = '12px sans-serif';
+    ctx.fillText('(32, 96, 480)', 110, 215);
+
+    drawArrow(ctx, 170, 200, 220, 200);
+
+    if (isSparse) {
+        // SparseDeviceCNN
+        drawRoundRect(ctx, 220, 150, 160, 100, 8, 'rgba(78, 168, 222, 0.2)', '#4ea8de');
+        ctx.fillStyle = '#fff';
+        ctx.fillText('Conv1d -> GELU', 300, 190);
+        ctx.fillText('-> BatchNorm', 300, 210);
+
+        drawArrow(ctx, 380, 200, 430, 200);
+
+        drawRoundRect(ctx, 430, 150, 160, 100, 8, 'rgba(78, 168, 222, 0.2)', '#4ea8de');
+        ctx.fillStyle = '#fff';
+        ctx.fillText('Conv1d (Dilated)', 510, 190);
+        ctx.fillText('-> GELU', 510, 210);
+
+        drawArrow(ctx, 590, 200, 640, 200);
+
+        drawRoundRect(ctx, 640, 170, 100, 60, 5, 'rgba(233, 69, 96, 0.2)', '#e94560');
+        ctx.fillStyle = '#fff';
+        ctx.fillText('Conv1d', 690, 195);
+        ctx.fillText('Output (2 channels)', 690, 215);
+        
+        drawArrow(ctx, 740, 190, 800, 160);
+        drawArrow(ctx, 740, 210, 800, 240);
+        
+        ctx.textAlign = 'left';
+        ctx.fillText('Ch 0: Power', 810, 165);
+        ctx.fillText('Ch 1: Gate Logit', 810, 245);
+
+    } else {
+        // SimpleDeviceHead
+        // Shared
+        drawRoundRect(ctx, 220, 150, 140, 100, 8, 'rgba(46, 204, 113, 0.2)', '#2ecc71');
+        ctx.fillStyle = '#fff';
+        ctx.fillText('Shared Feature', 290, 190);
+        ctx.fillText('Extractor', 290, 210);
+        
+        // Split
+        drawArrow(ctx, 360, 200, 410, 120);
+        drawArrow(ctx, 360, 200, 410, 280);
+
+        // Classification Branch
+        drawRoundRect(ctx, 410, 80, 200, 80, 8, 'rgba(231, 76, 60, 0.2)', '#e74c3c');
+        ctx.fillStyle = '#fff';
+        ctx.fillText('Classification Branch', 510, 110);
+        ctx.fillText('Conv -> 2 * Sigmoid', 510, 130);
+        ctx.fillStyle = '#e74c3c';
+        ctx.fillText('Gate Prob [0, 2.0]', 510, 150);
+
+        // Regression Branch
+        drawRoundRect(ctx, 410, 240, 200, 80, 8, 'rgba(52, 152, 219, 0.2)', '#3498db');
+        ctx.fillStyle = '#fff';
+        ctx.fillText('Regression Branch', 510, 270);
+        ctx.fillText('Conv -> ReLU', 510, 290);
+        ctx.fillStyle = '#3498db';
+        ctx.fillText('Power Raw [0, inf)', 510, 310);
+
+        // Merge
+        drawArrow(ctx, 610, 120, 680, 190);
+        drawArrow(ctx, 610, 280, 680, 210);
+
+        ctx.beginPath();
+        ctx.arc(690, 200, 15, 0, Math.PI*2);
+        ctx.fillStyle = '#0f3460';
+        ctx.fill();
+        ctx.strokeStyle = '#fff';
+        ctx.stroke();
+        ctx.fillStyle = '#fff';
+        ctx.fillText('X', 690, 205); // Multiply
+
+        drawArrow(ctx, 705, 200, 760, 200);
+        
+        drawRoundRect(ctx, 760, 180, 120, 40, 5, 'rgba(243, 156, 18, 0.2)', '#f39c12');
+        ctx.fillStyle = '#fff';
+        ctx.fillText('Gated Power', 820, 205);
+    }
+}
+
+// --- TAB 2: Gate Mechanism ---
+const funcCtx = document.getElementById('funcCanvas').getContext('2d');
+const timeCtx = document.getElementById('timeCanvas').getContext('2d');
+
+document.getElementById('gateThresh').addEventListener('input', (e) => {
+    gateThresh = parseFloat(e.target.value);
+    document.getElementById('gateThreshVal').textContent = gateThresh.toFixed(2);
+});
+
+function setGateMode(m) {
+    gateMode = m;
+    document.getElementById('btnSoftGate').classList.toggle('active', m === 'soft');
+    document.getElementById('btnHardGate').classList.toggle('active', m === 'hard');
+}
+
+function drawTab2() {
+    // 1. Function Plot
+    const fCtx = funcCtx;
+    fCtx.clearRect(0, 0, 450, 300);
+    
+    // Axes
+    fCtx.strokeStyle = '#334155';
+    fCtx.lineWidth = 1;
+    fCtx.beginPath();
+    fCtx.moveTo(50, 250); fCtx.lineTo(400, 250); // X
+    fCtx.moveTo(50, 250); fCtx.lineTo(50, 50); // Y
+    fCtx.stroke();
+    fCtx.fillStyle = '#94a3b8';
+    fCtx.fillText('0.0', 30, 255);
+    fCtx.fillText('1.0', 30, 55);
+    fCtx.fillText('s (Input)', 200, 280);
+
+    // Grid lines for 0.5 and threshold
+    fCtx.setLineDash([5, 5]);
+    fCtx.beginPath(); fCtx.moveTo(50, 150); fCtx.lineTo(400, 150); fCtx.stroke();
+    
+    let thX = 50 + gateThresh * 300;
+    fCtx.strokeStyle = '#e94560';
+    fCtx.beginPath(); fCtx.moveTo(thX, 250); fCtx.lineTo(thX, 50); fCtx.stroke();
+    fCtx.fillText(`Th: ${gateThresh.toFixed(2)}`, thX - 10, 40);
+    fCtx.setLineDash([]);
+
+    // Draw curves
+    fCtx.lineWidth = 2;
+    fCtx.beginPath();
+    for(let i=0; i<=300; i++) {
+        let s = i / 300; // 0 to 1
+        // Smoothstep
+        let y = smoothstep(s);
+        if(i===0) fCtx.moveTo(50+i, 250 - y*200);
+        else fCtx.lineTo(50+i, 250 - y*200);
+    }
+    fCtx.strokeStyle = '#2ecc71'; fCtx.stroke();
+
+    fCtx.beginPath();
+    for(let i=0; i<=300; i++) {
+        let s = i / 300;
+        // Hard
+        let y = s >= gateThresh ? 1.0 : 0.0;
+        if(i===0) fCtx.moveTo(50+i, 250 - y*200);
+        else fCtx.lineTo(50+i, 250 - y*200);
+    }
+    fCtx.strokeStyle = '#e94560'; fCtx.stroke();
+
+    // Legend
+    fCtx.fillStyle = '#2ecc71'; fCtx.fillText('— Smoothstep (Training)', 250, 80);
+    fCtx.fillStyle = '#e94560'; fCtx.fillText('— Hard Gate (Inference)', 250, 100);
+
+    // 2. Timeline Example
+    const tCtx = timeCtx;
+    tCtx.clearRect(0, 0, 450, 300);
+
+    // Fake data for 100 points
+    const pts = 100;
+    const w = 400 / pts;
+    
+    tCtx.fillStyle = '#fff';
+    tCtx.fillText('Gate Probability', 10, 20);
+    tCtx.fillText('Raw Power', 10, 120);
+    tCtx.fillText('Gated Power', 10, 220);
+
+    for(let i=0; i<pts; i++) {
+        let x = 30 + i * w;
+        
+        // Base signal (ON in middle)
+        let isOn = (i > 30 && i < 70);
+        let transition = Math.abs(i - 30) < 10 || Math.abs(i - 70) < 10;
+        
+        let rawS = isOn ? 1.0 : 0.0;
+        if (transition) {
+            if (i >= 20 && i <= 40) rawS = (i - 20) / 20; // ramp up
+            if (i >= 60 && i <= 80) rawS = 1.0 - (i - 60) / 20; // ramp down
+        }
+        
+        let gateProb = rawS * 0.9 + Math.sin(i*0.5)*0.05; // add noise
+        gateProb = Math.max(0, Math.min(1, gateProb));
+
+        let powerRaw = isOn ? 120 + Math.sin(i)*5 : 10 + Math.random()*20; // background noise
+        
+        let finalGate = 0;
+        if (gateMode === 'soft') finalGate = smoothstep(gateProb);
+        else finalGate = gateProb >= gateThresh ? 1.0 : 0.0;
+
+        let finalPower = finalGate * powerRaw;
+
+        // Draw Prob
+        tCtx.fillStyle = `rgba(46, 204, 113, ${gateProb})`;
+        tCtx.fillRect(x, 40, w-1, 40);
+
+        // Draw Raw
+        let hRaw = (powerRaw / 150) * 50;
+        tCtx.fillStyle = '#3498db';
+        tCtx.fillRect(x, 180 - hRaw, w-1, hRaw);
+
+        // Draw Final
+        let hFinal = (finalPower / 150) * 50;
+        tCtx.fillStyle = '#f39c12';
+        tCtx.fillRect(x, 280 - hFinal, w-1, hFinal);
+    }
+}
+
+// --- TAB 3: Loss & PCGrad ---
+const lossCtx = document.getElementById('lossCanvas').getContext('2d');
+const gradCtx = document.getElementById('gradCanvas').getContext('2d');
+
+['wOn','wOff','wPeak','wGrad','wEng','wZero'].forEach(id => {
+    document.getElementById(id).addEventListener('input', (e) => {
+        let key = id.replace('w','').toLowerCase();
+        if(key === 'eng') key = 'energy';
+        lossWeights[key] = parseFloat(e.target.value);
+    });
+});
+
+function togglePcgrad() {
+    pcgradOn = !pcgradOn;
+    document.getElementById('btnPcgrad').classList.toggle('active', pcgradOn);
+    document.getElementById('btnPcgrad').textContent = pcgradOn ? "PCGrad ON" : "PCGrad OFF";
+}
+
+function drawTab3() {
+    // 1. Loss Stacked Bar
+    const lCtx = lossCtx;
+    lCtx.clearRect(0, 0, 450, 250);
+
+    const devNames = ['Kettle', 'Micro', 'Fridge', 'Dish', 'Washer'];
+    const comps = [
+        {k:'on', c:'#ef4444'}, {k:'off', c:'#f97316'}, {k:'peak', c:'#eab308'},
+        {k:'grad', c:'#2ecc71'}, {k:'eng', c:'#3b82f6'}, {k:'zero', c:'#8b5cf6'}
+    ];
+
+    // Base raw losses (simulated)
+    const baseRaw = [
+        [0.8, 0.1, 0.5, 0.3, 0.4, 0.1], // Kettle
+        [0.7, 0.2, 0.4, 0.2, 0.5, 0.1], // Micro
+        [0.3, 0.6, 0.2, 0.1, 0.2, 0.3], // Fridge
+        [0.4, 0.4, 0.3, 0.2, 0.4, 0.2], // Dish
+        [0.5, 0.3, 0.4, 0.3, 0.5, 0.1]  // Washer
+    ];
+
+    const barW = 40;
+    const startX = 50;
+
+    for (let d = 0; d < 5; d++) {
+        let x = startX + d * 70;
+        let y = 220; // Bottom
+        
+        for (let c = 0; c < 6; c++) {
+            let key = comps[c].k;
+            if(key === 'eng') key = 'energy';
+            let val = baseRaw[d][c] * lossWeights[key] * 20; // Scale for visual
+            
+            lCtx.fillStyle = comps[c].c;
+            lCtx.fillRect(x, y - val, barW, val);
+            y -= val;
+        }
+
+        lCtx.fillStyle = '#fff';
+        lCtx.font = '10px sans-serif';
+        lCtx.fillText(devNames[d], x, 235);
+    }
+
+    // Legend
+    let lx = 350, ly = 50;
+    comps.forEach((c, i) => {
+        lCtx.fillStyle = c.c;
+        lCtx.fillRect(lx, ly + i*20, 10, 10);
+        lCtx.fillStyle = '#fff';
+        lCtx.fillText(c.k, lx + 15, ly + i*20 + 8);
+    });
+
+    // 2. PCGrad Vectors
+    const gCtx = gradCtx;
+    gCtx.clearRect(0, 0, 450, 250);
+    
+    const cx = 225, cy = 150;
+    
+    // Draw axes
+    gCtx.strokeStyle = '#334155';
+    gCtx.beginPath(); gCtx.moveTo(50, cy); gCtx.lineTo(400, cy); gCtx.stroke();
+    gCtx.beginPath(); gCtx.moveTo(cx, 50); gCtx.lineTo(cx, 230); gCtx.stroke();
+
+    // Two gradient vectors (simulating conflict)
+    let a1 = Math.PI * 0.2 + Math.sin(animTime*0.5)*0.1; // vec 1
+    let a2 = Math.PI * 0.9 + Math.cos(animTime*0.7)*0.2; // vec 2 (conflict > 90 deg)
+
+    let v1 = {x: Math.cos(a1)*80, y: -Math.sin(a1)*80};
+    let v2 = {x: Math.cos(a2)*70, y: -Math.sin(a2)*70};
+
+    // Draw original v2 (dimmed if PCGrad on)
+    gCtx.strokeStyle = pcgradOn ? 'rgba(234, 179, 8, 0.3)' : '#eab308';
+    gCtx.lineWidth = 3;
+    drawArrow(gCtx, cx, cy, cx + v2.x, cy + v2.y);
+    gCtx.fillStyle = pcgradOn ? 'rgba(234, 179, 8, 0.3)' : '#eab308';
+    gCtx.fillText('g2 (Kettle)', cx + v2.x - 20, cy + v2.y - 10);
+
+    // Draw v1
+    gCtx.strokeStyle = '#3b82f6';
+    drawArrow(gCtx, cx, cy, cx + v1.x, cy + v1.y);
+    gCtx.fillStyle = '#3b82f6';
+    gCtx.fillText('g1 (Fridge)', cx + v1.x + 10, cy + v1.y);
+
+    // PCGrad Projection Logic
+    let dot = v1.x * v2.x + v1.y * v2.y;
+    if (dot < 0 && pcgradOn) {
+        // v2 projected away from v1
+        let v1_len2 = v1.x*v1.x + v1.y*v1.y;
+        let proj_x = (dot / v1_len2) * v1.x;
+        let proj_y = (dot / v1_len2) * v1.y;
+
+        let v2_new = { x: v2.x - proj_x, y: v2.y - proj_y };
+
+        // Draw projection line
+        gCtx.strokeStyle = '#e74c3c';
+        gCtx.setLineDash([4, 4]);
+        gCtx.beginPath(); gCtx.moveTo(cx + v2.x, cy + v2.y); gCtx.lineTo(cx + v2_new.x, cy + v2_new.y); gCtx.stroke();
+        gCtx.setLineDash([]);
+
+        // Draw new vector
+        gCtx.strokeStyle = '#2ecc71';
+        drawArrow(gCtx, cx, cy, cx + v2_new.x, cy + v2_new.y);
+        gCtx.fillStyle = '#2ecc71';
+        gCtx.fillText("g2' (Projected)", cx + v2_new.x - 30, cy + v2_new.y - 10);
+        
+        gCtx.fillStyle = '#e74c3c';
+        gCtx.fillText("Conflict Detected! (Dot < 0)", 10, 30);
+    }
+}
+
+// --- TAB 4: Inference ---
+const inferCtx = document.getElementById('inferCanvas').getContext('2d');
+
+function toggleInfer(type) {
+    if (type === 'short') {
+        inferShort = !inferShort;
+        document.getElementById('btnShortSup').classList.toggle('active', inferShort);
+        document.getElementById('btnShortSup').textContent = `Short Activation Suppression (${inferShort?'ON':'OFF'})`;
+    } else {
+        inferLong = !inferLong;
+        document.getElementById('btnLongSup').classList.toggle('active', inferLong);
+        document.getElementById('btnLongSup').textContent = `Long OFF Suppression (${inferLong?'ON':'OFF'})`;
+    }
+}
+
+// Pre-generate a long signal
+const longSignal = [];
+for(let i=0; i<800; i++) {
+    let base = Math.sin(i*0.02)*10 + 20;
+    // Add spikes
+    if (i>100 && i<120) base += 100; // valid
+    if (i>300 && i<305) base += 90;  // too short (will be suppressed)
+    if (i>500 && i<600) base += 80;  // valid
+    if (i>700 && i<702) base += 120; // short spike
+    longSignal.push(base + Math.random()*5);
+}
+
+function drawTab4() {
+    const ctx = inferCtx;
+    ctx.clearRect(0, 0, 1000, 400);
+
+    const winSize = 160;
+    const stride = 80;
+    const margin = 40;
+
+    // Sliding window position
+    let slideX = (animTime * 30) % (800 - winSize);
+    
+    ctx.fillStyle = '#fff';
+    ctx.font = '14px sans-serif';
+    ctx.fillText('1. Padded Input Sequence', 20, 30);
+    
+    // Draw full input
+    ctx.strokeStyle = '#4ea8de';
+    ctx.beginPath();
+    for(let i=0; i<800; i++) {
+        let y = 80 - longSignal[i]*0.3;
+        if(i===0) ctx.moveTo(20+i, y);
+        else ctx.lineTo(20+i, y);
+    }
+    ctx.stroke();
+
+    // Draw sliding window box
+    ctx.strokeStyle = '#f39c12';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(20 + slideX, 20, winSize, 80);
+    
+    // Draw center region
+    ctx.fillStyle = 'rgba(46, 204, 113, 0.3)';
+    ctx.fillRect(20 + slideX + margin, 20, winSize - 2*margin, 80);
+
+    // 2. Stitched Output (Building up)
+    ctx.fillStyle = '#fff';
+    ctx.fillText('2. Stitched Window Centers', 20, 150);
+    
+    ctx.strokeStyle = '#2ecc71';
+    ctx.beginPath();
+    // Only draw up to current slideX center
+    let maxDraw = slideX + margin + stride;
+    for(let i=0; i<maxDraw && i<800; i++) {
+        let y = 200 - longSignal[i]*0.3;
+        if(i===0) ctx.moveTo(20+i, y);
+        else ctx.lineTo(20+i, y);
+    }
+    ctx.stroke();
+
+    // 3. Post-processed Output
+    ctx.fillStyle = '#fff';
+    ctx.fillText('3. Post-processed Output', 20, 270);
+    
+    ctx.beginPath();
+    for(let i=0; i<800; i++) {
+        let val = longSignal[i];
+        let isShort = (i>300 && i<305) || (i>700 && i<702);
+        
+        if (inferShort && isShort) {
+            val = 0; // Suppressed
+            ctx.fillStyle = 'rgba(231, 76, 60, 0.5)';
+            ctx.fillRect(20+i, 280, 2, 80); // highlight suppression
+        }
+        
+        let y = 350 - val*0.3;
+        if(i===0) ctx.moveTo(20+i, y);
+        else ctx.lineTo(20+i, y);
+    }
+    ctx.strokeStyle = '#eab308';
+    ctx.stroke();
+    
+    if (inferShort) {
+        ctx.fillStyle = '#e74c3c';
+        ctx.fillText('Red Area: Suppressed Short Activations', 250, 270);
+    }
+}
+
+// --- Main Render Loop ---
+function renderLoop() {
+    animTime += 0.016; // ~60fps
+
+    if (currentTab === 1) drawTab1();
+    if (currentTab === 2) drawTab2();
+    if (currentTab === 3) drawTab3();
+    if (currentTab === 4) drawTab4();
+
+    requestAnimationFrame(renderLoop);
+}
+
+// Start
+renderLoop();
+
+</script>
+</body>
+</html>

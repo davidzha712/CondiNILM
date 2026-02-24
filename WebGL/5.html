@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CondiNILM Feature Extractor</title>
+    <style>
+        :root {
+            --bg-dark: #12121a;
+            --panel-bg: rgba(25, 25, 35, 0.9);
+            --border-color: rgba(255, 255, 255, 0.15);
+            --text-main: #ffffff;
+            --text-muted: #9aa0a6;
+            --highlight: #4fc3f7;
+            --accent: #ffa726;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+        }
+
+        /* 3D Canvas */
+        #webgl-container {
+            flex: 1;
+            height: 100vh;
+            position: relative;
+        }
+
+        /* Sidebar UI */
+        #sidebar {
+            width: 360px;
+            height: 100vh;
+            background: var(--panel-bg);
+            border-left: 1px solid var(--border-color);
+            backdrop-filter: blur(10px);
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+            z-index: 10;
+            box-shadow: -5px 0 20px rgba(0,0,0,0.5);
+        }
+
+        .section {
+            padding: 20px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        h1 {
+            font-size: 20px;
+            margin: 0 0 10px 0;
+            color: #fff;
+        }
+
+        h2 {
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: var(--text-muted);
+            margin: 0 0 10px 0;
+        }
+
+        p {
+            font-size: 14px;
+            line-height: 1.5;
+            color: #ccc;
+            margin: 0 0 10px 0;
+        }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+        }
+
+        .tab-btn {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: white;
+            padding: 8px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 13px;
+            flex: 1;
+            text-align: center;
+            transition: all 0.2s;
+        }
+
+        .tab-btn:hover {
+            background: rgba(255, 255, 255, 0.15);
+        }
+
+        .tab-btn.active {
+            background: rgba(79, 195, 247, 0.2);
+            border-color: var(--highlight);
+            color: var(--highlight);
+            font-weight: bold;
+        }
+
+        /* Controls */
+        .controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-top: 15px;
+        }
+
+        .controls button {
+            background: var(--highlight);
+            border: none;
+            color: #000;
+            padding: 8px 16px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 13px;
+        }
+
+        input[type="range"] {
+            flex: 1;
+            accent-color: var(--highlight);
+        }
+
+        /* Action Button */
+        .action-btn {
+            display: block;
+            width: 100%;
+            background: rgba(255, 167, 38, 0.2);
+            border: 1px solid var(--accent);
+            color: var(--accent);
+            padding: 10px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+            margin-top: 10px;
+            transition: all 0.2s;
+        }
+
+        .action-btn:hover {
+            background: rgba(255, 167, 38, 0.3);
+        }
+
+        /* Diagrams */
+        .diagram-box {
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 8px;
+            padding: 15px;
+            margin-top: 10px;
+        }
+
+        .res-diagram {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            font-family: monospace;
+        }
+
+        .res-node {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 6px 12px;
+            border-radius: 4px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            text-align: center;
+            width: 120px;
+        }
+
+        .res-split {
+            display: flex;
+            gap: 20px;
+            position: relative;
+        }
+
+        .res-path {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            align-items: center;
+        }
+
+        .skip-path {
+            justify-content: center;
+            border-left: 2px dashed rgba(255, 255, 255, 0.3);
+            padding-left: 15px;
+            color: var(--text-muted);
+        }
+
+        /* Canvas Overlays */
+        #gelu-canvas {
+            width: 100%;
+            height: 100px;
+            background: #000;
+            border-radius: 4px;
+            margin-top: 10px;
+        }
+
+        #loader {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 18px;
+            z-index: 1000;
+        }
+
+        /* 3D Labels */
+        .floating-label {
+            color: #fff;
+            font-family: sans-serif;
+            font-size: 12px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 4px 8px;
+            border-radius: 4px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            pointer-events: none;
+        }
+
+        /* Sidebar Toggle Button */
+        .sidebar-toggle {
+            display: none;
+            position: fixed;
+            top: 15px;
+            right: 15px;
+            z-index: 20;
+            background: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            color: white;
+            width: 40px;
+            height: 40px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 20px;
+            align-items: center;
+            justify-content: center;
+            backdrop-filter: blur(10px);
+            padding: 0;
+            flex: none;
+        }
+
+        .sidebar-backdrop {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 9;
+        }
+
+        /* Responsive */
+        @media (max-width: 1024px) {
+            .sidebar-toggle { display: flex; }
+            #sidebar {
+                position: fixed;
+                right: -380px;
+                top: 0;
+                z-index: 15;
+                transition: right 0.3s ease;
+            }
+            body.sidebar-open #sidebar { right: 0; }
+            body.sidebar-open .sidebar-backdrop { display: block; }
+            #webgl-container { width: 100vw; }
+        }
+        @media (max-width: 640px) {
+            #sidebar { width: 100vw; right: -100vw; }
+        }
+    </style>
+
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+<style>.nav-back{display:inline-flex;align-items:center;gap:6px;color:#4fc3f7;text-decoration:none;font-size:13px;font-family:-apple-system,BlinkMacSystemFont,monospace;opacity:0.7;transition:opacity .2s;white-space:nowrap}.nav-back:hover{opacity:1;color:#81d4fa}.nav-back svg{width:14px;height:14px;fill:currentColor}</style>
+</head>
+<body data-condinilm="true">
+
+    <div id="loader">Loading 3D Scene...</div>
+
+    <button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar">&#9776;</button>
+    <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
+
+    <div id="webgl-container"></div>
+
+    <div id="sidebar">
+        <div class="section">
+            <a class="nav-back" href="/">&larr; Home</a>
+            <h1>Step 2: Feature Extractor</h1>
+            <p>This is the first neural network layer. The layer changes raw input into useful features.</p>
+            <p>The layer uses a special filter with gaps. The gaps allow the model to see a wider time range without extra math. This helps the model find patterns.</p>
+        </div>
+
+        <div class="section">
+            <h2>Select Network Layer</h2>
+            <div class="tabs">
+                <button class="tab-btn active" data-layer="0">Layer 0 (Gap: 0)</button>
+                <button class="tab-btn" data-layer="1">Layer 1 (Gap: 1)</button>
+                <button class="tab-btn" data-layer="2">Layer 2 (Gap: 3)</button>
+                <button class="tab-btn" data-layer="3">Layer 3 (Gap: 7)</button>
+            </div>
+            <p id="layer-desc">Layer 0 looks at 3 consecutive minutes of data.</p>
+            
+            <div class="controls">
+                <button id="btn-play">Auto Play</button>
+                <input type="range" id="time-slider" min="0" max="479" value="240">
+            </div>
+            
+            <button class="action-btn" id="btn-rf">Show View Range</button>
+            <p id="rf-desc" style="margin-top: 10px; color: var(--accent); font-weight: bold; text-align: center; opacity: 0;">View Range: 3 minutes</p>
+        </div>
+
+        <div class="section">
+            <h2>Residual Connection</h2>
+            <p>The skip connection bypasses the main filter. It prevents data loss during training.</p>
+            <div class="diagram-box">
+                <div class="res-diagram">
+                    <div class="res-node">Input Data</div>
+                    <div>↓</div>
+                    <div class="res-split">
+                        <div class="res-path">
+                            <div class="res-node" style="border-color: #4fc3f7;">Filter (Conv1d)</div>
+                            <div class="res-node">GELU Activation</div>
+                            <div class="res-node">Normalize</div>
+                        </div>
+                        <div class="res-path skip-path">
+                            <span>Skip Connection</span>
+                            <span>(Identity)</span>
+                        </div>
+                    </div>
+                    <div>↓</div>
+                    <div class="res-node" style="border-color: #ffa726;">+ Add Together</div>
+                    <div>↓</div>
+                    <div class="res-node">Output Data</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h2>GELU Activation Function</h2>
+            <p>The GELU function shapes the data. It curves smoothly to help the model learn better.</p>
+            <canvas id="gelu-canvas"></canvas>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
+        // --- State Variables ---
+        let currentLayer = 0;
+        let currentTime = 240;
+        let isPlaying = false;
+        
+        let rfAnimating = false;
+        let rfProgress = 0;
+
+        const DILATIONS = [1, 2, 4, 8];
+        const EFFECTIVE_RF = [3, 7, 15, 31];
+
+        // --- Procedural Data Generation ---
+        const TIME_STEPS = 480;
+        const IN_CHANNELS = 7;
+        const OUT_CHANNELS = 8;
+        
+        const inputData = [];
+        for (let i = 0; i < IN_CHANNELS; i++) {
+            inputData.push(new Float32Array(TIME_STEPS));
+        }
+
+        // Fill input with sine waves and noise
+        for (let t = 0; t < TIME_STEPS; t++) {
+            inputData[0][t] = Math.random() * 0.2 + (t % 80 < 20 ? 0.6 : 0) + (Math.abs(t - 240) < 5 ? 1.0 : 0); // Power
+            inputData[1][t] = Math.sin(t * 0.1) * 0.5 + 0.5;
+            inputData[2][t] = Math.cos(t * 0.1) * 0.5 + 0.5;
+            inputData[3][t] = Math.sin(t * 0.05) * 0.5 + 0.5;
+            inputData[4][t] = Math.cos(t * 0.05) * 0.5 + 0.5;
+            inputData[5][t] = Math.sin(t * 0.01) * 0.5 + 0.5;
+            inputData[6][t] = Math.cos(t * 0.01) * 0.5 + 0.5;
+        }
+
+        const layerOutputs = [];
+        for (let l = 0; l < 4; l++) {
+            const gap = DILATIONS[l];
+            const out = [];
+            for (let c = 0; c < OUT_CHANNELS; c++) {
+                const channelOut = new Float32Array(TIME_STEPS);
+                for (let t = 0; t < TIME_STEPS; t++) {
+                    let sum = 0;
+                    let t1 = Math.max(0, t - gap);
+                    let t2 = t;
+                    let t3 = Math.min(TIME_STEPS - 1, t + gap);
+                    
+                    for (let ic = 0; ic < IN_CHANNELS; ic++) {
+                        sum += inputData[ic][t1] * 0.3 + inputData[ic][t2] * 0.4 + inputData[ic][t3] * 0.3;
+                    }
+                    
+                    // Simple GELU approximation
+                    const gelu = sum * 0.5 * (1 + Math.tanh(0.79788 * (sum + 0.044715 * Math.pow(sum, 3))));
+                    channelOut[t] = gelu;
+                }
+                
+                // Normalize for visualization
+                let max = 0.001;
+                for (let t = 0; t < TIME_STEPS; t++) if (channelOut[t] > max) max = channelOut[t];
+                for (let t = 0; t < TIME_STEPS; t++) channelOut[t] /= max;
+                
+                out.push(channelOut);
+            }
+            layerOutputs.push(out);
+        }
+
+        // --- Color Maps ---
+        const inputColors = [0x4fc3f7, 0xffb74d, 0x81c784, 0xba68c8, 0xf06292, 0xa1887f, 0xe0e0e0];
+        
+        const magmaColors = [
+            [0, 0, 4],       // Black
+            [81, 18, 124],   // Dark Purple
+            [182, 54, 121],  // Pink
+            [251, 136, 97],  // Orange
+            [252, 253, 191]  // Yellow
+        ];
+
+        function getHeatmapColor(val) {
+            val = Math.max(0, Math.min(1, val));
+            const idx = val * (magmaColors.length - 1);
+            const i1 = Math.floor(idx);
+            const i2 = Math.min(i1 + 1, magmaColors.length - 1);
+            const f = idx - i1;
+            const c1 = magmaColors[i1];
+            const c2 = magmaColors[i2];
+            return [
+                c1[0] + (c2[0] - c1[0]) * f,
+                c1[1] + (c2[1] - c1[1]) * f,
+                c1[2] + (c2[2] - c1[2]) * f,
+                255
+            ];
+        }
+
+        // --- Three.js Setup ---
+        const container = document.getElementById('webgl-container');
+        const scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x12121a, 0.02);
+
+        const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 100);
+        camera.position.set(0, 0, 35);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(container.clientWidth, container.clientHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        const labelRenderer = new CSS2DRenderer();
+        labelRenderer.setSize(container.clientWidth, container.clientHeight);
+        labelRenderer.domElement.style.position = 'absolute';
+        labelRenderer.domElement.style.top = '0px';
+        labelRenderer.domElement.style.pointerEvents = 'none';
+        container.appendChild(labelRenderer.domElement);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.enablePan = false;
+
+        // Coordinate Mapping
+        const MAX_X = 48; // Total width in 3D space
+        function getX(t) {
+            return (t / TIME_STEPS) * MAX_X - (MAX_X / 2);
+        }
+
+        // --- Build Scene Objects ---
+        
+        // 1. Input Signal Lines
+        const inputYBase = 8;
+        for (let c = 0; c < IN_CHANNELS; c++) {
+            const geo = new THREE.BufferGeometry();
+            const pos = new Float32Array(TIME_STEPS * 3);
+            for (let t = 0; t < TIME_STEPS; t++) {
+                pos[t * 3] = getX(t);
+                pos[t * 3 + 1] = inputYBase - c * 0.8 + inputData[c][t] * 0.6;
+                pos[t * 3 + 2] = 0;
+            }
+            geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+            const mat = new THREE.LineBasicMaterial({ color: inputColors[c], transparent: true, opacity: 0.8 });
+            scene.add(new THREE.Line(geo, mat));
+        }
+
+        // 2. Output Feature Maps (Heatmaps)
+        const outputYBase = -6;
+        const heatmapPlanes = [];
+        for (let c = 0; c < OUT_CHANNELS; c++) {
+            const geo = new THREE.PlaneGeometry(MAX_X, 0.6);
+            
+            // Create initial empty texture
+            const texData = new Uint8Array(TIME_STEPS * 4);
+            const texture = new THREE.DataTexture(texData, TIME_STEPS, 1, THREE.RGBAFormat);
+            texture.needsUpdate = true;
+            
+            const mat = new THREE.MeshBasicMaterial({ map: texture, side: THREE.DoubleSide });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.position.set(0, outputYBase - c * 0.8, 0);
+            scene.add(mesh);
+            heatmapPlanes.push(mesh);
+        }
+
+        // 3. Kernel Visualizer
+        const kernelGroup = new THREE.Group();
+        scene.add(kernelGroup);
+
+        const dashMat = new THREE.LineDashedMaterial({ color: 0xffa726, dashSize: 0.2, gapSize: 0.2, linewidth: 2 });
+        const kernelLines = [];
+        const kernelDots = [];
+
+        // Create 3 vertical lines for the 3 taps
+        for (let i = 0; i < 3; i++) {
+            const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, inputYBase, 0), new THREE.Vector3(0, outputYBase, 0)]);
+            const line = new THREE.Line(geo, dashMat);
+            kernelGroup.add(line);
+            kernelLines.push(line);
+
+            // Top dot
+            const dotGeo = new THREE.CircleGeometry(0.15, 16);
+            const dotMat = new THREE.MeshBasicMaterial({ color: 0xffa726 });
+            const dot = new THREE.Mesh(dotGeo, dotMat);
+            kernelGroup.add(dot);
+            kernelDots.push(dot);
+        }
+        
+        // Bottom output dot
+        const outDot = new THREE.Mesh(new THREE.CircleGeometry(0.2, 16), new THREE.MeshBasicMaterial({ color: 0xffa726 }));
+        kernelGroup.add(outDot);
+
+        // 4. Receptive Field Highlight Box
+        const rfGeo = new THREE.PlaneGeometry(1, 14);
+        const rfMat = new THREE.MeshBasicMaterial({ color: 0x4fc3f7, transparent: true, opacity: 0.0, blending: THREE.AdditiveBlending, side: THREE.DoubleSide });
+        const rfBox = new THREE.Mesh(rfGeo, rfMat);
+        rfBox.position.set(0, 1, -0.1);
+        scene.add(rfBox);
+
+        // Labels
+        function createLabel(text, yPos) {
+            const div = document.createElement('div');
+            div.className = 'floating-label';
+            div.textContent = text;
+            const obj = new CSS2DObject(div);
+            obj.position.set(-MAX_X/2 - 2, yPos, 0);
+            scene.add(obj);
+        }
+        createLabel("Input Signal (7 Channels)", inputYBase - 2);
+        createLabel("Output Features (8 Channels)", outputYBase - 2);
+
+        // --- Logic & Updates ---
+
+        function updateTextures() {
+            const data = layerOutputs[currentLayer];
+            for (let c = 0; c < OUT_CHANNELS; c++) {
+                const texture = heatmapPlanes[c].material.map;
+                const texData = texture.image.data;
+                for (let t = 0; t < TIME_STEPS; t++) {
+                    const rgba = getHeatmapColor(data[c][t]);
+                    texData[t * 4 + 0] = rgba[0];
+                    texData[t * 4 + 1] = rgba[1];
+                    texData[t * 4 + 2] = rgba[2];
+                    texData[t * 4 + 3] = rgba[3];
+                }
+                texture.needsUpdate = true;
+            }
+        }
+
+        function updateKernel() {
+            const gap = DILATIONS[currentLayer];
+            
+            const t1 = Math.max(0, currentTime - gap);
+            const t2 = currentTime;
+            const t3 = Math.min(TIME_STEPS - 1, currentTime + gap);
+
+            const x1 = getX(t1);
+            const x2 = getX(t2);
+            const x3 = getX(t3);
+
+            const xs = [x1, x2, x3];
+
+            for (let i = 0; i < 3; i++) {
+                const pos = kernelLines[i].geometry.attributes.position.array;
+                pos[0] = xs[i]; pos[1] = inputYBase; pos[2] = 0;
+                pos[3] = x2;    pos[4] = outputYBase; pos[5] = 0; // All converge to center bottom
+                kernelLines[i].geometry.attributes.position.needsUpdate = true;
+                kernelLines[i].computeLineDistances();
+
+                kernelDots[i].position.set(xs[i], inputYBase, 0);
+            }
+            outDot.position.set(x2, outputYBase, 0);
+        }
+
+        function drawGelu() {
+            const canvas = document.getElementById('gelu-canvas');
+            const ctx = canvas.getContext('2d');
+            const w = canvas.width = canvas.clientWidth * window.devicePixelRatio;
+            const h = canvas.height = canvas.clientHeight * window.devicePixelRatio;
+            ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+            
+            const cw = canvas.clientWidth;
+            const ch = canvas.clientHeight;
+
+            ctx.clearRect(0, 0, cw, ch);
+
+            // Draw Axes
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+            ctx.beginPath();
+            ctx.moveTo(0, ch/2); ctx.lineTo(cw, ch/2);
+            ctx.moveTo(cw/2, 0); ctx.lineTo(cw/2, ch);
+            ctx.stroke();
+
+            // Draw Curve
+            ctx.strokeStyle = '#4fc3f7';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            for (let i = 0; i < cw; i++) {
+                const x = (i / cw) * 6 - 3; // -3 to 3
+                const gelu = x * 0.5 * (1 + Math.tanh(0.79788 * (x + 0.044715 * Math.pow(x, 3))));
+                const yPos = ch/2 - (gelu / 3) * (ch/2);
+                if (i === 0) ctx.moveTo(i, yPos);
+                else ctx.lineTo(i, yPos);
+            }
+            ctx.stroke();
+
+            // Draw Current Dot based on simulated kernel sum
+            const gap = DILATIONS[currentLayer];
+            let sum = 0;
+            for (let ic = 0; ic < IN_CHANNELS; ic++) {
+                sum += inputData[ic][Math.max(0, currentTime - gap)] * 0.3 + 
+                       inputData[ic][currentTime] * 0.4 + 
+                       inputData[ic][Math.min(TIME_STEPS-1, currentTime + gap)] * 0.3;
+            }
+            
+            // Normalize sum to roughly -2 to 2 for the plot
+            const plotX = (sum * 2) - 1;
+            const plotGelu = plotX * 0.5 * (1 + Math.tanh(0.79788 * (plotX + 0.044715 * Math.pow(plotX, 3))));
+            
+            const dotX = ((plotX + 3) / 6) * cw;
+            const dotY = ch/2 - (plotGelu / 3) * (ch/2);
+
+            ctx.fillStyle = '#ffa726';
+            ctx.beginPath();
+            ctx.arc(dotX, dotY, 4, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
+        // --- UI Events ---
+
+        document.querySelectorAll('.tab-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+                e.target.classList.add('active');
+                
+                currentLayer = parseInt(e.target.dataset.layer);
+                
+                const gap = DILATIONS[currentLayer];
+                const rf = EFFECTIVE_RF[currentLayer];
+                
+                document.getElementById('layer-desc').textContent = `Layer ${currentLayer} uses a gap of ${gap}. The layer looks at ${rf} minutes of data.`;
+                
+                rfAnimating = false;
+                rfBox.material.opacity = 0;
+                document.getElementById('rf-desc').style.opacity = 0;
+                
+                updateTextures();
+                updateKernel();
+                drawGelu();
+            });
+        });
+
+        const slider = document.getElementById('time-slider');
+        slider.addEventListener('input', (e) => {
+            currentTime = parseInt(e.target.value);
+            isPlaying = false;
+            document.getElementById('btn-play').textContent = 'Auto Play';
+            
+            // If dragging slider, hide RF animation to prevent visual mess
+            rfAnimating = false;
+            rfBox.material.opacity = 0;
+            document.getElementById('rf-desc').style.opacity = 0;
+
+            updateKernel();
+            drawGelu();
+        });
+
+        document.getElementById('btn-play').addEventListener('click', () => {
+            isPlaying = !isPlaying;
+            document.getElementById('btn-play').textContent = isPlaying ? 'Pause' : 'Auto Play';
+            if (isPlaying) {
+                rfAnimating = false;
+                rfBox.material.opacity = 0;
+                document.getElementById('rf-desc').style.opacity = 0;
+            }
+        });
+
+        document.getElementById('btn-rf').addEventListener('click', () => {
+            isPlaying = false;
+            document.getElementById('btn-play').textContent = 'Auto Play';
+            
+            currentTime = 240;
+            slider.value = 240;
+            updateKernel();
+            drawGelu();
+
+            rfAnimating = true;
+            rfProgress = 0;
+            
+            const rf = EFFECTIVE_RF[currentLayer];
+            const desc = document.getElementById('rf-desc');
+            desc.textContent = `View Range: ${rf} minutes`;
+            desc.style.opacity = 1;
+        });
+
+        // Sidebar toggle
+        document.getElementById('sidebarToggle').addEventListener('click', () => {
+            document.body.classList.toggle('sidebar-open');
+        });
+        document.getElementById('sidebarBackdrop').addEventListener('click', () => {
+            document.body.classList.remove('sidebar-open');
+        });
+
+        // --- Init ---
+        document.getElementById('loader').style.display = 'none';
+        updateTextures();
+        updateKernel();
+        drawGelu();
+
+        window.addEventListener('resize', () => {
+            camera.aspect = container.clientWidth / container.clientHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(container.clientWidth, container.clientHeight);
+            labelRenderer.setSize(container.clientWidth, container.clientHeight);
+            drawGelu();
+        });
+
+        // --- Animation Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (isPlaying) {
+                currentTime++;
+                if (currentTime >= TIME_STEPS) currentTime = 0;
+                slider.value = currentTime;
+                updateKernel();
+                drawGelu();
+            }
+
+            if (rfAnimating) {
+                rfProgress += 0.02;
+                if (rfProgress > 1) {
+                    // Stop animation at full size
+                    rfProgress = 1;
+                } else {
+                    // Ease out
+                    const ease = 1 - Math.pow(1 - rfProgress, 3);
+                    const rf = EFFECTIVE_RF[currentLayer];
+                    
+                    // Width in 3D space: Total width 48 represents 480 steps. So 1 step = 0.1
+                    const targetWidth = Math.max(0.2, (rf - 1) * 0.1); 
+                    const currentWidth = 0.2 + (targetWidth - 0.2) * ease;
+                    
+                    rfBox.scale.x = currentWidth;
+                    rfBox.position.x = getX(240); // Center at t=240
+                    rfBox.material.opacity = 0.2 + Math.sin(Date.now() * 0.005) * 0.1; // Pulsing
+                }
+            }
+
+            controls.update();
+            renderer.render(scene, camera);
+            labelRenderer.render(scene, camera);
+        }
+
+        animate();
+
+    </script>
+</body>
+</html>

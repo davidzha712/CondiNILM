@@ -1,0 +1,680 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CondiNILM Full Data Flow (Forward Pass)</title>
+    <style>
+        :root {
+            --bg-dark: #12121a;
+            --panel-bg: rgba(25, 25, 35, 0.85);
+            --border-color: rgba(255, 255, 255, 0.15);
+            --text-main: #ffffff;
+            --text-muted: #9aa0a6;
+            --highlight: #4fc3f7;
+        }
+
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: var(--bg-dark);
+            color: var(--text-main);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+
+        /* Canvas Container */
+        #webgl-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: 1;
+        }
+
+        /* UI Layer */
+        #ui-layer {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            z-index: 10;
+            pointer-events: none; /* Let clicks pass through to 3D scene */
+            display: flex;
+        }
+
+        /* Sidebar: Step Selector */
+        #sidebar {
+            width: 280px;
+            height: 100%;
+            background: var(--panel-bg);
+            border-right: 1px solid var(--border-color);
+            backdrop-filter: blur(10px);
+            pointer-events: auto;
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+        }
+
+        .sidebar-header {
+            padding: 20px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .sidebar-header h1 {
+            margin: 0 0 10px 0;
+            font-size: 20px;
+            color: #fff;
+        }
+
+        .sidebar-header p {
+            margin: 0;
+            font-size: 13px;
+            color: var(--text-muted);
+            line-height: 1.5;
+        }
+
+        .step-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+
+        .step-item {
+            padding: 15px 20px;
+            border-bottom: 1px solid rgba(255,255,255,0.05);
+            cursor: pointer;
+            transition: background 0.2s;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .step-item:hover {
+            background: rgba(255,255,255,0.05);
+        }
+
+        .step-item.active {
+            background: rgba(79, 195, 247, 0.15);
+            border-left: 4px solid var(--highlight);
+        }
+
+        .step-title {
+            font-weight: 600;
+            font-size: 14px;
+            margin-bottom: 5px;
+        }
+
+        .step-shape {
+            font-family: monospace;
+            font-size: 12px;
+            color: var(--highlight);
+        }
+
+        /* Bottom Status Bar */
+        #bottom-bar {
+            position: absolute;
+            bottom: 0;
+            left: 280px;
+            right: 0;
+            height: 60px;
+            background: var(--panel-bg);
+            border-top: 1px solid var(--border-color);
+            backdrop-filter: blur(10px);
+            pointer-events: auto;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 30px;
+        }
+
+        .controls {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+        }
+
+        button {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: white;
+            padding: 8px 16px;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+
+        button:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+
+        .param-counter {
+            font-size: 16px;
+            font-weight: bold;
+            color: #ffa726;
+            font-family: monospace;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        /* 3D Floating Labels */
+        .stage-label {
+            background: rgba(0, 0, 0, 0.8);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            padding: 10px 15px;
+            border-radius: 6px;
+            color: white;
+            font-family: sans-serif;
+            pointer-events: none;
+            text-align: center;
+            width: 200px;
+            margin-top: -80px;
+        }
+
+        .stage-label .title { font-weight: bold; font-size: 14px; margin-bottom: 5px; color: #fff;}
+        .stage-label .shape { font-family: monospace; font-size: 12px; color: #4fc3f7; margin-bottom: 5px; }
+        .stage-label .desc { font-size: 12px; color: #aaa; line-height: 1.4; }
+
+        /* Loader */
+        #loader {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 18px;
+            z-index: 1000;
+        }
+
+        /* Sidebar Toggle Button */
+        .sidebar-toggle {
+            display: none;
+            position: fixed;
+            top: 15px;
+            left: 15px;
+            z-index: 20;
+            background: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            color: white;
+            width: 40px;
+            height: 40px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 20px;
+            align-items: center;
+            justify-content: center;
+            backdrop-filter: blur(10px);
+            padding: 0;
+            flex: none;
+        }
+
+        /* Sidebar overlay backdrop */
+        .sidebar-backdrop {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 9;
+        }
+
+        /* Responsive */
+        @media (max-width: 1024px) {
+            .sidebar-toggle { display: flex; }
+            #sidebar {
+                position: fixed;
+                left: -300px;
+                top: 0;
+                z-index: 15;
+                transition: left 0.3s ease;
+            }
+            body.sidebar-open #sidebar { left: 0; }
+            body.sidebar-open .sidebar-backdrop { display: block; }
+            #bottom-bar { left: 0; }
+            #ui-layer { width: 100vw; }
+        }
+        @media (max-width: 640px) {
+            #bottom-bar { padding: 0 15px; }
+            .param-counter { font-size: 13px; }
+        }
+    </style>
+
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+<style>.nav-back{display:inline-flex;align-items:center;gap:6px;color:#4fc3f7;text-decoration:none;font-size:13px;font-family:-apple-system,BlinkMacSystemFont,monospace;opacity:0.7;transition:opacity .2s;white-space:nowrap}.nav-back:hover{opacity:1;color:#81d4fa}.nav-back svg{width:14px;height:14px;fill:currentColor}</style>
+</head>
+<body data-condinilm="true">
+
+    <div id="loader">Loading 3D Scene...</div>
+
+    <button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar">&#9776;</button>
+    <div class="sidebar-backdrop" id="sidebarBackdrop"></div>
+
+    <div id="webgl-container"></div>
+
+    <div id="ui-layer">
+        <div id="sidebar">
+            <div class="sidebar-header">
+                <a class="nav-back" href="/">&larr; Home</a>
+                <h1>Model Data Flow</h1>
+                <p>Scroll down or click the steps below to see how the data blocks (tensors) change within the model.</p>
+            </div>
+            <ul class="step-list" id="step-list">
+                <!-- List items will be generated by JS -->
+            </ul>
+        </div>
+
+        <div id="bottom-bar">
+            <div class="controls">
+                <button id="btn-play">Auto Play</button>
+                <span style="font-size: 13px; color: var(--text-muted);">Tip: Drag mouse to rotate view</span>
+            </div>
+            <div class="param-counter">
+                <span>Cumulative Parameters:</span>
+                <span id="param-display">0</span>
+            </div>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+
+        // ==========================================
+        // 1. Define all processing stages
+        // ==========================================
+        const STAGES = [
+            { id: 0, title: "0. Input Data", shape: "(32, 7, 480)", desc: "Initial data entering the model. Contains power values and time information.", w: 2, h: 1.4, d: 12, color: 0x4fc3f7, params: 0, split: false },
+            { id: 1, title: "1. Data Normalization", shape: "(32, 7, 480)", desc: "Adjusts data to a suitable range, making it easier for the model to learn.", w: 2, h: 1.4, d: 12, color: 0x29b6f6, params: 0, split: false },
+            { id: 2, title: "2. Feature Extraction", shape: "(32, 8, 480)", desc: "Uses convolutional networks to find local patterns. The height (number of features) increases.", w: 2, h: 1.6, d: 12, color: 0x00bcd4, params: 896, split: false },
+            { id: 3, title: "3. Add Positional Info", shape: "(32, 8, 480)", desc: "Tells the model the sequential order of each data point on the timeline.", w: 2, h: 1.6, d: 12, color: 0x26a69a, params: 4736, split: false },
+            { id: 4, title: "4. Expand Feature Dim", shape: "(32, 96, 480)", desc: "Expands the number of features to 96, preparing to enter the core brain.", w: 2, h: 6.0, d: 12, color: 0x66bb6a, params: 5600, split: false },
+            { id: 5, title: "5. Transpose Data", shape: "(32, 480, 96)", desc: "Swaps the order of features and length to fit the Transformer module. The block rotates!", w: 2, h: 12.0, d: 6.0, color: 0x9ccc65, params: 5600, split: false },
+            { id: 6, title: "6. Prepare Conditions", shape: "Feature Fusion", desc: "Extracts global context features, represented by a pink glow. It guides the subsequent processing.", w: 2, h: 12.0, d: 6.0, color: 0xf48fb1, params: 9600, split: false },
+            { id: 7, title: "7. Core Processing Brain", shape: "(32, 480, 96)", desc: "The Transformer module performs 3 layers of deep thinking to find long-range patterns.", w: 2, h: 12.0, d: 6.0, color: 0xffa726, params: 343600, split: false },
+            { id: 8, title: "8. Output Conditions", shape: "Feature Guidance", desc: "Extracts another context feature, represented by a red glow, to guide the final output.", w: 2, h: 12.0, d: 6.0, color: 0xef5350, params: 345600, split: false },
+            { id: 9, title: "9. Transpose Back", shape: "(32, 96, 480)", desc: "Processing complete, transposes the data back to its original order.", w: 2, h: 6.0, d: 12.0, color: 0x9ccc65, params: 345600, split: false },
+            { id: 10, title: "10. Distribute to Apps", shape: "5 x (32, 2, 480)", desc: "Splits the overall data into 5 parts to predict 5 different household appliances.", w: 2, h: 6.0, d: 12.0, color: 0xab47bc, params: 445600, split: true },
+            { id: 11, title: "11. App Fine-tuning", shape: "Independent Adjust", desc: "Uses the conditions from step 8 to perform final fine-tuning on each appliance's prediction.", w: 2, h: 6.0, d: 12.0, color: 0xce93d8, params: 445600, split: true },
+            { id: 12, title: "12. Final Prediction", shape: "(32, 5, 480)", desc: "Done! Outputs the power consumption prediction for each appliance at every minute.", w: 2, h: 6.0, d: 12.0, color: 0x7e57c2, params: 445600, split: true }
+        ];
+
+        const STAGE_SPACING = 30; // Physical distance between stages (along X axis)
+
+        // ==========================================
+        // 2. State and Variables
+        // ==========================================
+        let scene, camera, renderer, labelRenderer, controls;
+        let stageObjects = []; // Stores 3D objects for each stage
+        let particleSystem;
+        
+        let currentProgress = 0; // Smooth transition progress (0 to 12)
+        let targetProgress = 0;  // Target progress
+        let isAutoPlay = false;
+
+        // ==========================================
+        // 3. Initialize Scene
+        // ==========================================
+        function init() {
+            document.getElementById('loader').style.display = 'none';
+
+            // Scene
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x12121a, 0.015);
+
+            // Camera
+            camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 1000);
+            
+            // Renderer (WebGL)
+            const container = document.getElementById('webgl-container');
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            container.appendChild(renderer.domElement);
+
+            // Renderer (CSS Labels)
+            labelRenderer = new CSS2DRenderer();
+            labelRenderer.setSize(window.innerWidth, window.innerHeight);
+            labelRenderer.domElement.style.position = 'absolute';
+            labelRenderer.domElement.style.top = '0px';
+            labelRenderer.domElement.style.pointerEvents = 'none'; // Critical: allow mouse events to pass through
+            container.appendChild(labelRenderer.domElement);
+
+            // Controls
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.enablePan = false; // Disable panning, only allow rotation and zoom
+
+            // Lighting
+            const ambient = new THREE.AmbientLight(0xffffff, 0.5);
+            scene.add(ambient);
+            
+            const dirLight = new THREE.DirectionalLight(0xffffff, 1);
+            dirLight.position.set(10, 20, 15);
+            scene.add(dirLight);
+
+            // Create content
+            buildUI();
+            buildStages();
+            buildParticles();
+
+            // Event Listeners
+            window.addEventListener('resize', onWindowResize);
+            window.addEventListener('wheel', onScroll, { passive: false });
+            
+            document.getElementById('btn-play').addEventListener('click', toggleAutoPlay);
+
+            // Start animation
+            animate();
+        }
+
+        // ==========================================
+        // 4. Build 3D Objects
+        // ==========================================
+        function buildStages() {
+            const materialOpts = {
+                transparent: true,
+                opacity: 0.85,
+                roughness: 0.2,
+                metalness: 0.3
+            };
+
+            STAGES.forEach((stage, i) => {
+                const group = new THREE.Group();
+                group.position.x = i * STAGE_SPACING;
+                
+                // Material
+                const mat = new THREE.MeshStandardMaterial({
+                    color: stage.color,
+                    emissive: stage.color,
+                    emissiveIntensity: 0.2,
+                    ...materialOpts
+                });
+                const edgeMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.4 });
+
+                if (stage.split) {
+                    // Steps 10-12: Split into 5 smaller blocks representing 5 appliances
+                    const splitCount = 5;
+                    const gap = 0.5;
+                    const singleH = (stage.h - (gap * (splitCount - 1))) / splitCount;
+                    
+                    for (let j = 0; j < splitCount; j++) {
+                        const geo = new THREE.BoxGeometry(stage.w, singleH, Math.max(stage.d, 1.0)); // Prevent 0 depth
+                        const mesh = new THREE.Mesh(geo, mat);
+                        
+                        // Arrange vertically
+                        const yOffset = (j - 2) * (singleH + gap);
+                        mesh.position.y = yOffset;
+                        
+                        // Add wireframe
+                        const edges = new THREE.EdgesGeometry(geo);
+                        const line = new THREE.LineSegments(edges, edgeMat);
+                        mesh.add(line);
+                        
+                        group.add(mesh);
+                    }
+                } else {
+                    // Regular single data block
+                    const geo = new THREE.BoxGeometry(stage.w, stage.h, stage.d);
+                    const mesh = new THREE.Mesh(geo, mat);
+                    
+                    const edges = new THREE.EdgesGeometry(geo);
+                    const line = new THREE.LineSegments(edges, edgeMat);
+                    mesh.add(line);
+                    
+                    group.add(mesh);
+                }
+
+                // Add ground shadow plane for position reference
+                const shadowGeo = new THREE.PlaneGeometry(10, 20);
+                const shadowMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.05, side: THREE.DoubleSide });
+                const shadow = new THREE.Mesh(shadowGeo, shadowMat);
+                shadow.rotation.x = Math.PI / 2;
+                shadow.position.y = -8;
+                group.add(shadow);
+
+                // Create CSS Label
+                const div = document.createElement('div');
+                div.className = 'stage-label';
+                div.innerHTML = `
+                    <div class="title">${stage.title}</div>
+                    <div class="shape">${stage.shape}</div>
+                    <div class="desc">${stage.desc}</div>
+                `;
+                const label = new CSS2DObject(div);
+                label.position.set(0, 7, 0); // Float above the block
+                group.add(label);
+
+                scene.add(group);
+                stageObjects.push(group);
+            });
+            
+            // Draw a main axis line through all stages
+            const axisGeo = new THREE.BufferGeometry().setFromPoints([
+                new THREE.Vector3(-10, -8, 0),
+                new THREE.Vector3((STAGES.length - 1) * STAGE_SPACING + 10, -8, 0)
+            ]);
+            const axisMat = new THREE.LineBasicMaterial({ color: 0x4fc3f7, transparent: true, opacity: 0.3 });
+            scene.add(new THREE.Line(axisGeo, axisMat));
+        }
+
+        // ==========================================
+        // 5. Build Flowing Particles (Simulating Data Flow)
+        // ==========================================
+        function buildParticles() {
+            const particleCount = 1000;
+            const geo = new THREE.BufferGeometry();
+            const pos = new Float32Array(particleCount * 3);
+            const colors = new Float32Array(particleCount * 3);
+            
+            // Assign random initial positions and colors to particles
+            for(let i=0; i<particleCount; i++) {
+                pos[i*3] = Math.random() * (STAGES.length * STAGE_SPACING); // X
+                pos[i*3+1] = (Math.random() - 0.5) * 4; // Y
+                pos[i*3+2] = (Math.random() - 0.5) * 10; // Z
+                
+                colors[i*3] = 1.0;
+                colors[i*3+1] = 1.0;
+                colors[i*3+2] = 1.0;
+            }
+            
+            geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+            geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            
+            const mat = new THREE.PointsMaterial({
+                size: 0.2,
+                vertexColors: true,
+                transparent: true,
+                opacity: 0.6
+            });
+            
+            particleSystem = new THREE.Points(geo, mat);
+            scene.add(particleSystem);
+        }
+
+        // ==========================================
+        // 6. Interaction & UI Updates
+        // ==========================================
+        function buildUI() {
+            const list = document.getElementById('step-list');
+            STAGES.forEach((stage, i) => {
+                const li = document.createElement('li');
+                li.className = i === 0 ? 'step-item active' : 'step-item';
+                li.innerHTML = `
+                    <span class="step-title">${stage.title}</span>
+                    <span class="step-shape">${stage.shape}</span>
+                `;
+                li.onclick = () => {
+                    targetProgress = i;
+                    isAutoPlay = false;
+                    updatePlayButton();
+                };
+                list.appendChild(li);
+            });
+        }
+
+        function onScroll(event) {
+            // Ignore scrolling within the sidebar to prevent conflicts
+            if (event.clientX < 280) return; 
+
+            event.preventDefault(); // Prevent default page scrolling
+            
+            // Change progress based on scroll direction
+            const delta = Math.sign(event.deltaY);
+            targetProgress += delta * 0.3; // Scroll speed
+            targetProgress = Math.max(0, Math.min(targetProgress, STAGES.length - 1));
+            
+            isAutoPlay = false;
+            updatePlayButton();
+        }
+
+        function toggleAutoPlay() {
+            isAutoPlay = !isAutoPlay;
+            updatePlayButton();
+        }
+
+        function updatePlayButton() {
+            const btn = document.getElementById('btn-play');
+            btn.textContent = isAutoPlay ? 'Pause' : 'Auto Play';
+            btn.style.background = isAutoPlay ? 'rgba(255, 167, 38, 0.3)' : '';
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            labelRenderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // Format number with thousands separators
+        function formatNumber(num) {
+            return num.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+        }
+
+        // ==========================================
+        // 7. Core Animation Loop
+        // ==========================================
+        function animate() {
+            requestAnimationFrame(animate);
+
+            // 1. Auto-play logic
+            if (isAutoPlay) {
+                targetProgress += 0.02;
+                if (targetProgress > STAGES.length - 1) {
+                    targetProgress = 0; // Loop
+                }
+            }
+
+            // 2. Smooth interpolate progress
+            currentProgress += (targetProgress - currentProgress) * 0.1;
+
+            // 3. Update camera position
+            // Camera moves along X axis while keeping an angled view
+            const camTargetX = currentProgress * STAGE_SPACING;
+            
+            camera.position.x += (camTargetX - 10 - camera.position.x) * 0.1;
+            camera.position.y += (15 - camera.position.y) * 0.1;
+            camera.position.z += (30 - camera.position.z) * 0.1;
+            
+            controls.target.x = camTargetX;
+            controls.target.y = 0;
+            controls.target.z = 0;
+            controls.update();
+
+            // 4. Update UI active states
+            const activeIndex = Math.round(currentProgress);
+            const listItems = document.getElementById('step-list').children;
+            for(let i=0; i<listItems.length; i++) {
+                if (i === activeIndex) {
+                    listItems[i].classList.add('active');
+                } else {
+                    listItems[i].classList.remove('active');
+                }
+            }
+
+            // 5. Update parameter counter
+            // Find current stages and calculate interpolated parameters
+            const floorIdx = Math.floor(currentProgress);
+            const ceilIdx = Math.min(floorIdx + 1, STAGES.length - 1);
+            const fraction = currentProgress - floorIdx;
+            
+            const pStart = STAGES[floorIdx].params;
+            const pEnd = STAGES[ceilIdx].params;
+            const currentParams = Math.round(pStart + (pEnd - pStart) * fraction);
+            
+            document.getElementById('param-display').textContent = formatNumber(currentParams);
+
+            // 6. Update block breathing effects
+            const time = Date.now() * 0.002;
+            stageObjects.forEach((obj, idx) => {
+                // If current stage, float slightly up and down
+                if (idx === activeIndex) {
+                    obj.position.y = Math.sin(time * 2) * 0.5;
+                    
+                    // Stage 7 (Transformer) adds special pulsing effect
+                    if (idx === 7) {
+                        const pulse = 1.0 + Math.sin(time * 5) * 0.05;
+                        obj.scale.set(pulse, pulse, pulse);
+                    } else {
+                        obj.scale.set(1, 1, 1);
+                    }
+                } else {
+                    obj.position.y = 0;
+                    obj.scale.set(1, 1, 1);
+                }
+            });
+
+            // 7. Update flowing particles
+            const positions = particleSystem.geometry.attributes.position.array;
+            const colors = particleSystem.geometry.attributes.color.array;
+            
+            for(let i=0; i<1000; i++) {
+                // Particles flow to the right
+                positions[i*3] += 0.5;
+                
+                // Loop back to beginning
+                if (positions[i*3] > STAGES.length * STAGE_SPACING) {
+                    positions[i*3] = -20;
+                }
+
+                // Color particles based on their current X coordinate stage
+                const pX = positions[i*3];
+                let pStageIdx = Math.max(0, Math.min(Math.floor(pX / STAGE_SPACING), STAGES.length - 1));
+                const c = new THREE.Color(STAGES[pStageIdx].color);
+                
+                colors[i*3] = c.r;
+                colors[i*3+1] = c.g;
+                colors[i*3+2] = c.b;
+            }
+            particleSystem.geometry.attributes.position.needsUpdate = true;
+            particleSystem.geometry.attributes.color.needsUpdate = true;
+
+            // 8. Render
+            renderer.render(scene, camera);
+            labelRenderer.render(scene, camera);
+        }
+
+        // Sidebar toggle
+        document.getElementById('sidebarToggle').addEventListener('click', () => {
+            document.body.classList.toggle('sidebar-open');
+        });
+        document.getElementById('sidebarBackdrop').addEventListener('click', () => {
+            document.body.classList.remove('sidebar-open');
+        });
+
+        // Start
+        init();
+
+    </script>
+</body>
+</html>

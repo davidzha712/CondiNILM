@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FiLM Modulation Mechanism</title>
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --panel-bg: #1e293b;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+            --border-color: #334155;
+            --accent: #3b82f6;
+            --gamma-color: #ef4444;
+            --beta-color: #22c55e;
+            
+            --dev0: #ef4444; /* Kettle */
+            --dev1: #f97316; /* Microwave */
+            --dev2: #eab308; /* Fridge */
+            --dev3: #06b6d4; /* Dishwasher */
+            --dev4: #a855f7; /* Washer */
+        }
+
+        body {
+            margin: 0;
+            padding: 20px;
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            min-height: 100vh;
+        }
+
+        .header {
+            max-width: 1500px;
+            width: 100%;
+            margin-bottom: 20px;
+        }
+
+        h1 {
+            font-size: 1.5rem;
+            margin: 0 0 10px 0;
+            font-weight: 600;
+        }
+
+        .insight-panel {
+            background-color: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+            font-size: 0.95rem;
+            line-height: 1.5;
+            color: var(--text-muted);
+        }
+
+        .insight-panel strong {
+            color: var(--text-main);
+        }
+
+        .main-container {
+            display: grid;
+            grid-template-columns: 320px 1fr 450px;
+            gap: 20px;
+            max-width: 1500px;
+            width: 100%;
+        }
+
+        .panel {
+            background-color: var(--panel-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            position: relative;
+        }
+
+        .panel-title {
+            font-size: 1rem;
+            font-weight: 600;
+            margin-bottom: 12px;
+            text-align: center;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 8px;
+        }
+
+        canvas {
+            display: block;
+            margin: 0 auto;
+            max-width: 100%;
+        }
+
+        .canvas-container {
+            margin-bottom: 16px;
+            background: rgba(0,0,0,0.2);
+            border-radius: 4px;
+            padding: 8px;
+        }
+
+        .label {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            text-align: center;
+            margin-bottom: 4px;
+        }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 16px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .tab-btn {
+            background: var(--bg-color);
+            color: var(--text-main);
+            border: 1px solid var(--border-color);
+            padding: 6px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            transition: all 0.2s;
+        }
+
+        .tab-btn.active.d0 { background: var(--dev0); border-color: var(--dev0); color: white; }
+        .tab-btn.active.d1 { background: var(--dev1); border-color: var(--dev1); color: white; }
+        .tab-btn.active.d2 { background: var(--dev2); border-color: var(--dev2); color: white; }
+        .tab-btn.active.d3 { background: var(--dev3); border-color: var(--dev3); color: white; }
+        .tab-btn.active.d4 { background: var(--dev4); border-color: var(--dev4); color: white; }
+
+        /* Formula Overlay */
+        .formula-box {
+            background: rgba(15, 23, 42, 0.9);
+            border: 2px solid var(--accent);
+            border-radius: 8px;
+            padding: 12px;
+            text-align: center;
+            margin-bottom: 16px;
+            font-family: monospace;
+            font-size: 1.2rem;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+
+        .f-gamma { color: var(--gamma-color); font-weight: bold; }
+        .f-beta { color: var(--beta-color); font-weight: bold; }
+
+        /* Sliders */
+        .slider-group {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 8px;
+            font-size: 0.9rem;
+        }
+        
+        .slider-group input[type=range] {
+            flex: 1;
+        }
+
+        .val-display {
+            width: 40px;
+            text-align: right;
+            font-family: monospace;
+        }
+
+        .btn-toggle {
+            background: var(--bg-color);
+            color: var(--text-main);
+            border: 1px solid var(--border-color);
+            padding: 6px;
+            border-radius: 4px;
+            cursor: pointer;
+            width: 100%;
+            margin-bottom: 10px;
+        }
+        .btn-toggle.active {
+            background: var(--accent);
+            border-color: var(--accent);
+        }
+
+        #encWebGL {
+            width: 100%;
+            height: 120px;
+            image-rendering: pixelated;
+        }
+
+        /* Responsive */
+        @media (max-width: 1024px) {
+            .main-container {
+                grid-template-columns: 1fr 1fr;
+            }
+            .main-container > .panel:nth-child(2) {
+                grid-column: 1 / -1;
+                order: -1;
+            }
+        }
+        @media (max-width: 768px) {
+            body { padding: 10px; }
+            h1 { font-size: 1.2rem; }
+            .tabs { gap: 4px; }
+            .tab-btn { padding: 4px 8px; font-size: 0.8rem; }
+        }
+        @media (max-width: 640px) {
+            body { overflow: auto; }
+            .main-container {
+                grid-template-columns: 1fr;
+                gap: 12px;
+            }
+            .main-container > .panel:nth-child(2) {
+                grid-column: auto;
+            }
+            canvas { max-width: 100%; height: auto; }
+            .slider-group { flex-wrap: wrap; }
+        }
+    </style>
+<style>.nav-back{display:inline-flex;align-items:center;gap:6px;color:#4fc3f7;text-decoration:none;font-size:13px;font-family:-apple-system,BlinkMacSystemFont,monospace;opacity:0.7;transition:opacity .2s;white-space:nowrap}.nav-back:hover{opacity:1;color:#81d4fa}.nav-back svg{width:14px;height:14px;fill:currentColor}</style>
+</head>
+<body data-condinilm="true">
+
+    <div class="header">
+        <a class="nav-back" href="/">&larr; Home</a>
+        <h1>FiLM Modulation Mechanism</h1>
+        <div class="insight-panel">
+            Many device predictions share the same encoder. This causes problems. A kettle needs to amplify high power features. A fridge needs to suppress low power features. FiLM (Feature-wise Linear Modulation) solves this problem. It generates specific scale (Gamma) and shift (Beta) parameters for each device. This allows features to adapt to different signals. Devices do not conflict with each other anymore.
+        </div>
+    </div>
+
+    <div class="main-container">
+        <!-- LEFT: Condition Features -->
+        <div class="panel">
+            <div class="panel-title">1. Condition Features (13d)</div>
+            
+            <div class="canvas-container" style="cursor: ew-resize;" id="waveBox">
+                <div class="label">Input Waveform (Drag left/right to change)</div>
+                <canvas id="waveCanvas" width="280" height="100"></canvas>
+            </div>
+
+            <div class="canvas-container">
+                <div class="label">Electrical Stats (Mean, Std, RMS, Peak, Crest)</div>
+                <canvas id="gaugeCanvas" width="280" height="70"></canvas>
+            </div>
+
+            <div class="canvas-container">
+                <div class="label">Frequency Profile (8 Bands)</div>
+                <canvas id="fftCanvas" width="280" height="80"></canvas>
+            </div>
+
+            <div class="canvas-container">
+                <div class="label">Combined Condition Vector (13-dim)</div>
+                <canvas id="condCanvas" width="280" height="40"></canvas>
+            </div>
+        </div>
+
+        <!-- CENTER: Parameter Generation -->
+        <div class="panel">
+            <div class="panel-title">2. Parameter Generation</div>
+            
+            <div class="tabs" id="devTabs">
+                <button class="tab-btn d0 active" data-dev="0">Kettle</button>
+                <button class="tab-btn d1" data-dev="1">Microwave</button>
+                <button class="tab-btn d2" data-dev="2">Fridge</button>
+                <button class="tab-btn d3" data-dev="3">Dishwasher</button>
+                <button class="tab-btn d4" data-dev="4">Washer</button>
+            </div>
+
+            <div class="canvas-container">
+                <div class="label">Encoder FiLM (Averaged over devices, per layer)</div>
+                <div style="font-size: 0.75rem; text-align: center; color: var(--text-muted); margin-bottom: 4px;">
+                    MLP: 45 → 32 → 576 → Reshape(3×2×96)<br>
+                    Top 3 rows = <span class="f-gamma">Gamma</span>, Bottom 3 = <span class="f-beta">Beta</span>
+                </div>
+                <canvas id="encWebGL" width="96" height="6"></canvas>
+            </div>
+
+            <div class="canvas-container">
+                <div class="label">Decoder FiLM (Per device, scalar)</div>
+                <canvas id="decCanvas" width="400" height="160"></canvas>
+            </div>
+            
+            <div class="canvas-container">
+                <div class="label">tanh Activation Bounding [-0.5, 0.5]</div>
+                <canvas id="tanhCanvas" width="400" height="80"></canvas>
+            </div>
+        </div>
+
+        <!-- RIGHT: Modulation Application -->
+        <div class="panel">
+            <div class="panel-title">3. Modulation Application</div>
+            
+            <div class="formula-box">
+                Output = (1 + <span class="f-gamma">γ</span>) × Input + <span class="f-beta">β</span>
+            </div>
+
+            <button class="btn-toggle" id="btnManual">Manual Override: OFF</button>
+
+            <div class="slider-group">
+                <span class="f-gamma">Gamma:</span>
+                <input type="range" id="slGamma" min="-0.5" max="0.5" step="0.01" value="0" disabled>
+                <span class="val-display" id="valGamma">0.00</span>
+            </div>
+            <div class="slider-group">
+                <span class="f-beta">Beta:</span>
+                <input type="range" id="slBeta" min="-0.5" max="0.5" step="0.01" value="0" disabled>
+                <span class="val-display" id="valBeta">0.00</span>
+            </div>
+
+            <div class="canvas-container" style="flex: 1; display: flex; flex-direction: column;">
+                <div class="label">FFN Output Modulation (96 features)</div>
+                <div style="display: flex; justify-content: space-between; font-size: 0.8rem; margin: 4px 10px;">
+                    <span><span style="color:#64748b;">■</span> Before</span>
+                    <span><span style="color:#3b82f6;">■</span> After FiLM</span>
+                </div>
+                <canvas id="modCanvas" width="400" height="300" style="margin-top: auto;"></canvas>
+            </div>
+        </div>
+    </div>
+
+<script>
+/**
+ * State & Math Helpers
+ */
+let state = {
+    device: 0,
+    wavePhase: 0,
+    waveType: 0, // 0-4
+    manual: false,
+    mGamma: 0,
+    mBeta: 0,
+    animT: 0
+};
+
+// Neural Net weights (simulated deterministic random)
+function seededRandom(seed) {
+    let x = Math.sin(seed++) * 10000;
+    return x - Math.floor(x);
+}
+
+function createMatrix(rows, cols, seed) {
+    let m = [];
+    for (let i = 0; i < rows; i++) {
+        let row = [];
+        for (let j = 0; j < cols; j++) {
+            row.push((seededRandom(seed++) - 0.5) * 2.0);
+        }
+        m.push(row);
+    }
+    return m;
+}
+
+function matmul(vec, mat) {
+    let out = new Array(mat[0].length).fill(0);
+    for (let i = 0; i < vec.length; i++) {
+        for (let j = 0; j < mat[0].length; j++) {
+            out[j] += vec[i] * mat[i][j];
+        }
+    }
+    return out;
+}
+
+function relu(vec) { return vec.map(v => Math.max(0, v)); }
+function tanhScale(vec) { return vec.map(v => 0.5 * Math.tanh(v)); }
+
+// Network Parameters
+const W_emb = createMatrix(5, 32, 100);
+const W_enc_fc1 = createMatrix(45, 32, 200);
+const W_enc_fc2 = createMatrix(32, 576, 300);
+const W_dec_fc1 = createMatrix(45, 32, 400);
+const W_dec_fc2 = createMatrix(32, 2, 500);
+
+// Base input feature vector (96 dim)
+const baseFeature = Array.from({length: 96}, (_, i) => Math.sin(i * 0.2) * 0.5 + 0.5);
+
+/**
+ * Signal Processing
+ */
+function getSignal() {
+    let signal = [];
+    let phase = state.wavePhase;
+    for (let i = 0; i < 480; i++) {
+        let t = i / 480 + phase;
+        let val = 0;
+        
+        // Change signal characteristics based on waveType to simulate different aggregates
+        if (state.waveType % 3 === 0) {
+            val = Math.sin(t * Math.PI * 10) * 0.5 + 0.5; // Smooth
+            val += Math.sin(t * Math.PI * 40) * 0.1;
+        } else if (state.waveType % 3 === 1) {
+            val = t % 0.2 < 0.05 ? 1.0 : 0.1; // Spiky
+        } else {
+            val = (Math.sin(t * Math.PI * 4) > 0 ? 0.8 : 0.2); // Square wave
+            val += (Math.random() - 0.5) * 0.2;
+        }
+        signal.push(Math.max(0, val));
+    }
+    return signal;
+}
+
+function extractCondition(signal) {
+    let mean = signal.reduce((a, b) => a + b) / 480;
+    let std = Math.sqrt(signal.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / 480);
+    let rms = Math.sqrt(signal.reduce((a, b) => a + b * b, 0) / 480);
+    let peak = Math.max(...signal);
+    let crest = peak / (rms + 1e-6);
+
+    // Simulate FFT bands (simplified for visual effect)
+    let bands = new Array(8).fill(0);
+    for(let i=0; i<480; i++) {
+        let diff = Math.abs(signal[i] - mean);
+        bands[i % 8] += diff; 
+    }
+    let maxBand = Math.max(...bands, 1);
+    bands = bands.map(b => (b / maxBand) * 0.8 + 0.1);
+
+    // Normalize for MLP input
+    let cond = [
+        mean, std * 2, rms, peak * 0.5, crest * 0.2,
+        ...bands
+    ];
+    return { mean, std, rms, peak, crest, bands, cond };
+}
+
+/**
+ * Forward Pass
+ */
+function computeFiLM() {
+    let sig = getSignal();
+    let stats = extractCondition(sig);
+    
+    // Encoder FiLM (Average over all 5 devices)
+    // Actually, in CondiNILM, the condition is the same, devices are 0..4
+    let encGamma = new Array(3 * 96).fill(0);
+    let encBeta = new Array(3 * 96).fill(0);
+    
+    let allDecGamma = [];
+    let allDecBeta = [];
+
+    for (let d = 0; d < 5; d++) {
+        let emb = W_emb[d];
+        let inp = [...stats.cond, ...emb]; // 45 dim
+        
+        // Encoder
+        let h_enc = relu(matmul(inp, W_enc_fc1));
+        let gb_enc = tanhScale(matmul(h_enc, W_enc_fc2)); // 576 dim
+        
+        for (let i = 0; i < 3 * 96; i++) {
+            encGamma[i] += gb_enc[i * 2] / 5.0; // Average
+            encBeta[i] += gb_enc[i * 2 + 1] / 5.0;
+        }
+
+        // Decoder
+        let h_dec = relu(matmul(inp, W_dec_fc1));
+        let gb_dec = tanhScale(matmul(h_dec, W_dec_fc2)); // 2 dim
+        allDecGamma.push(gb_dec[0]);
+        allDecBeta.push(gb_dec[1]);
+    }
+
+    return { 
+        sig, stats, 
+        encGamma, encBeta, 
+        allDecGamma, allDecBeta 
+    };
+}
+
+/**
+ * Render Functions (Canvas 2D)
+ */
+const ctxWave = document.getElementById('waveCanvas').getContext('2d');
+const ctxGauge = document.getElementById('gaugeCanvas').getContext('2d');
+const ctxFft = document.getElementById('fftCanvas').getContext('2d');
+const ctxCond = document.getElementById('condCanvas').getContext('2d');
+const ctxDec = document.getElementById('decCanvas').getContext('2d');
+const ctxTanh = document.getElementById('tanhCanvas').getContext('2d');
+const ctxMod = document.getElementById('modCanvas').getContext('2d');
+
+function drawRoundedRect(ctx, x, y, w, h, r, fill) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+    ctx.fillStyle = fill; ctx.fill();
+}
+
+function drawLeftColumn(data) {
+    // 1. Waveform
+    ctxWave.clearRect(0, 0, 280, 100);
+    ctxWave.strokeStyle = '#3b82f6';
+    ctxWave.lineWidth = 2;
+    ctxWave.beginPath();
+    for(let i=0; i<data.sig.length; i++) {
+        let x = (i / 480) * 280;
+        let y = 90 - data.sig[i] * 70;
+        if(i===0) ctxWave.moveTo(x, y);
+        else ctxWave.lineTo(x, y);
+    }
+    ctxWave.stroke();
+
+    // 2. Gauges
+    ctxGauge.clearRect(0, 0, 280, 70);
+    let gVals = [data.stats.mean, data.stats.std, data.stats.rms, data.stats.peak, data.stats.crest/3];
+    let gLabels = ['Mean', 'Std', 'RMS', 'Peak', 'Crest'];
+    for(let i=0; i<5; i++) {
+        let cx = 30 + i * 55;
+        let cy = 40;
+        ctxGauge.beginPath();
+        ctxGauge.arc(cx, cy, 20, Math.PI, 0);
+        ctxGauge.strokeStyle = '#334155'; ctxGauge.lineWidth = 4; ctxGauge.stroke();
+        
+        ctxGauge.beginPath();
+        ctxGauge.arc(cx, cy, 20, Math.PI, Math.PI + Math.PI * Math.min(1, gVals[i]));
+        ctxGauge.strokeStyle = '#22c55e'; ctxGauge.stroke();
+        
+        ctxGauge.fillStyle = '#94a3b8';
+        ctxGauge.font = '10px sans-serif';
+        ctxGauge.textAlign = 'center';
+        ctxGauge.fillText(gLabels[i], cx, cy + 15);
+    }
+
+    // 3. FFT
+    ctxFft.clearRect(0, 0, 280, 80);
+    for(let i=0; i<8; i++) {
+        let h = data.stats.bands[i] * 60;
+        drawRoundedRect(ctxFft, 20 + i*32, 70 - h, 24, h, 2, '#8b5cf6');
+        ctxFft.fillStyle = '#94a3b8';
+        ctxFft.fillText(`B${i}`, 32 + i*32, 80);
+    }
+
+    // 4. Condition Vector
+    ctxCond.clearRect(0, 0, 280, 40);
+    for(let i=0; i<13; i++) {
+        let val = data.stats.cond[i];
+        let color = i < 5 ? '#22c55e' : '#8b5cf6';
+        let alpha = Math.min(1, Math.max(0.1, val));
+        ctxCond.fillStyle = `${color}${Math.floor(alpha*255).toString(16).padStart(2,'0')}`;
+        ctxCond.fillRect(10 + i * 20, 10, 18, 20);
+    }
+}
+
+function drawCenterColumn(data) {
+    // Decoder FiLM Bars
+    ctxDec.clearRect(0, 0, 400, 160);
+    let devNames = ['Kettle', 'Micro', 'Fridge', 'DishW', 'Washer'];
+    let colors = ['#ef4444', '#f97316', '#eab308', '#06b6d4', '#a855f7'];
+    
+    ctxDec.fillStyle = '#94a3b8';
+    ctxDec.font = '12px sans-serif';
+    ctxDec.textAlign = 'left';
+    ctxDec.fillText('Device', 10, 20);
+    ctxDec.fillText('Gamma (Scale)', 120, 20);
+    ctxDec.fillText('Beta (Shift)', 260, 20);
+    
+    // Draw 0 lines
+    ctxDec.strokeStyle = '#334155';
+    ctxDec.beginPath(); ctxDec.moveTo(170, 30); ctxDec.lineTo(170, 150); ctxDec.stroke();
+    ctxDec.beginPath(); ctxDec.moveTo(310, 30); ctxDec.lineTo(310, 150); ctxDec.stroke();
+
+    for(let d=0; d<5; d++) {
+        let y = 40 + d * 22;
+        let isActive = (d === state.device);
+        
+        ctxDec.fillStyle = isActive ? '#fff' : '#94a3b8';
+        ctxDec.fillText(devNames[d], 10, y + 10);
+        
+        let g = data.allDecGamma[d]; // [-0.5, 0.5]
+        let b = data.allDecBeta[d];
+        
+        let gw = g * 80;
+        let bw = b * 80;
+        
+        ctxDec.fillStyle = isActive ? colors[d] : '#475569';
+        ctxDec.fillRect(170 + Math.min(0, gw), y, Math.abs(gw), 12);
+        
+        ctxDec.fillStyle = isActive ? '#22c55e' : '#475569';
+        ctxDec.fillRect(310 + Math.min(0, bw), y, Math.abs(bw), 12);
+    }
+
+    // Tanh visualization
+    ctxTanh.clearRect(0, 0, 400, 80);
+    ctxTanh.strokeStyle = '#334155';
+    ctxTanh.beginPath(); ctxTanh.moveTo(20, 40); ctxTanh.lineTo(380, 40); ctxTanh.stroke();
+    ctxTanh.beginPath(); ctxTanh.moveTo(200, 10); ctxTanh.lineTo(200, 70); ctxTanh.stroke();
+    
+    ctxTanh.strokeStyle = '#3b82f6';
+    ctxTanh.lineWidth = 2;
+    ctxTanh.beginPath();
+    for(let x=0; x<360; x++) {
+        let val = (x - 180) / 40; // range -4.5 to 4.5
+        let y = 40 - (0.5 * Math.tanh(val)) * 50; 
+        if(x===0) ctxTanh.moveTo(20+x, y);
+        else ctxTanh.lineTo(20+x, y);
+    }
+    ctxTanh.stroke();
+    
+    ctxTanh.fillStyle = '#94a3b8';
+    ctxTanh.fillText('-0.5', 205, 70);
+    ctxTanh.fillText('+0.5', 205, 20);
+    ctxTanh.fillStyle = '#fff';
+    
+    // Current point
+    let curVal = data.allDecGamma[state.device] * 2.0; // reverse tanh scale approx
+    let px = 200 + curVal * 40;
+    let py = 40 - data.allDecGamma[state.device] * 50;
+    ctxTanh.beginPath(); ctxTanh.arc(px, py, 4, 0, Math.PI*2);
+    ctxTanh.fillStyle = '#ef4444'; ctxTanh.fill();
+}
+
+function drawRightColumn(data) {
+    ctxMod.clearRect(0, 0, 400, 300);
+    
+    let activeG = state.manual ? state.mGamma : data.allDecGamma[state.device];
+    let activeB = state.manual ? state.mBeta : data.allDecBeta[state.device];
+    
+    // Update labels
+    if(!state.manual) {
+        document.getElementById('slGamma').value = activeG;
+        document.getElementById('slBeta').value = activeB;
+        document.getElementById('valGamma').innerText = activeG.toFixed(2);
+        document.getElementById('valBeta').innerText = activeB.toFixed(2);
+    }
+
+    let barW = 3;
+    let spacing = 4;
+    let startX = 10;
+    let baseH = 150;
+
+    for (let i = 0; i < 96; i++) {
+        let x = startX + i * spacing;
+        let val = baseFeature[i];
+        
+        // Before
+        let h1 = val * 80;
+        ctxMod.fillStyle = '#475569';
+        ctxMod.fillRect(x, baseH - h1, barW, h1);
+        
+        // After
+        let modVal = (1.0 + activeG) * val + activeB;
+        let h2 = Math.max(0, modVal * 80);
+        
+        // Animation lerp
+        let t = (Math.sin(state.animT) + 1) / 2; // 0 to 1
+        let currentH = h1 + (h2 - h1) * t;
+        
+        let color = state.manual ? '#f59e0b' : '#3b82f6';
+        ctxMod.fillStyle = color;
+        ctxMod.fillRect(x, baseH + 10, barW, currentH);
+    }
+
+    // Draw baseline
+    ctxMod.strokeStyle = '#334155';
+    ctxMod.beginPath(); ctxMod.moveTo(10, baseH); ctxMod.lineTo(390, baseH); ctxMod.stroke();
+    ctxMod.beginPath(); ctxMod.moveTo(10, baseH + 10); ctxMod.lineTo(390, baseH + 10); ctxMod.stroke();
+
+    // Arrows for effect explanation
+    let t = state.animT % (Math.PI*2);
+    let offset = Math.sin(t) * 5;
+    
+    ctxMod.fillStyle = '#fff';
+    ctxMod.font = '12px sans-serif';
+    ctxMod.fillText('Scale: ' + (1+activeG).toFixed(2) + 'x', 20, 20);
+    ctxMod.fillText('Shift: ' + (activeB>0?'+':'') + activeB.toFixed(2), 20, 40);
+    
+    // Draw visual arrow
+    ctxMod.strokeStyle = 'var(--gamma-color)';
+    ctxMod.lineWidth = 2;
+    ctxMod.beginPath();
+    if(activeG > 0) { // Scale Up
+        ctxMod.moveTo(150, 30 + offset); ctxMod.lineTo(150, 10 + offset);
+        ctxMod.lineTo(145, 15 + offset); ctxMod.moveTo(150, 10 + offset); ctxMod.lineTo(155, 15 + offset);
+    } else if(activeG < 0) {
+        ctxMod.moveTo(150, 10 - offset); ctxMod.lineTo(150, 30 - offset);
+        ctxMod.lineTo(145, 25 - offset); ctxMod.moveTo(150, 30 - offset); ctxMod.lineTo(155, 25 - offset);
+    }
+    ctxMod.stroke();
+}
+
+/**
+ * WebGL For Encoder FiLM Heatmap
+ */
+const gl = document.getElementById('encWebGL').getContext('webgl');
+const vs = `attribute vec2 a_pos; varying vec2 v_uv; void main() { gl_Position = vec4(a_pos, 0.0, 1.0); v_uv = a_pos * 0.5 + 0.5; v_uv.y = 1.0 - v_uv.y; }`;
+const fs = `precision mediump float; varying vec2 v_uv; uniform sampler2D u_tex;
+    vec3 colormap(float v) {
+        if(v < 0.5) return mix(vec3(0.0, 0.0, 1.0), vec3(1.0, 1.0, 1.0), v * 2.0);
+        return mix(vec3(1.0, 1.0, 1.0), vec3(1.0, 0.0, 0.0), (v - 0.5) * 2.0);
+    }
+    void main() {
+        float val = texture2D(u_tex, v_uv).r;
+        vec3 col = colormap(val);
+        // Grid lines
+        vec2 grid = fract(v_uv * vec2(96.0, 6.0));
+        if (grid.x < 0.1 || grid.y < 0.1) col *= 0.8;
+        gl_FragColor = vec4(col, 1.0);
+    }`;
+
+function compileShader(src, type) {
+    let s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compileShader(vs, gl.VERTEX_SHADER));
+gl.attachShader(prog, compileShader(fs, gl.FRAGMENT_SHADER));
+gl.linkProgram(prog); gl.useProgram(prog);
+
+const posBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
+const posLoc = gl.getAttribLocation(prog, "a_pos");
+gl.enableVertexAttribArray(posLoc);
+gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+
+function updateWebGL(data) {
+    // 6 rows: 3 for gamma, 3 for beta, 96 cols
+    const texData = new Uint8Array(96 * 6);
+    for(let r=0; r<3; r++) {
+        for(let c=0; c<96; c++) {
+            let g = data.encGamma[r*96 + c]; // [-0.5, 0.5]
+            let b = data.encBeta[r*96 + c];
+            texData[r * 96 + c] = Math.floor(Math.max(0, Math.min(1, g + 0.5)) * 255);
+            texData[(r+3) * 96 + c] = Math.floor(Math.max(0, Math.min(1, b + 0.5)) * 255);
+        }
+    }
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.LUMINANCE, 96, 6, 0, gl.LUMINANCE, gl.UNSIGNED_BYTE, texData);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+
+/**
+ * Main Loop & Event Listeners
+ */
+function tick() {
+    state.animT += 0.05;
+    let data = computeFiLM();
+    
+    drawLeftColumn(data);
+    drawCenterColumn(data);
+    updateWebGL(data);
+    drawRightColumn(data);
+    
+    requestAnimationFrame(tick);
+}
+
+// Interactions
+let isDragging = false;
+const waveBox = document.getElementById('waveBox');
+waveBox.addEventListener('mousedown', () => isDragging = true);
+window.addEventListener('mouseup', () => isDragging = false);
+window.addEventListener('mousemove', (e) => {
+    if(!isDragging) return;
+    state.wavePhase -= e.movementX * 0.01;
+    if(Math.abs(e.movementY) > 5) {
+        state.waveType = (state.waveType + 1) % 5;
+    }
+});
+
+document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+        state.device = parseInt(e.target.dataset.dev);
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        e.target.classList.add('active');
+    });
+});
+
+const btnManual = document.getElementById('btnManual');
+const slGamma = document.getElementById('slGamma');
+const slBeta = document.getElementById('slBeta');
+
+btnManual.addEventListener('click', () => {
+    state.manual = !state.manual;
+    btnManual.textContent = state.manual ? "Manual Override: ON" : "Manual Override: OFF";
+    btnManual.classList.toggle('active', state.manual);
+    slGamma.disabled = !state.manual;
+    slBeta.disabled = !state.manual;
+});
+
+slGamma.addEventListener('input', (e) => { state.mGamma = parseFloat(e.target.value); });
+slBeta.addEventListener('input', (e) => { state.mBeta = parseFloat(e.target.value); });
+
+// Start
+tick();
+
+</script>
+</body>
+</html>
