@@ -1,15 +1,17 @@
-"""BiLSTM baseline -- CondiNILM.
+"""BiLSTM: Bidirectional LSTM model for non-intrusive load monitoring.
 
-Author: Siyi Li
+A 1D conv layer followed by two stacked BiLSTM layers and two fully connected
+layers. Supports both seq2seq and seq2point output modes.
+
+Reference: Kelly & Knottenbelt, "Neural NILM: Deep Neural Networks Applied to
+Energy Disaggregation", 2015.
 """
 import torch.nn as nn
 
 
 class BiLSTM(nn.Module):
     def __init__(self, window_size, c_in=1, downstreamtask="seq2seq"):
-        """
-        BiLSTM implementation from Kelly et al. paper
-        """
+        """Initialize BiLSTM with 1D conv, two BiLSTM layers, and fully connected decoder."""
         super(BiLSTM, self).__init__()
         self.window_size = window_size
         self.downstreamtask = downstreamtask

@@ -1,6 +1,5 @@
 """Collect and tabulate experiment results for NILMFormer paper.
 
-Author: Siyi Li
 Usage:
     python scripts/collect_results.py --table 1      # Table 1: UKDALE single-device
     python scripts/collect_results.py --table 2      # Table 2: UKDALE multi-device SmoothL1
@@ -100,7 +99,6 @@ def _best_epoch_multi_by_avg(records, devices, metric="F1_SCORE"):
             continue
         f1s = []
         for dev in devices:
-            # Try exact match and lowercase
             dev_metrics = per_device.get(dev, per_device.get(dev.lower(), {}))
             f1s.append(dev_metrics.get(metric, 0.0))
         if f1s:
@@ -150,10 +148,6 @@ def _print_table_row(model_name, f1s, extra_vals=None):
     print(row)
     return avg
 
-
-# ============================================================
-# Table generators
-# ============================================================
 
 def table1(dataset="UKDALE", sampling_rate="1min", window_size=128):
     """Table 1: Single-device fair comparison (SmoothL1)."""

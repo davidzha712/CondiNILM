@@ -1,7 +1,4 @@
-"""Interactive validation result viewer -- CondiNILM.
-
-Author: Siyi Li
-"""
+"""Interactive validation result viewer -- CondiNILM."""
 
 import os
 

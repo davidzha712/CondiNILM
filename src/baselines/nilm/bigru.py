@@ -1,6 +1,10 @@
-"""BiGRU baseline -- CondiNILM.
+"""BiGRU: Bidirectional GRU model for non-intrusive load monitoring.
 
-Author: Siyi Li
+Two 1D conv layers followed by two stacked BiGRU layers, a dense layer,
+and separate 1x1 conv heads for power regression and state classification.
+
+Reference: Bonfigli et al., "Thresholding methods in non-intrusive load
+monitoring", 2019.
 """
 import torch
 import torch.nn as nn
@@ -26,9 +30,7 @@ class BiGRU(nn.Module):
         return_values="power",
         verbose_loss=False,
     ):
-        """
-        BiGRU Pytorch implementation as described in the original paper "Thresholding methods in non-intrusive load monitoring"
-        """
+        """Initialize BiGRU with conv front-end, bidirectional GRU layers, and dual output heads."""
         super(BiGRU, self).__init__()
 
         self.return_values = return_values

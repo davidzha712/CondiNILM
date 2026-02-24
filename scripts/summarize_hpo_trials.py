@@ -1,7 +1,4 @@
-"""Summarize HPO trial results -- CondiNILM.
-
-Author: Siyi Li
-"""
+"""Summarize HPO trial results -- CondiNILM."""
 
 import json
 from pathlib import Path
@@ -46,7 +43,6 @@ def main():
             'off_nzr_raw': rec.get('off_pred_nonzero_rate_raw'),
         })
 
-    # sort by F1 descending
     rows_sorted=sorted([r for r in rows if r['F1'] is not None], key=lambda r: r['F1'], reverse=True)
     print('found',len(rows_sorted),'trials')
     print('top 10 by overall F1 (timestamp):')

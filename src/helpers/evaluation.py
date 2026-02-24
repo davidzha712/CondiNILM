@@ -99,7 +99,6 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
             ts_agg_t = ts_agg.float().to(device)
             appl_t = appl.float().to(device)
             pred_t = model(ts_agg_t)
-            # seq2subseq: crop OUTPUTS to center region (model still sees full context)
             output_ratio = float(getattr(expes_config, "output_ratio", 1.0))
             threshold_small_values = float(getattr(expes_config, "threshold", 0.0))
             threshold_postprocess = float(
@@ -118,7 +117,7 @@ def  _save_val_data(model_trainer, valid_loader, scaler, expes_config, epoch_idx
                 except Exception:
                     gate_logits = None
 
-            # seq2subseq: crop outputs to center region (model sees full context, we only evaluate center)
+            # Crop to center region for seq2subseq evaluation
             if output_ratio < 1.0:
                 pred_t = _crop_center_tensor(pred_t, output_ratio)
                 appl_t = _crop_center_tensor(appl_t, output_ratio)
@@ -685,7 +684,6 @@ def evaluate_nilm_split(
         post_gate_soft_scale = getattr(expes_config, "postprocess_gate_soft_scale", None)
         gate_floor = float(getattr(expes_config, "gate_floor", gate_floor))
         gate_soft_scale = float(getattr(expes_config, "gate_soft_scale", gate_soft_scale))
-    # seq2subseq: ratio of center region to evaluate (model sees full context)
     output_ratio = 1.0
     if expes_config is not None:
         output_ratio = float(getattr(expes_config, "output_ratio", 1.0))
@@ -717,7 +715,7 @@ def evaluate_nilm_split(
                     gate_logits = torch.nan_to_num(
                         gate_logits.float(), nan=0.0, posinf=0.0, neginf=0.0
                     )
-                    # V7.5: Use per-device learned gate params to match training
+                    # Apply per-device learned gate parameters if available from criterion
                     _applied_perdevice = False
                     if (criterion is not None
                             and hasattr(criterion, "gate_soft_scales")
@@ -762,7 +760,7 @@ def evaluate_nilm_split(
                     gate_logits = None
             if pred is None:
                 pred = model(ts_agg_t)
-            # seq2subseq: crop outputs to center region (model sees full context, we only evaluate center)
+            # Crop to center region for seq2subseq evaluation
             if output_ratio < 1.0:
                 pred = _crop_center_tensor(pred, output_ratio)
                 target = _crop_center_tensor(target, output_ratio)
@@ -797,7 +795,6 @@ def evaluate_nilm_split(
                         min_off_j = int(cfg_j.get("min_off_steps", 0))
                         max_power_j = float(cfg_j.get("max_power", 0.0))
                     ch = pred_inv[:, j : j + 1, :]
-                    # Clip to max power first (prevents peak overshoot)
                     if max_power_j > 0:
                         ch = torch.clamp(ch, max=max_power_j)
                     ch[ch < thr_j] = 0.0
@@ -820,7 +817,7 @@ def evaluate_nilm_split(
                 and int(post_gate_kernel or 0) > 1
             ):
                 try:
-                    # V7.5: Use per-device learned params for postprocess gate too
+                    # Apply per-device learned gate parameters for postprocess suppression
                     _pp_perdevice = False
                     if (criterion is not None
                             and hasattr(criterion, "gate_soft_scales")
@@ -829,7 +826,7 @@ def evaluate_nilm_split(
                         _bi = criterion.gate_biases.detach().to(gate_logits.device)
                         C = gate_logits.size(1)
                         if _ss.numel() == C and _bi.numel() == C:
-                            # Use 3x learned scale for sharp postprocess gate
+                            # Scale up learned soft_scale by 3x for sharper gate probability
                             _ss_sharp = torch.clamp(_ss * 3.0, min=1.5, max=18.0).view(1, C, 1)
                             _bi = _bi.view(1, C, 1)
                             gl = gate_logits.float()
@@ -930,20 +927,15 @@ def evaluate_nilm_split(
                         )
     if not y.size:
         return {}, {}
-    # Safety: ensure y_state matches y_hat length (can differ with output_ratio cropping)
+    # Align y_state length to y_hat (may differ after output_ratio center-cropping)
     if y_state.size and y_state.size != y_hat.size:
-        # Crop y_state to match y_hat if needed (center crop like output_ratio)
         if y_state.size > y_hat.size:
-            ratio = y_hat.size / y_state.size
             crop_len = y_hat.size
             start = (y_state.size - crop_len) // 2
             y_state = y_state[start:start + crop_len]
         else:
-            # y_state shorter than y_hat - this shouldn't happen, but handle gracefully
             y_state = np.array([])
-    # FIX: Use threshold_postprocess instead of 0 for consistent state determination
-    # The postprocessing already set values < threshold to 0, so any remaining > 0 values
-    # are above threshold. Using a small epsilon (0.01) to handle floating point noise.
+    # Derive predicted on/off state; values below threshold were already zeroed by postprocessing
     y_hat_state = (y_hat > 0.01).astype(int) if y_state.size else None
     metrics_timestamp = metrics_helper(
         y=y,
@@ -980,7 +972,7 @@ def evaluate_nilm_split(
             y_hat_j = per_device_data["y_hat"][j]
             if y_j.size and y_hat_j.size:
                 y_state_j = per_device_data["y_state"][j]
-                # Safety: ensure y_state_j matches y_hat_j length
+                # Align y_state_j length to y_hat_j
                 if y_state_j.size and y_state_j.size != y_hat_j.size:
                     if y_state_j.size > y_hat_j.size:
                         crop_len = y_hat_j.size
@@ -988,10 +980,9 @@ def evaluate_nilm_split(
                         y_state_j = y_state_j[start:start + crop_len]
                     else:
                         y_state_j = np.array([])
-                # FIX: Use device-specific threshold for state calculation
                 name_j = device_names[j] if j < len(device_names) else str(j)
                 thr_j = per_device_thr_map.get(str(name_j).strip().lower(), threshold_postprocess)
-                # Use small epsilon after postprocessing (values already thresholded)
+                # Values below threshold were already zeroed; use epsilon for on/off state
                 y_hat_state_j = (y_hat_j > 0.01).astype(int) if y_state_j.size else None
                 metrics_timestamp_per_device[str(device_names[j])] = metrics_helper(
                     y=y_j,

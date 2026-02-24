@@ -1,6 +1,11 @@
-"""BERT4NILM baseline -- CondiNILM.
+"""BERT4NILM: BERT-based seq2seq model for non-intrusive load monitoring.
 
-Author: Siyi Li
+Applies a conv+pool front-end, positional embedding, stacked Transformer
+encoder blocks, and a transposed-conv + linear decoder to disaggregate
+appliance power from aggregate input.
+
+Reference: Yue et al., "BERT4NILM: A Bidirectional Transformer Model for
+Non-Intrusive Load Monitoring", 2020.
 """
 import torch
 import math
@@ -150,10 +155,8 @@ class BERT4NILM(nn.Module):
     ):
         super().__init__()
 
-        self.cutoff = cutoff if cutoff is not None else 10000  # Need to be provide
-        self.threshold = (
-            threshold if threshold is not None else 0
-        )  # According to code implementation
+        self.cutoff = cutoff if cutoff is not None else 10000
+        self.threshold = threshold if threshold is not None else 0
 
         self.use_bert4nilm_postprocessing = use_bert4nilm_postprocessing
         self.return_values = return_values
@@ -284,18 +287,14 @@ class BERT4NILM(nn.Module):
         return x.permute(0, 2, 1)
 
     def compute_status(self, data):
-        """
-        State activation based on threshold
-        """
+        """Return binary on/off status by thresholding power values."""
         status = (data >= self.threshold) * 1
 
         return status
 
     def cutoff_energy(self, data):
-        """
-        Apply cutoff and cuton
-        """
-        data[data < 5] = 0  # Remove very small value
+        """Clamp power values: zero out values below 5 and cap at self.cutoff."""
+        data[data < 5] = 0
         data[data > self.cutoff] = self.cutoff
 
         return data

@@ -103,20 +103,17 @@ class SeqToSeqLightningModule(pl.LightningModule):
         self.loss_train_history = []
         self.loss_valid_history = []
 
-        # Gradient conflict resolution configuration
-        # Will be set via set_gradient_conflict_config() or from expes_config
+        # PCGrad gradient conflict resolution (configured via set_gradient_conflict_config)
         self._use_gradient_conflict_resolution = False
         self._gradient_resolver = None
 
-        # Gradient isolation configuration
-        # Completely separates device heads so gradients don't interfere
+        # Gradient isolation (configured via set_gradient_isolation_config)
         self._use_gradient_isolation = False
         self._isolation_backbone_training = "frozen"
         self._isolated_devices = []
         self._device_param_groups = None
 
-        # Shared parameter prefixes for identifying encoder parameters
-        # These are the parameters that suffer from gradient conflicts in multi-device training
+        # Shared encoder parameter prefixes used by gradient conflict resolver
         self._shared_param_prefixes = [
             "EmbedBlock", "ProjEmbedding", "ProjStats",
             "encoder_layers", "final_norm", "SharedHead"
@@ -124,14 +121,8 @@ class SeqToSeqLightningModule(pl.LightningModule):
 
     @property
     def automatic_optimization(self) -> bool:
-        """
-        Disable automatic optimization when using gradient conflict resolution.
-
-        When PCGrad is enabled, we need manual control over:
-        1. Per-device backward passes
-        2. Gradient extraction and projection
-        3. Optimizer step timing
-        """
+        """Returns False when gradient conflict resolution or isolation is enabled,
+        triggering manual optimization for per-device backward passes."""
         return not self._use_gradient_conflict_resolution
 
     def set_gradient_conflict_config(
@@ -298,11 +289,10 @@ class SeqToSeqLightningModule(pl.LightningModule):
         logging.info(f"[FREEZE] Frozen indices: {freeze_indices}")
 
     def setup(self, stage: str):
-        """
-        PyTorch Lightning setup hook - called before training/validation/testing starts.
+        """Initialize the gradient conflict resolver for multi-device training.
 
-        This is where we initialize the gradient conflict resolver, as we need access
-        to the criterion's device information which is set up by this point.
+        Called by PyTorch Lightning before training/validation/testing.
+        Disables PCGrad automatically for single-device training.
         """
         if self._use_gradient_conflict_resolution and self._gradient_resolver is None:
             from src.helpers.gradient_conflict import GradientConflictResolver
@@ -450,17 +440,17 @@ class SeqToSeqLightningModule(pl.LightningModule):
 
     def _gate_focal_bce(self, logits, targets):
         """
-        Per-device Focal BCE loss for gate classification.
+        Per-device focal binary cross-entropy loss for gate classification.
 
-        CRITICAL: Each device gets its OWN alpha parameters from device_params
-        based on observed training behavior, not just duty cycle.
+        Uses per-device alpha_on/alpha_off from device_params when available,
+        otherwise falls back to duty-cycle-based alpha heuristics.
 
-        Latest tuning based on actual results:
-        - Fridge (gate_prob=0.407): Balanced - keep alpha_on/alpha_off moderate
-        - WashingMachine (gate_prob=0.9998): VERY HIGH alpha_off to suppress gate
-        - Kettle (gate_prob=0.038): HIGH alpha_on to boost gate (over-suppressed)
-        - Dishwasher (gate_prob=0.093): Moderate alpha_off
-        - Microwave (gate_prob=0.385): Balanced, slight alpha_off increase
+        Args:
+            logits: Gate logits, shape (B, C, L) or (B, L).
+            targets: Binary state labels, same shape as logits.
+
+        Returns:
+            Weighted average focal BCE loss across devices (scalar tensor).
         """
         if self.gate_cls_weight <= 0.0:
             return logits.new_tensor(0.0)
@@ -534,44 +524,44 @@ class SeqToSeqLightningModule(pl.LightningModule):
 
     def _apply_soft_gate(self, power, gate_logits):
         """
-        Apply soft gating to power output with PER-DEVICE parameters.
+        Apply soft gating to power output.
 
-        Each device gets its own gate_soft_scale, gate_floor, and gate_bias
-        based on its electrical characteristics and observed training behavior.
+        For multi-device training (n_devices > 1), uses per-device gate_soft_scale,
+        gate_floor, and gate_bias from the criterion. For single-device training,
+        uses global parameters with an optional gate_bias from the criterion.
 
-        Key per-device tuning (based on latest results):
-        - Fridge: Balanced settings (benchmark)
-        - WashingMachine: Aggressive suppression (gate was saturated at 0.9998)
-        - Kettle: Less aggressive (gate was over-suppressing at 0.038)
-        - Dishwasher/Microwave: Moderate settings
+        The gating formula is: power * (floor + (1 - floor) * sigmoid(logits * scale + bias))
+
+        Args:
+            power: Power prediction tensor, shape (B, C, L).
+            gate_logits: Raw gate logits, shape (B, C, L).
+
+        Returns:
+            Tuple of (gated_power, gate_prob) where gate_prob = sigmoid(scaled_logits).
         """
-        # Check if criterion has per-device gate parameters
-        # NOTE: For single-device training, use global parameters (simpler, matches bd64d01 behavior)
+        # Use per-device parameters only for multi-device training
         use_per_device = (
             hasattr(self, "criterion")
             and isinstance(self.criterion, AdaptiveDeviceLoss)
             and hasattr(self.criterion, "gate_soft_scales")
             and hasattr(self.criterion, "gate_floors")
             and hasattr(self.criterion, "gate_biases")
-            and self.criterion.n_devices > 1  # CRITICAL: Skip per-device for single-device training
+            and self.criterion.n_devices > 1
         )
 
         if use_per_device and gate_logits.dim() == 3:
-            # Per-device soft gating
             B, C, L = gate_logits.shape
             device = gate_logits.device
 
-            # Get per-device parameters (shape: [C])
+            # Per-device parameters, each shape: (C,)
             soft_scales = self.criterion.gate_soft_scales.to(device)
             floors = self.criterion.gate_floors.to(device)
             biases = self.criterion.gate_biases.to(device)
 
-            # V7: Handle frozen gate_bias for sparse devices
-            # Frozen biases are detached to prevent gradient updates
+            # Detach frozen biases to prevent gradient updates
             if hasattr(self.criterion, "_gate_bias_frozen_mask"):
                 frozen_mask = self.criterion._gate_bias_frozen_mask
                 if len(frozen_mask) == biases.shape[0]:
-                    # Detach frozen biases to prevent gradient flow
                     biases_list = []
                     for i in range(biases.shape[0]):
                         if frozen_mask[i]:
@@ -580,8 +570,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
                             biases_list.append(biases[i])
                     biases = torch.stack(biases_list)
 
-            # V30: Get per-device gate_logits_floor to prevent collapse
-            # For sparse devices, clamp gate_logits to prevent extreme negative values
+            # Per-device gate logits floor to prevent extreme negative values
             gate_logits_floors = None
             if hasattr(self.criterion, "_gate_logits_floors"):
                 gate_logits_floors = self.criterion._gate_logits_floors
@@ -589,52 +578,41 @@ class SeqToSeqLightningModule(pl.LightningModule):
                     gate_logits_floors = torch.tensor(gate_logits_floors, device=device, dtype=gate_logits.dtype)
                     gate_logits_floors = gate_logits_floors.view(1, C, 1)
 
-            # Ensure correct number of devices
+            # Fallback to global parameters if device count mismatches
             if soft_scales.shape[0] != C:
-                # Fallback to global parameters
                 soft_scales = torch.full((C,), self.gate_soft_scale, device=device)
                 floors = torch.full((C,), self.gate_floor, device=device)
                 biases = torch.zeros(C, device=device)
 
-            # Reshape for broadcasting: [1, C, 1]
+            # Reshape for broadcasting: (1, C, 1)
             soft_scales = soft_scales.view(1, C, 1)
             floors = floors.view(1, C, 1)
             biases = biases.view(1, C, 1)
 
-            # LEARNABLE PARAMS CONSTRAINT: Clamp to valid ranges
-            # soft_scales: [0.5, 6.0] - controls sharpness
-            # floors: [1e-4, 0.5] - minimum activation probability
-            # V7.3 used min=0.01 but that's too high for cycling_low_power (fridge)
-            # causing OFF leakage (high R, low P). Restored to 1e-4; sparse device
-            # collapse is now handled by gate_cls_weight=0.3 instead of floor clamp.
-            soft_scales = torch.clamp(soft_scales, min=0.5, max=6.0)
-            floors = torch.clamp(floors, min=1e-4, max=0.5)
+            # Clamp learnable parameters to valid ranges
+            soft_scales = torch.clamp(soft_scales, min=0.5, max=6.0)  # gate sharpness
+            floors = torch.clamp(floors, min=1e-4, max=0.5)  # minimum gate probability
 
-            # V30: Apply per-device gate_logits_floor before scaling
-            # This prevents extreme negative logits from causing collapse
+            # Apply per-device logits floor before scaling
             gate_logits_clamped = gate_logits.float()
             if gate_logits_floors is not None:
                 gate_logits_clamped = torch.maximum(gate_logits_clamped, gate_logits_floors)
 
-            # Apply per-device scale and bias to gate logits
-            # Formula: sigmoid(logits * scale + bias)
-            # - scale controls sharpness of decision boundary
-            # - bias shifts decision boundary (negative = harder to trigger ON)
-            # Applying bias AFTER scale makes it a direct offset in sigmoid input space
+            # gate_prob = sigmoid(logits * scale + bias)
             gate_logits_scaled = gate_logits_clamped * soft_scales
             gate_logits_adj = gate_logits_scaled + biases
             gate_prob = torch.sigmoid(gate_logits_adj)
 
-            # Apply per-device floor (already clamped above)
+            # effective_prob = floor + (1 - floor) * gate_prob
             effective_prob = floors + (1.0 - floors) * gate_prob
 
             return power * effective_prob, gate_prob
         else:
-            # Global soft gating (fallback) - ALSO apply gate_bias for single-device training
+            # Global soft gating (single-device or fallback path)
             gate_floor = min(max(self.gate_floor, 0.0), 1.0)
             gate_floor = max(gate_floor, 1e-4)
             soft_scale = max(self.gate_soft_scale, 0.0)
-            # FIX: Apply gate_bias from per-device params for single-device training
+            # Use gate_bias from criterion if available (single-device training)
             gate_bias = 0.0
             if (
                 hasattr(self, "criterion")
@@ -882,31 +860,26 @@ class SeqToSeqLightningModule(pl.LightningModule):
                 min_top = topk[..., -1:].detach()
                 on_mask = (target >= min_top).float()
 
-        # Part 1: Energy ratio penalty
+        # Energy ratio penalty: penalize if predicted/target energy ratio < 0.4
         energy_pred = (pred * on_mask).sum(dim=-1)
         energy_target = (target * on_mask).sum(dim=-1)
         valid = (energy_target > 0.0).float()
         if valid.sum() <= 0:
             return pred.new_tensor(0.0)
         ratio = energy_pred / (energy_target + eps)
-        # Strong minimum energy ratio requirement
-        r_min = 0.4  # Increased from 0.3
+        r_min = 0.4
         deficit = torch.relu(r_min - ratio) * valid
         energy_penalty = deficit.sum() / (valid.sum() + eps)
 
-        # Part 2: Direct ON recall - penalize zero predictions on ON samples
-        # This is critical to prevent collapse to all-zeros
+        # ON recall penalty: penalize predictions below 15% of target on ON samples
         on_count = on_mask.sum()
         if on_count > 0:
-            # Penalize when pred is below a fraction of target on ON samples
             pred_on = pred * on_mask
             target_on = target * on_mask
-            # Use relative error: penalize if pred < 0.15 * target (increased from 0.1)
             rel_deficit = torch.relu(0.15 * target_on - pred_on)
             on_recall_penalty = rel_deficit.sum() / (target_on.sum() + eps)
 
-            # Part 3: Detect per-channel collapse
-            # If any channel has very low prediction ratio, penalize heavily
+            # Per-channel collapse detection: penalize channels with energy ratio < 0.3
             if pred.dim() >= 3 and pred.size(1) > 1:
                 B, C, L = pred.shape
                 channel_penalties = []
@@ -957,7 +930,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
         return penalties
 
     def training_step(self, batch, batch_idx):
-        # Parse batch
+        # Unpack batch: (ts_agg, target, [state])
         if isinstance(batch, (list, tuple)) and len(batch) >= 3:
             ts_agg, appl, state = batch[0], batch[1], batch[2]
         else:
@@ -969,7 +942,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
             state = torch.nan_to_num(state.float(), nan=0.0, posinf=0.0, neginf=0.0)
         ts_agg, target, state, _ = self._maybe_multi_crop(ts_agg, target, state)
 
-        # Dispatch to gradient isolation training step if enabled (highest priority)
+        # Gradient isolation takes precedence over PCGrad
         if self._use_gradient_isolation:
             return self._training_step_with_gradient_isolation(ts_agg, target, state, batch_idx)
 
@@ -1049,7 +1022,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
         )
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("train_loss", loss, prog_bar=False, on_step=False, on_epoch=True)
-        # V8: Split loss logging — train_loss_main is comparable with val_loss_main
+        # Log main, auxiliary, and gate losses separately
         aux_penalties = (
             penalties["zero_run"]
             + penalties["off_high_agg"]
@@ -1072,15 +1045,10 @@ class SeqToSeqLightningModule(pl.LightningModule):
         """
         Training step with PCGrad gradient conflict resolution.
 
-        This method implements manual optimization with:
-        1. Per-device forward and backward passes
-        2. Gradient extraction for shared encoder parameters
-        3. PCGrad conflict resolution (normalization + projection)
-        4. Manual optimizer step
-
-        This solves the gradient conflict problem where different devices
-        have opposing gradient directions (e.g., sparse devices want recall UP,
-        dense devices want precision UP), causing some devices to collapse.
+        Uses manual optimization to compute per-device losses separately,
+        extract per-device gradients for shared encoder parameters, resolve
+        gradient conflicts via PCGrad projection, then apply a single
+        optimizer step. Auxiliary losses are distributed equally across devices.
         """
         opt = self.optimizers()
 
@@ -1097,244 +1065,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
             gate = None
             gate_prob = None
 
-        # Apply output_ratio center cropping (seq2subseq) - MUST match AdaptiveDeviceLoss.forward
-        output_ratio = getattr(self.criterion, 'output_ratio', 1.0)
-        if output_ratio < 1.0:
-            pred = self.criterion._crop_center(pred, output_ratio)
-            target = self.criterion._crop_center(target, output_ratio)
-            ts_agg = self.criterion._crop_center(ts_agg, output_ratio)
-            if state is not None:
-                state = self.criterion._crop_center(state, output_ratio)
-            if gate is not None:
-                gate = self.criterion._crop_center(gate, output_ratio)
-            if gate_prob is not None:
-                gate_prob = self.criterion._crop_center(gate_prob, output_ratio)
-
-        # Compute per-device losses
-        n_devices = pred.shape[1]
-        per_device_losses = []
-
-        for c in range(n_devices):
-            p_c = pred[:, c:c+1, :]
-            t_c = target[:, c:c+1, :]
-
-            # Get device-specific parameters
-            params = self.criterion.device_params[c]
-            device_name = self.criterion.device_names[c]
-
-            # Apply epoch-adjusted parameters (curriculum controlled by params)
-            adjusted_params = self.criterion._get_epoch_adjusted_params(
-                params, self.current_epoch
-            )
-
-            # Compute device-specific loss using the cycling loss
-            loss_c = self.criterion._compute_cycling_loss(
-                p_c, t_c, adjusted_params, device_name=device_name, device_idx=c
-            )
-
-            # Numerical stability (match AdaptiveDeviceLoss.forward)
-            loss_c = torch.nan_to_num(loss_c, nan=1.0, posinf=10.0, neginf=0.0)
-
-            # Apply device weight
-            weight = self.criterion.device_weights[c]
-            per_device_losses.append(weight * loss_c)
-
-        # Add gate classification loss (shared across devices, not per-device)
-        gate_cls_loss = self._gate_focal_bce(gate, state) if (gate is not None and state is not None) else pred.new_tensor(0.0)
-        gate_window_loss = self._gate_window_bce(gate, state) if (gate is not None and state is not None) else pred.new_tensor(0.0)
-
-        # V8: Compute gate_duty_loss (was missing from PCGrad path)
-        gate_duty_loss = pred.new_tensor(0.0)
-        if self.gate_duty_weight > 0.0 and gate_prob is not None and state is not None:
-            total_duty_loss = gate_prob.new_tensor(0.0)
-            for c in range(gate_prob.size(1)):
-                target_duty = torch.clamp(state[:, c, :].float().mean(), 0.0, 1.0)
-                pred_duty = torch.clamp(gate_prob[:, c, :].mean(), 0.0, 1.0)
-                total_duty_loss = total_duty_loss + F.mse_loss(pred_duty, target_duty)
-            gate_duty_loss = total_duty_loss / max(gate_prob.size(1), 1)
-
-        # Compute penalties (these apply to all predictions collectively)
-        penalties = self._compute_all_penalties(pred, target, state, ts_agg)
-        anti_scale = self._compute_anti_collapse_scale(self.current_epoch)
-
-        gate_cls_scale = self.gate_cls_weight
-        gate_window_scale = self.gate_window_weight
-
-        # Aggregate auxiliary losses (not per-device)
-        aux_loss = (
-            penalties["zero_run"]
-            + penalties["off_high_agg"]
-            + penalties["off_state_long"]
-            + penalties["off_state"]
-            + self.neg_penalty_weight * penalties["neg"]
-            + gate_cls_scale * gate_cls_loss
-            + gate_window_scale * gate_window_loss
-            + self.gate_duty_weight * gate_duty_loss
-            + self.anti_collapse_weight * anti_scale * penalties["anti_collapse"]
-        )
-
-        # Distribute auxiliary loss equally across devices
-        aux_per_device = aux_loss / max(n_devices, 1)
-        for i in range(len(per_device_losses)):
-            per_device_losses[i] = per_device_losses[i] + aux_per_device
-
-        # Decide whether to use full PCGrad or normal backward this step
-        pcgrad_every_n = getattr(self, '_pcgrad_every_n_steps', 1)
-        use_pcgrad_this_step = (self.global_step % pcgrad_every_n == 0)
-
-        if use_pcgrad_this_step:
-            # Full PCGrad: per-device backward + conflict resolution
-            device_grads = self._gradient_resolver.compute_per_device_gradients(
-                self.model, per_device_losses
-            )
-            resolved_grads = self._gradient_resolver.resolve_conflicts(device_grads)
-            self._gradient_resolver.apply_gradients(self.model, resolved_grads)
-        else:
-            # Normal backward: sum per-device losses, single backward pass
-            total_loss_for_backward = sum(per_device_losses)
-            self.manual_backward(total_loss_for_backward)
-
-        # Manual gradient clipping (since automatic clipping is disabled for manual optimization)
-        # Use max_norm=1.0 as safety net
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-        # Manual optimizer step
-        opt.step()
-        opt.zero_grad()
-
-        # Update learning rate scheduler if needed
-        sch = self.lr_schedulers()
-        if sch is not None and self.trainer.is_last_batch:
-            if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                pass  # Will be stepped in on_validation_end
-            else:
-                sch.step()
-
-        # Compute total loss for logging (sum of per-device losses)
-        total_loss = sum(l.detach() for l in per_device_losses)
-        self.log("train_loss", total_loss, prog_bar=False, on_step=False, on_epoch=True)
-        # V8: Split loss logging — train_loss_main is comparable with val_loss_main
-        loss_main_det = (total_loss - aux_loss.detach())
-        penalty_det = (
-            penalties["zero_run"]
-            + penalties["off_high_agg"]
-            + penalties["off_state_long"]
-            + penalties["off_state"]
-            + self.neg_penalty_weight * penalties["neg"]
-            + self.anti_collapse_weight * anti_scale * penalties["anti_collapse"]
-        ).detach()
-        gate_det = (
-            self.gate_cls_weight * gate_cls_loss
-            + self.gate_window_weight * gate_window_loss
-            + self.gate_duty_weight * gate_duty_loss
-        ).detach()
-        self.log("train_loss_main", loss_main_det, prog_bar=True, on_step=False, on_epoch=True)
-        self.log("train_loss_aux", penalty_det, on_step=False, on_epoch=True)
-        self.log("train_loss_gate", gate_det, on_step=False, on_epoch=True)
-
-        # Log PCGrad statistics periodically
-        if batch_idx % 100 == 0:
-            stats = self._gradient_resolver.get_stats()
-            for k, v in stats.items():
-                self.log(k, v, on_step=True, on_epoch=False)
-
-            # Log per-device losses for debugging
-            for i, loss_i in enumerate(per_device_losses):
-                device_name = self.criterion.device_names[i]
-                self.log(f"train_loss/{device_name}", loss_i.detach(), on_step=True, on_epoch=False)
-
-        return total_loss
-
-    def _get_device_param_groups(self):
-        """
-        Identify parameter groups for each device.
-
-        Returns dict mapping:
-        - "shared": Parameters shared across all devices (backbone)
-        - "device_0", "device_1", ...: Device-specific parameters
-        """
-        if self._device_param_groups is not None:
-            return self._device_param_groups
-
-        self._device_param_groups = {"shared": []}
-        n_devices = getattr(self.criterion, "n_devices", 1)
-        for i in range(n_devices):
-            self._device_param_groups[f"device_{i}"] = []
-
-        for name, param in self.model.named_parameters():
-            if not param.requires_grad:
-                continue
-
-            # Check if parameter belongs to a specific device
-            device_idx = None
-
-            # Device adapters: model.device_adapters.0, model.device_adapters.1, ...
-            if "device_adapters" in name:
-                for i in range(n_devices):
-                    if f"device_adapters.{i}" in name:
-                        device_idx = i
-                        break
-
-            # V8: Type heads → map to first device in the type group
-            elif "type_power_heads" in name or "type_gate_heads" in name:
-                import re
-                m = re.search(r"type_(?:power|gate)_heads\.(\d+)", name)
-                if m is not None and hasattr(self.model, "type_group_to_module") and hasattr(self.model, "type_group_indices"):
-                    module_idx = int(m.group(1))
-                    g2m = self.model.type_group_to_module
-                    gi = self.model.type_group_indices
-                    # Find which group this module belongs to
-                    for gid, mid in enumerate(g2m):
-                        if mid == module_idx and gid < len(gi) and gi[gid]:
-                            device_idx = gi[gid][0]  # First device in group
-                            break
-
-            # Sparse CNN device heads: model.sparse_cnn.device_heads.X
-            elif "sparse_cnn" in name and "device_heads" in name:
-                for i in range(n_devices):
-                    if f"device_heads.{i}" in name:
-                        device_idx = i
-                        break
-
-            if device_idx is not None:
-                self._device_param_groups[f"device_{device_idx}"].append(param)
-            else:
-                self._device_param_groups["shared"].append(param)
-
-        return self._device_param_groups
-
-    def _training_step_with_gradient_isolation(self, ts_agg, target, state, batch_idx):
-        """
-        Training step with complete gradient isolation between devices.
-
-        This method ensures that each device's loss ONLY affects its own parameters.
-        The shared backbone can be:
-        - "frozen": No gradient updates (most isolated)
-        - "average": Receives averaged gradients from all devices
-        - "anchor": Only anchor devices (non-isolated) update the backbone
-
-        This solves the gradient conflict problem by preventing one device's
-        optimization from harming another device's performance.
-        """
-        opt = self.optimizers()
-
-        # Get device parameter groups
-        param_groups = self._get_device_param_groups()
-
-        # Forward pass
-        if hasattr(self.model, "forward_with_gate"):
-            power, gate = self.model.forward_with_gate(ts_agg)
-            power = torch.nan_to_num(power, nan=0.0, posinf=1e4, neginf=-1e4)
-            gate = torch.nan_to_num(gate, nan=0.0, posinf=1e4, neginf=-1e4)
-            pred, gate_prob = self._apply_soft_gate(power, gate)
-            pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
-        else:
-            pred = self(ts_agg)
-            pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
-            gate = None
-            gate_prob = None
-
-        # Apply output_ratio center cropping (seq2subseq)
+        # Center-crop predictions/targets to match criterion output_ratio
         output_ratio = getattr(self.criterion, 'output_ratio', 1.0)
         if output_ratio < 1.0:
             pred = self.criterion._crop_center(pred, output_ratio)
@@ -1376,11 +1107,247 @@ class SeqToSeqLightningModule(pl.LightningModule):
             weight = self.criterion.device_weights[c]
             per_device_losses.append(weight * loss_c)
 
-        # Add gate classification loss (shared across devices)
+        # Gate classification and window losses (computed across all devices)
         gate_cls_loss = self._gate_focal_bce(gate, state) if (gate is not None and state is not None) else pred.new_tensor(0.0)
         gate_window_loss = self._gate_window_bce(gate, state) if (gate is not None and state is not None) else pred.new_tensor(0.0)
 
-        # Compute penalties
+        # Gate duty cycle loss: MSE between predicted and target duty cycles
+        gate_duty_loss = pred.new_tensor(0.0)
+        if self.gate_duty_weight > 0.0 and gate_prob is not None and state is not None:
+            total_duty_loss = gate_prob.new_tensor(0.0)
+            for c in range(gate_prob.size(1)):
+                target_duty = torch.clamp(state[:, c, :].float().mean(), 0.0, 1.0)
+                pred_duty = torch.clamp(gate_prob[:, c, :].mean(), 0.0, 1.0)
+                total_duty_loss = total_duty_loss + F.mse_loss(pred_duty, target_duty)
+            gate_duty_loss = total_duty_loss / max(gate_prob.size(1), 1)
+
+        # Compute auxiliary penalties
+        penalties = self._compute_all_penalties(pred, target, state, ts_agg)
+        anti_scale = self._compute_anti_collapse_scale(self.current_epoch)
+
+        gate_cls_scale = self.gate_cls_weight
+        gate_window_scale = self.gate_window_weight
+
+        # Sum all auxiliary losses (penalties + gate losses)
+        aux_loss = (
+            penalties["zero_run"]
+            + penalties["off_high_agg"]
+            + penalties["off_state_long"]
+            + penalties["off_state"]
+            + self.neg_penalty_weight * penalties["neg"]
+            + gate_cls_scale * gate_cls_loss
+            + gate_window_scale * gate_window_loss
+            + self.gate_duty_weight * gate_duty_loss
+            + self.anti_collapse_weight * anti_scale * penalties["anti_collapse"]
+        )
+
+        # Distribute auxiliary loss equally across devices
+        aux_per_device = aux_loss / max(n_devices, 1)
+        for i in range(len(per_device_losses)):
+            per_device_losses[i] = per_device_losses[i] + aux_per_device
+
+        # Decide whether to use full PCGrad or normal backward this step
+        pcgrad_every_n = getattr(self, '_pcgrad_every_n_steps', 1)
+        use_pcgrad_this_step = (self.global_step % pcgrad_every_n == 0)
+
+        if use_pcgrad_this_step:
+            # Full PCGrad: per-device backward + conflict resolution
+            device_grads = self._gradient_resolver.compute_per_device_gradients(
+                self.model, per_device_losses
+            )
+            resolved_grads = self._gradient_resolver.resolve_conflicts(device_grads)
+            self._gradient_resolver.apply_gradients(self.model, resolved_grads)
+        else:
+            # Normal backward: sum per-device losses, single backward pass
+            total_loss_for_backward = sum(per_device_losses)
+            self.manual_backward(total_loss_for_backward)
+
+        # Gradient clipping (manual mode requires explicit clipping)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+        # Manual optimizer step
+        opt.step()
+        opt.zero_grad()
+
+        # Update learning rate scheduler if needed
+        sch = self.lr_schedulers()
+        if sch is not None and self.trainer.is_last_batch:
+            if isinstance(sch, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                pass  # Will be stepped in on_validation_end
+            else:
+                sch.step()
+
+        # Compute total loss for logging (sum of per-device losses)
+        total_loss = sum(l.detach() for l in per_device_losses)
+        self.log("train_loss", total_loss, prog_bar=False, on_step=False, on_epoch=True)
+        # Log main, auxiliary, and gate losses separately
+        loss_main_det = (total_loss - aux_loss.detach())
+        penalty_det = (
+            penalties["zero_run"]
+            + penalties["off_high_agg"]
+            + penalties["off_state_long"]
+            + penalties["off_state"]
+            + self.neg_penalty_weight * penalties["neg"]
+            + self.anti_collapse_weight * anti_scale * penalties["anti_collapse"]
+        ).detach()
+        gate_det = (
+            self.gate_cls_weight * gate_cls_loss
+            + self.gate_window_weight * gate_window_loss
+            + self.gate_duty_weight * gate_duty_loss
+        ).detach()
+        self.log("train_loss_main", loss_main_det, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("train_loss_aux", penalty_det, on_step=False, on_epoch=True)
+        self.log("train_loss_gate", gate_det, on_step=False, on_epoch=True)
+
+        # Log PCGrad statistics periodically
+        if batch_idx % 100 == 0:
+            stats = self._gradient_resolver.get_stats()
+            for k, v in stats.items():
+                self.log(k, v, on_step=True, on_epoch=False)
+
+            # Log per-device losses
+            for i, loss_i in enumerate(per_device_losses):
+                device_name = self.criterion.device_names[i]
+                self.log(f"train_loss/{device_name}", loss_i.detach(), on_step=True, on_epoch=False)
+
+        return total_loss
+
+    def _get_device_param_groups(self):
+        """
+        Identify parameter groups for each device.
+
+        Returns dict mapping:
+        - "shared": Parameters shared across all devices (backbone)
+        - "device_0", "device_1", ...: Device-specific parameters
+        """
+        if self._device_param_groups is not None:
+            return self._device_param_groups
+
+        self._device_param_groups = {"shared": []}
+        n_devices = getattr(self.criterion, "n_devices", 1)
+        for i in range(n_devices):
+            self._device_param_groups[f"device_{i}"] = []
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            # Check if parameter belongs to a specific device
+            device_idx = None
+
+            # Device adapters: model.device_adapters.0, model.device_adapters.1, ...
+            if "device_adapters" in name:
+                for i in range(n_devices):
+                    if f"device_adapters.{i}" in name:
+                        device_idx = i
+                        break
+
+            # Type-shared heads: map to the first device in the type group
+            elif "type_power_heads" in name or "type_gate_heads" in name:
+                import re
+                m = re.search(r"type_(?:power|gate)_heads\.(\d+)", name)
+                if m is not None and hasattr(self.model, "type_group_to_module") and hasattr(self.model, "type_group_indices"):
+                    module_idx = int(m.group(1))
+                    g2m = self.model.type_group_to_module
+                    gi = self.model.type_group_indices
+                    # Find which group this module belongs to
+                    for gid, mid in enumerate(g2m):
+                        if mid == module_idx and gid < len(gi) and gi[gid]:
+                            device_idx = gi[gid][0]  # First device in group
+                            break
+
+            # Sparse CNN device heads: model.sparse_cnn.device_heads.X
+            elif "sparse_cnn" in name and "device_heads" in name:
+                for i in range(n_devices):
+                    if f"device_heads.{i}" in name:
+                        device_idx = i
+                        break
+
+            if device_idx is not None:
+                self._device_param_groups[f"device_{device_idx}"].append(param)
+            else:
+                self._device_param_groups["shared"].append(param)
+
+        return self._device_param_groups
+
+    def _training_step_with_gradient_isolation(self, ts_agg, target, state, batch_idx):
+        """
+        Training step with gradient isolation between devices.
+
+        Each device's loss only updates its own adapter/head parameters.
+        Shared backbone gradient handling depends on backbone_training mode:
+        - "frozen": No backbone gradient updates.
+        - "average": Backbone receives weighted average of per-device gradients.
+        - "anchor": Only non-isolated devices update the backbone normally.
+
+        Per-device backbone_grad_weight (from device_params) controls each
+        device's contribution to backbone gradients in "average" mode.
+        """
+        opt = self.optimizers()
+
+        # Get device parameter groups
+        param_groups = self._get_device_param_groups()
+
+        # Forward pass
+        if hasattr(self.model, "forward_with_gate"):
+            power, gate = self.model.forward_with_gate(ts_agg)
+            power = torch.nan_to_num(power, nan=0.0, posinf=1e4, neginf=-1e4)
+            gate = torch.nan_to_num(gate, nan=0.0, posinf=1e4, neginf=-1e4)
+            pred, gate_prob = self._apply_soft_gate(power, gate)
+            pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+        else:
+            pred = self(ts_agg)
+            pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+            gate = None
+            gate_prob = None
+
+        # Center-crop predictions/targets to match criterion output_ratio
+        output_ratio = getattr(self.criterion, 'output_ratio', 1.0)
+        if output_ratio < 1.0:
+            pred = self.criterion._crop_center(pred, output_ratio)
+            target = self.criterion._crop_center(target, output_ratio)
+            ts_agg = self.criterion._crop_center(ts_agg, output_ratio)
+            if state is not None:
+                state = self.criterion._crop_center(state, output_ratio)
+            if gate is not None:
+                gate = self.criterion._crop_center(gate, output_ratio)
+            if gate_prob is not None:
+                gate_prob = self.criterion._crop_center(gate_prob, output_ratio)
+
+        # Compute per-device losses
+        n_devices = pred.shape[1]
+        per_device_losses = []
+
+        for c in range(n_devices):
+            p_c = pred[:, c:c+1, :]
+            t_c = target[:, c:c+1, :]
+
+            # Get device-specific parameters
+            params = self.criterion.device_params[c]
+            device_name = self.criterion.device_names[c]
+
+            # Apply epoch-adjusted parameters (curriculum controlled by params)
+            adjusted_params = self.criterion._get_epoch_adjusted_params(
+                params, self.current_epoch
+            )
+
+            # Compute device-specific loss using the cycling loss
+            loss_c = self.criterion._compute_cycling_loss(
+                p_c, t_c, adjusted_params, device_name=device_name, device_idx=c
+            )
+
+            # Numerical stability
+            loss_c = torch.nan_to_num(loss_c, nan=1.0, posinf=10.0, neginf=0.0)
+
+            # Apply device weight
+            weight = self.criterion.device_weights[c]
+            per_device_losses.append(weight * loss_c)
+
+        # Gate classification and window losses
+        gate_cls_loss = self._gate_focal_bce(gate, state) if (gate is not None and state is not None) else pred.new_tensor(0.0)
+        gate_window_loss = self._gate_window_bce(gate, state) if (gate is not None and state is not None) else pred.new_tensor(0.0)
+
+        # Auxiliary penalties
         penalties = self._compute_all_penalties(pred, target, state, ts_agg)
         anti_scale = self._compute_anti_collapse_scale(self.current_epoch)
 
@@ -1396,8 +1363,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
             + self.anti_collapse_weight * anti_scale * penalties["anti_collapse"]
         )
 
-        # === GRADIENT ISOLATION: Per-device backward passes ===
-        # Each device's loss only updates its own parameters
+        # Per-device backward passes with gradient isolation
         opt.zero_grad()
 
         # Determine which devices update the backbone
@@ -1418,9 +1384,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
                 device_name in isolated_device_names
             )
 
-            # Per-device backbone gradient weight (default 1.0).
-            # Set to 0.0 in loss_override to exclude a device from backbone training
-            # while keeping it isolated (adapter-only training for that device).
+            # Per-device backbone gradient weight (0.0 excludes device from backbone updates)
             bgw = float(self.criterion.device_params[c].get("backbone_grad_weight", 1.0))
 
             if is_isolated and backbone_training == "frozen":
@@ -1536,7 +1500,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
         )
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e4, neginf=-1e4)
         self.log("val_loss", loss, prog_bar=False, on_step=False, on_epoch=True)
-        # V8: Split loss logging — val_loss_main is comparable with train_loss_main
+        # Log main and auxiliary losses separately
         aux_penalties = (
             penalties["zero_run"]
             + penalties["off_high_agg"]
@@ -1551,27 +1515,19 @@ class SeqToSeqLightningModule(pl.LightningModule):
 
     def configure_optimizers(self):
         """
-        Configure optimizer and learning rate scheduler following best practices.
+        Configure AdamW optimizer and learning rate scheduler.
 
-        Best practices for Transformer training:
-        1. AdamW with weight_decay > 0 (default 0.01)
-        2. Warmup + Cosine Annealing (smoother than ReduceLROnPlateau)
-        3. Gradient clipping (handled by Trainer)
-
-        References:
-        - Vaswani et al. "Attention is All You Need" (original warmup)
-        - Loshchilov & Hutter "Decoupled Weight Decay Regularization" (AdamW)
-        - Recent LLM training: warmup + cosine decay is standard
+        Includes both model and criterion learnable parameters (e.g., gate_biases).
+        Scheduler is selected by self.scheduler_type:
+        - "cosine_warmup": Linear warmup + cosine annealing (default).
+        - "plateau": ReduceLROnPlateau with optional warmup.
         """
-        # Respect configured weight_decay (baselines may intentionally set wd=0)
         effective_wd = self.weight_decay
 
-        # Collect all learnable parameters:
-        # 1. Model parameters (main network)
-        # 2. Criterion parameters (e.g., learnable gate_biases in AdaptiveDeviceLoss)
+        # Collect model and criterion learnable parameters
         all_params = list(self.model.parameters())
         if hasattr(self.criterion, 'parameters'):
-            # Include criterion's learnable parameters (e.g., gate_biases)
+            # Include criterion's learnable parameters
             criterion_params = list(self.criterion.parameters())
             if criterion_params:
                 all_params.extend(criterion_params)
@@ -1582,19 +1538,16 @@ class SeqToSeqLightningModule(pl.LightningModule):
             all_params,
             lr=self.learning_rate,
             weight_decay=effective_wd,
-            betas=(0.9, 0.999),  # Standard betas
+            betas=(0.9, 0.999),
             eps=1e-8,
         )
 
-        # Determine scheduler type from config
         scheduler_type = self.scheduler_type
 
         if scheduler_type == "cosine_warmup":
-            # Best practice: Linear warmup + Cosine Annealing
-            # This provides smooth learning rate decay and better convergence
             return self._configure_cosine_warmup_scheduler(optimizer)
         elif scheduler_type == "plateau":
-            # Legacy: ReduceLROnPlateau (keep for backward compatibility)
+            # ReduceLROnPlateau with optional warmup
             return self._configure_plateau_scheduler(optimizer)
         else:
             # Default to cosine_warmup
@@ -1602,18 +1555,12 @@ class SeqToSeqLightningModule(pl.LightningModule):
 
     def _configure_cosine_warmup_scheduler(self, optimizer):
         """
-        Configure Cosine Annealing with Linear Warmup scheduler.
+        Configure linear warmup followed by cosine annealing LR scheduler.
 
-        This is the recommended scheduler for Transformer models:
-        - Warmup phase: lr increases linearly from 0 to max_lr
-        - Cosine phase: lr decreases following cosine curve to min_lr
-
-        Benefits:
-        - Smooth learning rate transitions
-        - No sudden drops like ReduceLROnPlateau
-        - Better for longer training runs
+        Warmup phase: LR increases linearly from 0 to learning_rate over
+        n_warmup_epochs (default 3). Cosine phase: LR decays from learning_rate
+        to rlr_min_lr (default 1e-6) over the remaining epochs.
         """
-        # Get total epochs from config
         total_epochs = self.total_epochs
         warmup_epochs = self.n_warmup_epochs if self.n_warmup_epochs > 0 else 3
         min_lr = self.rlr_min_lr if self.rlr_min_lr > 0 else 1e-6
@@ -1626,7 +1573,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
                 # Cosine annealing
                 progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
                 progress = min(1.0, progress)
-                # Cosine decay from 1.0 to min_lr_ratio
+                # LR multiplier decays from 1.0 to min_lr_ratio via cosine
                 min_lr_ratio = min_lr / self.learning_rate
                 return min_lr_ratio + (1.0 - min_lr_ratio) * 0.5 * (1 + math.cos(math.pi * progress))
 
@@ -1645,9 +1592,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
         }
 
     def _configure_plateau_scheduler(self, optimizer):
-        """
-        Configure ReduceLROnPlateau scheduler (legacy, kept for compatibility).
-        """
+        """Configure optional warmup + ReduceLROnPlateau scheduler."""
         schedulers = []
 
         if self.n_warmup_epochs and self.n_warmup_epochs > 0:
@@ -1708,7 +1653,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
         if "train_loss" in metrics:
             self.loss_train_history.append(float(metrics["train_loss"]))
 
-        # Log learned parameters for monitoring (only in SeqToSeqLightningModule)
+        # Log learnable criterion parameters for monitoring
         if (
             hasattr(self, "criterion")
             and isinstance(self.criterion, AdaptiveDeviceLoss)
@@ -1726,7 +1671,7 @@ class SeqToSeqLightningModule(pl.LightningModule):
                 )
                 logging.info(f"[LEARNABLE_GATE] Epoch {self.current_epoch} gate_biases: {bias_str}")
 
-            # Log gate_soft_scales (every 5 epochs to reduce noise)
+            # Log gate_soft_scales, floors, alpha, threshold, and focal params every 5 epochs
             if self.current_epoch % 5 == 0:
                 if hasattr(criterion, "gate_soft_scales") and isinstance(criterion.gate_soft_scales, nn.Parameter):
                     scales = criterion.gate_soft_scales.detach().cpu().numpy()

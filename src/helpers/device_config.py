@@ -8,25 +8,21 @@ import numpy as np
 # Device type groups
 CYCLING_DEVICE_TYPES = frozenset({"frequent_switching", "cycling_low_power", "cycling_infrequent"})
 
-# Base loss parameters for each device type
-# V3: Added regression parameters (w_energy, w_on_power, w_peak, w_grad, w_range)
+# Base loss parameters for each device type (includes regression weights)
 DEVICE_TYPE_BASE_PARAMS = {
-    # Microwave/Kettle: sparse high-power devices
-    # V6: HPO-ALIGNED - Based on Optuna Trial #46 best params
-    # CRITICAL: High OFF penalties suppress sparse device predictions entirely
-    # HPO best: alpha_off=0.072, lambda_off_hard=0.003
+    # Sparse high-power devices (e.g., Kettle, Microwave):
+    # Low alpha_off and lambda_off_hard to avoid suppressing sparse predictions.
     "sparse_high_power": {
-        "alpha_on": 3.82,           # HPO best (reduced from 5.0)
-        "alpha_off": 0.1,           # HPO-ALIGNED (reduced from 3.2; HPO best 0.072)
-        "lambda_zero": 0.03,        # Reduced zero penalty (too high causes collapse)
+        "alpha_on": 3.82,
+        "alpha_off": 0.1,
+        "lambda_zero": 0.03,
         "lambda_sparse": 0.005,
-        "lambda_off_hard": 0.005,   # HPO-ALIGNED (reduced from 0.18; HPO best 0.003)
-        "lambda_on_recall": 1.14,   # HPO best
+        "lambda_off_hard": 0.005,
+        "lambda_on_recall": 1.14,
         "on_recall_margin": 0.75,
         "lambda_gate_cls": 0.25,
         "lambda_energy": 0.15,
         "off_margin": 0.02,
-        # Regression parameters
         "w_energy": 0.15,
         "w_on_power": 0.12,
         "w_peak": 0.08,
@@ -44,7 +40,6 @@ DEVICE_TYPE_BASE_PARAMS = {
         "lambda_gate_cls": 0.15,
         "lambda_energy": 0.2,
         "off_margin": 0.02,
-        # Regression parameters
         "w_energy": 0.22,
         "w_on_power": 0.10,
         "w_peak": 0.10,
@@ -62,15 +57,14 @@ DEVICE_TYPE_BASE_PARAMS = {
         "lambda_gate_cls": 0.18,
         "lambda_energy": 0.2,
         "off_margin": 0.015,
-        # Regression parameters
         "w_energy": 0.22,
         "w_on_power": 0.10,
         "w_peak": 0.12,
         "w_grad": 0.06,
         "w_range": 0.08,
     },
-    # Fridge: cycling low-power device
-    # Must capture compressor start-up peaks while preserving cyclic waveform
+    # Cycling low-power devices (e.g., Fridge): emphasize peak and gradient
+    # regression weights to capture compressor start-up peaks and cyclic transitions.
     "cycling_low_power": {
         "alpha_on": 2.8,
         "alpha_off": 2.0,
@@ -82,34 +76,32 @@ DEVICE_TYPE_BASE_PARAMS = {
         "lambda_gate_cls": 0.18,
         "lambda_energy": 0.2,
         "off_margin": 0.008,
-        # Regression parameters - emphasize peaks and gradients
         "w_energy": 0.28,
         "w_on_power": 0.15,
-        "w_peak": 0.18,             # High: capture compressor start-up peaks
-        "w_grad": 0.10,             # Follow cyclic power transitions
-        "w_range": 0.05,            # Low: fridge power is relatively stable
+        "w_peak": 0.18,
+        "w_grad": 0.10,
+        "w_range": 0.05,
     },
-    # WashingMachine/Dishwasher: long-cycle devices
-    # V2: Enhanced OFF penalties, following sparse_high_power's success pattern
-    # Multi-phase power transitions need gradient smoothing and energy accuracy
+    # Long-cycle devices (e.g., WashingMachine, Dishwasher): emphasize energy
+    # and gradient regression weights for multi-phase power transitions.
     "long_cycle": {
         "alpha_on": 5.0,
-        "alpha_off": 3.0,           # Raised from 2.5
+        "alpha_off": 3.0,
         "lambda_zero": 0.10,
         "lambda_sparse": 0.018,
-        "lambda_off_hard": 0.16,    # Raised from 0.12
+        "lambda_off_hard": 0.16,
         "lambda_on_recall": 0.8,
         "on_recall_margin": 0.65,
         "lambda_gate_cls": 0.25,
         "lambda_energy": 0.15,
         "off_margin": 0.02,
-        # Regression parameters - emphasize energy and gradients
-        "w_energy": 0.32,           # High: total energy matters for long cycles
+        "w_energy": 0.32,
         "w_on_power": 0.12,
         "w_peak": 0.10,
-        "w_grad": 0.12,             # High: smooth multi-phase transitions
+        "w_grad": 0.12,
         "w_range": 0.12,
     },
+    # Always-on devices: low alpha_on, high energy and gradient weights for stability.
     "always_on": {
         "alpha_on": 1.0,
         "alpha_off": 2.0,
@@ -121,11 +113,10 @@ DEVICE_TYPE_BASE_PARAMS = {
         "lambda_gate_cls": 0.05,
         "lambda_energy": 0.25,
         "off_margin": 0.03,
-        # Regression parameters - emphasize stability
-        "w_energy": 0.30,           # High: continuous power consumption
+        "w_energy": 0.30,
         "w_on_power": 0.08,
-        "w_peak": 0.02,             # Low: almost no peaks
-        "w_grad": 0.15,             # High: stable output
+        "w_peak": 0.02,
+        "w_grad": 0.15,
         "w_range": 0.05,
     },
     "sparse_medium_power": {
@@ -139,30 +130,29 @@ DEVICE_TYPE_BASE_PARAMS = {
         "lambda_gate_cls": 0.1,
         "lambda_energy": 0.08,
         "off_margin": 0.02,
-        # Regression parameters
         "w_energy": 0.20,
         "w_on_power": 0.10,
         "w_peak": 0.08,
         "w_grad": 0.06,
         "w_range": 0.10,
     },
-    # Sparse long-cycle: hybrid of sparse_high_power and long_cycle
-    # For devices like REDD washing_machine (<5% duty, multi-phase power)
+    # Sparse long-cycle: hybrid of sparse_high_power and long_cycle for devices
+    # with very low duty cycle and multi-phase power (e.g., REDD washing_machine).
+    # w_peak disabled since no sharp peaks like kettle.
     "sparse_long_cycle": {
-        "alpha_on": 6.0,            # High weight for rare ON events
-        "alpha_off": 0.3,           # Low OFF penalty (sparse device)
+        "alpha_on": 6.0,
+        "alpha_off": 0.3,
         "lambda_zero": 0.03,
         "lambda_sparse": 0.005,
         "lambda_off_hard": 0.01,
-        "lambda_on_recall": 2.0,    # High recall for sparse events
+        "lambda_on_recall": 2.0,
         "on_recall_margin": 0.85,
         "lambda_gate_cls": 0.15,
         "lambda_energy": 0.18,
         "off_margin": 0.015,
-        # Regression parameters - multi-phase power needs energy + gradient
         "w_energy": 0.28,
         "w_on_power": 0.12,
-        "w_peak": 0.0,              # Disabled (no sharp peaks like kettle)
+        "w_peak": 0.0,
         "w_grad": 0.10,
         "w_range": 0.10,
     },
@@ -181,23 +171,14 @@ LONG_CYCLE_LOW_DUTY_PARAMS = {
     "off_margin": 0.03,
 }
 
-# Device type specific config defaults (using dict lookup instead of nested ternary)
-# FIXED: Reduced gate_floor values to prevent floor noise in OFF state
-# Previous high values (e.g., 0.4 for sparse_high_power) caused significant floor noise
-# OPTIMIZED (v4): Gate config - tuned per device type
-# LESSON LEARNED: gate_floor=0.02 for sparse devices caused minimum 2% activation even in OFF state
-# This led to false positives. Reduced to 0.008 to allow near-zero outputs.
+# Gate configuration per device type: soft_scale controls sigmoid steepness,
+# gate_floor sets the minimum gate output, gate_duty_weight regularizes toward
+# expected duty cycle. sparse_high_power also has a gate_logits_floor.
 DEVICE_TYPE_GATE_CONFIG = {
-    # V6: HPO-ALIGNED gate params
-    # sparse_high_power: moderate scale, floor allows detection
-    # V7.3: Restored gate_floor=0.015 (from 0.005). Lower floor allowed kettle gate_floor
-    # to learn down to 0.004, causing complete collapse (F1=0.0).
     "sparse_high_power": {"gate_soft_scale": 2.0, "gate_floor": 0.015, "gate_duty_weight": 0.05, "gate_logits_floor": -3.0},
     "frequent_switching": {"gate_soft_scale": 2.0, "gate_floor": 0.005, "gate_duty_weight": 0.05},
     "cycling_infrequent": {"gate_soft_scale": 2.0, "gate_floor": 0.01, "gate_duty_weight": 0.01},
-    # Fridge: lower gate_floor to reduce OFF leakage, higher scale for sharper gating
     "cycling_low_power": {"gate_soft_scale": 2.5, "gate_floor": 0.008, "gate_duty_weight": 0.02},
-    # WashingMachine/Dishwasher: higher scale for sharper gating
     "long_cycle": {"gate_soft_scale": 2.0, "gate_floor": 0.005, "gate_duty_weight": 0.03},
     "always_on": {"gate_soft_scale": 1.0, "gate_floor": 0.05, "gate_duty_weight": 0.0},
     "sparse_medium_power": {"gate_soft_scale": 1.0, "gate_floor": 0.02, "gate_duty_weight": 0.0},
@@ -218,7 +199,6 @@ DEVICE_TYPE_POSTPROCESS_CONFIG = {
 }
 
 DEVICE_TYPE_ZERO_PENALTY_CONFIG = {
-    # V6: Reduced zero penalty to prevent collapse
     "sparse_high_power": {"weight": 0.05, "kernel": 24, "ratio": 0.88},
     "frequent_switching": {"weight": 0.2, "kernel": 12, "ratio": 0.55},
     "cycling_infrequent": {"weight": 0.02, "kernel": 18, "ratio": 0.8},
@@ -232,13 +212,11 @@ DEVICE_TYPE_ZERO_PENALTY_CONFIG = {
 }
 
 DEVICE_TYPE_OFF_PENALTY_CONFIG = {
-    # V6: HPO-ALIGNED - Reduced OFF penalties to prevent sparse device collapse
     "sparse_high_power": {"off_high_agg": 0.03, "off_state": 0.02, "off_state_long": 0.01},
     "frequent_switching": {"off_high_agg": 0.02, "off_state": 0.1, "off_state_long": 0.2},
     "cycling_infrequent": {"off_high_agg": 0.01, "off_state": 0.015, "off_state_long": 0.1},
     "cycling_low_power": {"off_high_agg": 0.02, "off_state": 0.01, "off_state_long": 0.05},
     "cycling_low_power_low_duty": {"off_high_agg": 0.01, "off_state": 0.01, "off_state_long": 0.05},
-    # long_cycle: Added OFF penalties (previously 0, causing false positives)
     "long_cycle": {"off_high_agg": 0.08, "off_state": 0.05, "off_state_long": 0.02},
     "long_cycle_low_duty": {"off_high_agg": 0.03, "off_state": 0.02, "off_state_long": 0.01},
     "always_on": {"off_high_agg": 0.01, "off_state": 0.0, "off_state_long": 0.0},
@@ -349,7 +327,7 @@ def get_device_loss_params(device_type, duty_cycle):
     if device_type == "sparse_long_cycle":
         params = dict(DEVICE_TYPE_BASE_PARAMS["sparse_long_cycle"])
         if float(duty_cycle) < 0.03:
-            params["lambda_on_recall"] = 3.0  # Boost recall for very sparse (<3% duty)
+            params["lambda_on_recall"] = 3.0
         return params
 
     base = DEVICE_TYPE_BASE_PARAMS.get(device_type)
@@ -601,12 +579,9 @@ def apply_device_type_config_defaults(
         except (ValueError, TypeError):
             pass
 
-    # Gate weights - enabled for all device types with learnable gate_bias architecture
-    # CRITICAL: sparse_high_power devices (Kettle, Microwave) especially need gate supervision
-    # to learn when to activate vs suppress output
+    # Gate classification and window weights: enabled for cycling and sparse device types
     is_cycling = device_type in CYCLING_DEVICE_TYPES
     is_sparse = device_type in ("sparse_high_power", "sparse_medium_power", "sparse_long_cycle")
-    # Enable gate_cls for both cycling and sparse devices
     _set_if_missing(expes_config, "gate_cls_weight", 1.0 if (is_cycling or is_sparse) else 0.0)
     _set_if_missing(expes_config, "gate_window_weight", 0.5 if is_cycling else 0.0)
 

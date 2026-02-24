@@ -1,12 +1,12 @@
-"""Extract FINAL_EVAL_JSON metrics from V9 original + rerun logs.
+"""Extract FINAL_EVAL_JSON metrics from original + rerun logs.
 
 Combines results from both log directories:
-- V9 original: logs/comparison_20260210_005222/  (80 experiments, all completed)
-- V9 rerun:    logs/rerun_collapsed_20260211_130756/  (34 collapsed re-runs)
+- Original: logs/comparison_20260210_005222/  (80 experiments, all completed)
+- Rerun:    logs/rerun_collapsed_20260211_130756/  (34 collapsed re-runs)
 
 For experiments that appear in both, the rerun result takes priority.
 
-Output: structured JSON + human-readable tables for report generation.
+Outputs structured JSON and human-readable tables for report generation.
 """
 import json
 import os
@@ -16,7 +16,7 @@ import sys
 from collections import defaultdict
 
 ROOT = r"C:\Users\Workstation\Workspace\CondiNILM"
-V9_DIR = os.path.join(ROOT, "logs", "comparison_20260210_005222")
+ORIGINAL_DIR = os.path.join(ROOT, "logs", "comparison_20260210_005222")
 RERUN_DIR = os.path.join(ROOT, "logs", "rerun_collapsed_20260211_130756")
 
 
@@ -72,19 +72,19 @@ def main():
     # Collect all results
     all_results = {}
 
-    # Phase 1: Extract V9 original results
-    v9_logs = sorted(glob.glob(os.path.join(V9_DIR, "*.log")))
-    print(f"V9 original logs: {len(v9_logs)}")
+    # Extract original results
+    v9_logs = sorted(glob.glob(os.path.join(ORIGINAL_DIR, "*.log")))
+    print(f"Original logs: {len(v9_logs)}")
     for log_path in v9_logs:
         name = os.path.splitext(os.path.basename(log_path))[0]
         result = extract_final_eval(log_path)
         all_results[name] = {
-            "source": "V9_original",
+            "source": "original",
             "test": result["test"],
             "valid": result["valid"],
         }
 
-    # Phase 2: Extract rerun results (override V9 where available)
+    # Extract rerun results (override originals where available)
     rerun_logs = sorted(glob.glob(os.path.join(RERUN_DIR, "*.log")))
     print(f"Rerun logs: {len(rerun_logs)}")
     for log_path in rerun_logs:
@@ -121,7 +121,7 @@ def main():
     for model in models_t1:
         print(f"{model:<15}", end="")
         ndes = []
-        source = "V9"
+        source = "original"
         for device in devices:
             key = f"T1_{model}_{device}"
             r = all_results.get(key, {})
@@ -305,7 +305,7 @@ def main():
     for model in refit_models_single:
         print(f"{model:<15}", end="")
         ndes = []
-        source = "V9"
+        source = "original"
         for device in refit_devices:
             key = f"T5_single_{model}_{device}"
             r = all_results.get(key, {})

@@ -1,7 +1,4 @@
-"""Optuna hyperparameter optimization -- CondiNILM.
-
-Author: Siyi Li
-"""
+"""Optuna hyperparameter optimization -- CondiNILM."""
 
 import argparse
 import json
@@ -246,8 +243,8 @@ def _best_score_from_records(
         - "mean_f1": minimize 1 - mean(F1) across devices
         - "weighted_f1": minimize 1 - weighted_mean(F1), with higher weights for difficult devices
 
-    ENHANCED (v4): Added precision penalty for Microwave/Kettle to prevent
-    configurations that achieve high recall but terrible precision (lots of FP).
+    Includes precision penalty for Microwave/Kettle to prevent
+    configurations that achieve high recall but poor precision (many false positives).
     """
     # Device weights: higher for difficult devices (Microwave, Kettle)
     DEVICE_WEIGHTS = {

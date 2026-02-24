@@ -1,4 +1,4 @@
-"""AdaptiveDeviceLoss per-device loss function -- CondiNILM.
+"""Adaptive per-device loss function for NILM disaggregation.
 
 Author: Siyi Li
 """
@@ -13,23 +13,17 @@ from src.helpers.device_config import get_gate_config, get_device_loss_params
 
 
 class AdaptiveDeviceLoss(nn.Module):
-    """
-    Adaptive per-device NILM loss with automatic parameter derivation.
+    """Adaptive per-device NILM loss with parameters derived from device statistics.
 
-    Key design principles (from NILM best practices):
-    1. Each device gets its OWN parameters based on electrical characteristics
-    2. Parameters are DERIVED from statistics, not manually tuned
-    3. Unified stable loss structure with device-specific parameters
+    All devices share the same loss structure (8-component weighted regression)
+    but use different parameter values derived from their electrical characteristics.
 
-    Device types determine parameter tuning:
-    - Sparse high power (Kettle, Microwave): Higher alpha_on, lower alpha_off
-    - Cycling (Fridge): Balanced alpha_on/alpha_off
-    - Long cycle (Washer, Dishwasher): Strong alpha_on, moderate gradient weight
-    - Always on: Focus on energy tracking
-
-    NOTE: All devices use the same stable loss STRUCTURE (cycling loss)
-    but with different PARAMETERS derived from their electrical characteristics.
-    This prevents training collapse while maintaining device-specific optimization.
+    Device types:
+    - sparse_high_power: Higher alpha_on, lower alpha_off (e.g. kettle, microwave)
+    - cycling: Balanced alpha_on/alpha_off (e.g. fridge)
+    - long_cycle: Strong alpha_on, higher gradient weight (e.g. washer, dishwasher)
+    - sparse_long_cycle: Like long_cycle but with stronger recall (e.g. REDD washer)
+    - always_on: Equal alpha_on/alpha_off, lower device weight
     """
 
     # Device type constants
@@ -47,26 +41,21 @@ class AdaptiveDeviceLoss(nn.Module):
         output_ratio: float = 1.0,
         config_overrides: dict = None,
     ):
-        """
-        Initialize adaptive device loss.
+        """Initialize adaptive device loss.
 
         Args:
-            n_devices: Number of devices
-            device_stats: List of dicts with electrical statistics per device:
-                - duty_cycle: Fraction of time ON (0-1)
-                - peak_power: Maximum power (watts)
-                - mean_on: Mean power when ON (watts)
-                - cv_on: Coefficient of variation when ON (optional)
-                - mean_event_duration: Average ON duration in steps (optional)
-            warmup_epochs: Epochs before full auxiliary losses
-            output_ratio: Ratio of center region to supervise (0-1).
-                          E.g., 0.5 means only supervise middle 50% of sequence.
-                          This enables seq2subseq training to reduce boundary effects.
-            config_overrides: Optional dict with external config overrides:
-                - energy_weight_scale: Multiplier for w_energy (default 1.0)
-                - alpha_on_scale: Multiplier for alpha_on (default 1.0)
-                - alpha_off_scale: Multiplier for alpha_off (default 1.0)
-                - recall_weight_scale: Multiplier for w_recall (default 1.0)
+            n_devices: Number of output device channels.
+            device_stats: Per-device dicts with keys: duty_cycle (float 0-1),
+                peak_power (watts), mean_on (watts), cv_on (float, optional),
+                mean_event_duration (steps, optional), name (str, optional),
+                device_type (str, optional), loss_params (dict, optional).
+            warmup_epochs: Epochs before curriculum adjustments take effect.
+            output_ratio: Fraction of center sequence to supervise (0-1).
+                Enables seq2subseq training by cropping boundary regions.
+            config_overrides: Scaling multipliers for derived parameters.
+                Supported keys: energy_weight_scale, alpha_on_scale,
+                alpha_off_scale, recall_weight_scale, gate_soft_scale,
+                gate_floor, gate_bias.
         """
         super().__init__()
         self.n_devices = max(n_devices, 1)
@@ -77,13 +66,11 @@ class AdaptiveDeviceLoss(nn.Module):
         # Store config overrides for parameter scaling
         self.config_overrides = config_overrides or {}
 
-        # Analyze each device and derive parameters
         self.device_types = []
         self.device_params = []
-        self.device_names = []  # Store device names for per-device gate tuning
+        self.device_names = []
         init_weights = []
 
-        # Per-device gate parameters
         gate_soft_scales = []
         gate_floors = []
         gate_biases = []
@@ -94,18 +81,17 @@ class AdaptiveDeviceLoss(nn.Module):
             self.device_types.append(device_type)
             self.device_params.append(params)
 
-            # Store device name
             device_name = str(stats.get("name", f"device_{i}"))
             self.device_names.append(device_name)
 
-            # Extract per-device gate parameters
             gate_soft_scales.append(float(params.get("gate_soft_scale", 3.0)))
             gate_floors.append(float(params.get("gate_floor", 0.005)))
             gate_biases.append(float(params.get("gate_bias", 0.0)))
-            # Track which devices have frozen gate_bias
+
             if not hasattr(self, "_gate_bias_frozen_mask"):
                 self._gate_bias_frozen_mask = []
             self._gate_bias_frozen_mask.append(bool(params.get("gate_bias_frozen", False)))
+
             if not hasattr(self, "_gate_logits_floors"):
                 self._gate_logits_floors = []
             self._gate_logits_floors.append(float(params.get("gate_logits_floor", float("-inf"))))
@@ -114,42 +100,32 @@ class AdaptiveDeviceLoss(nn.Module):
             mean_on = float(stats.get("mean_on", 0.0))
             init_weights.append(self._compute_device_weight(device_type, duty_cycle, mean_on, params))
 
-        # Normalize weights so they sum to n_devices (preserves total gradient magnitude)
+        # Normalize weights to sum to n_devices (preserves total gradient magnitude)
         total_weight = sum(init_weights)
         if total_weight > 0:
             init_weights = [w * self.n_devices / total_weight for w in init_weights]
 
-        # Register as buffer (not learnable, but dynamically computed)
         self.register_buffer("device_weights", torch.tensor(init_weights, dtype=torch.float32))
 
-        # Per-device gate parameters (LEARNABLE - these are model architecture, not loss params)
+        # Learnable per-device gate parameters (shape: [n_devices])
+        # gate_soft_scales: sigmoid temperature for soft gating
+        # gate_floors: minimum gate output value
+        # gate_biases: additive bias to gate logits
         self.gate_soft_scales = nn.Parameter(torch.tensor(gate_soft_scales, dtype=torch.float32))
         self.gate_floors = nn.Parameter(torch.tensor(gate_floors, dtype=torch.float32))
         self.gate_biases = nn.Parameter(torch.tensor(gate_biases, dtype=torch.float32))
 
-        # V6: SIMPLIFIED LOSS - All loss parameters are FIXED from device config
-        # REMOVED: learnable alpha_on_log, alpha_off_log, threshold_logit
-        # REMOVED: learnable w_energy_log, w_on_power_log, w_peak_log, w_grad_log, w_range_log
-        # REMOVED: learnable focal_gamma_log, focal_alpha_logit
-        # REMOVED: learnable loss_log_vars (Kendall uncertainty weighting)
-        #
-        # RATIONALE: 125 learnable loss params created non-stationary optimization.
-        # HPO finds optimal loss params; making them learnable let them drift away.
-        # Fixed params from HPO-aligned device config are more stable.
-
-        # Base loss function
+        # All loss weights (alpha_on, alpha_off, w_main, etc.) are fixed from device config
         self.base_loss = nn.SmoothL1Loss(reduction="none")
 
-    # V6: All loss parameter getters removed.
-    # Loss params are now read directly from self.device_params in _compute_cycling_loss.
-    # This eliminates 125 learnable loss parameters that caused optimization instability.
-
     def _classify_and_derive_params(self, stats: dict) -> tuple:
-        """
-        Classify device type and derive ALL parameters from statistics.
+        """Classify device type and derive loss parameters from electrical statistics.
+
+        Args:
+            stats: Device statistics dict (see __init__ device_stats).
 
         Returns:
-            (device_type, params_dict)
+            Tuple of (device_type_str, params_dict).
         """
         name = str(stats.get("name", "") or "")
         duty_cycle = float(stats.get("duty_cycle", 0.1))
@@ -158,8 +134,7 @@ class AdaptiveDeviceLoss(nn.Module):
         cv_on = float(stats.get("cv_on", 0.3))
         mean_event_dur = float(stats.get("mean_event_duration", 10.0))
 
-        # V8: Device type from stats (data-driven) or config, never from device name.
-        # This ensures all datasets get identical classification logic.
+        # Use explicit device_type from stats if provided; otherwise classify from statistics
         raw_type = str(stats.get("device_type", "") or "").lower()
         if raw_type:
             if raw_type == "sparse_long_cycle":
@@ -208,11 +183,7 @@ class AdaptiveDeviceLoss(nn.Module):
                 params = dict(params)
                 params["lambda_gate_cls"] = float(base_params["lambda_gate_cls"])
 
-        # V8: Per-device tuning moved to dataset_params.yaml loss_override.
-        # No hardcoded device name overrides — all datasets use the same code path.
-        # Device-specific params flow through: config loss_override → loss_params → extra_params.
-
-        # Apply gate config_overrides from HPO
+        # Apply gate config_overrides (from HPO or user config)
         gate_soft_scale_override = self.config_overrides.get("gate_soft_scale")
         if gate_soft_scale_override is not None:
             params["gate_soft_scale"] = float(gate_soft_scale_override)
@@ -233,13 +204,10 @@ class AdaptiveDeviceLoss(nn.Module):
     def _classify_device(
         self, duty_cycle, peak_power, mean_on, cv_on, mean_event_dur
     ) -> str:
-        """
-        Classify device type from electrical statistics.
-        NOTE: SPARSE_LONG_CYCLE is only reachable via explicit device_type in YAML config,
-        not via this heuristic classifier.
+        """Classify device type from electrical statistics using duty cycle and event duration.
 
-        Classification is based primarily on DUTY CYCLE and EVENT DURATION
-        which are scale-independent (work with normalized or raw data).
+        Note: SPARSE_LONG_CYCLE is not reachable from this heuristic;
+        it requires explicit device_type in the stats dict.
         """
         # Always-on devices: very high duty cycle
         if duty_cycle > 0.7:
@@ -275,23 +243,21 @@ class AdaptiveDeviceLoss(nn.Module):
     def _derive_params_from_stats(
         self, device_type, duty_cycle, peak_power, mean_on, cv_on, mean_event_dur
     ) -> dict:
-        """
-        Derive loss parameters from device statistics.
+        """Derive fixed loss parameters from device type and statistics.
 
-        V6: HPO-ALIGNED - Parameters derived from HPO Trial #46 optimal values.
-        Key insight: Sparse devices need LOW OFF penalties, not high ones.
-        All values are FIXED (not learnable) for stable optimization.
+        Returns a dict of loss component weights and thresholds.
+        Values are scaled by any config_overrides set on the instance.
         """
         params = {}
 
-        # === Threshold (normalized to ~0.01 range for normalized data) ===
+        # ON/OFF threshold derived from mean_on / peak_power ratio
         if peak_power > 0:
             on_ratio = mean_on / peak_power
             params["threshold"] = max(0.005, min(0.05, 0.02 * on_ratio))
         else:
             params["threshold"] = 0.01
 
-        # Get config overrides for scaling
+        # Apply config override scaling factors
         energy_scale = float(self.config_overrides.get("energy_weight_scale", 1.0))
         alpha_on_scale = float(self.config_overrides.get("alpha_on_scale", 1.0))
         alpha_off_scale = float(self.config_overrides.get("alpha_off_scale", 1.0))
@@ -308,7 +274,7 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_hard_zero"] = 0.05
             params["off_margin"] = 0.02
             params["w_peak"] = 0.0
-            params["w_grad"] = 0.04  # V31: temporal gradient smoothness (short events, low weight)
+            params["w_grad"] = 0.04
             params["recall_coef_base"] = 0.25
             params["recall_coef_scale"] = 0.40
             params["recall_coef_max"] = 1.0
@@ -323,7 +289,7 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_hard_zero"] = 0.04
             params["off_margin"] = 0.015
             params["w_peak"] = 0.0
-            params["w_grad"] = 0.10  # V31: high — multi-phase transitions need smoothing
+            params["w_grad"] = 0.10
             params["recall_coef_base"] = 0.20
             params["recall_coef_scale"] = 0.40
             params["recall_coef_max"] = 0.70
@@ -338,7 +304,7 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_hard_zero"] = 0.05
             params["off_margin"] = 0.015
             params["w_peak"] = 0.0
-            params["w_grad"] = 0.10  # V31: high — multi-phase DW/WM need temporal structure
+            params["w_grad"] = 0.10
             params["recall_coef_base"] = 0.20
             params["recall_coef_scale"] = 0.40
             params["recall_coef_max"] = 0.70
@@ -353,12 +319,11 @@ class AdaptiveDeviceLoss(nn.Module):
             params["w_hard_zero"] = 0.03
             params["off_margin"] = 0.015
             params["w_peak"] = 0.0
-            params["w_grad"] = 0.06  # V31: moderate — cycling devices have regular transitions
+            params["w_grad"] = 0.06
             params["recall_coef_base"] = 0.10
             params["recall_coef_scale"] = 0.10
             params["recall_coef_max"] = 0.70
         else:
-            # Default/always-on devices
             params["alpha_on"] = 1.0 * alpha_on_scale
             params["alpha_off"] = 1.0 * alpha_off_scale
             params["w_main"] = 0.50
@@ -373,33 +338,24 @@ class AdaptiveDeviceLoss(nn.Module):
             params["recall_coef_scale"] = 0.10
             params["recall_coef_max"] = 0.70
 
-
         return params
 
     def _compute_device_weight(self, device_type: str, duty_cycle: float, mean_on: float, params: dict = None) -> float:
-        """
-        Compute loss weight for a device based on its type and duty cycle.
+        """Compute loss weight for a device based on type and duty cycle.
 
-        REVISED STRATEGY: Previous approach gave very high weights to sparse devices,
-        which caused them to dominate training and produce false positives.
-
-        New approach:
-        - Sparse devices get MODERATE weights (not too high to avoid dominating)
-        - Focus on better loss function design rather than weight boosting
-        - More balanced weights across all device types
-        - V29: Support loss_weight_multiplier in params for fine-grained control
+        Sparse devices get moderately higher weights; always-on devices get lower.
+        A duty_factor further adjusts weight based on how rare the ON state is.
+        An optional loss_weight_multiplier in params provides fine-grained control.
 
         Args:
-            device_type: Classification of device behavior
-            duty_cycle: Fraction of time device is ON (0-1)
-            params: Optional device params dict with loss_weight_multiplier
+            device_type: Device type classification string.
+            duty_cycle: Fraction of time device is ON (0-1).
+            mean_on: Mean ON power (used only for validation; not in formula).
+            params: Device params dict; may contain loss_weight_multiplier.
 
         Returns:
-            Weight multiplier for this device's loss
+            Weight multiplier for this device's contribution to total loss.
         """
-        # V8: Moderate weights for sparse devices — enough to prevent collapse,
-        # not so aggressive as to steal gradient from long-cycle devices (WM, DW).
-        # Max effective weight: 1.8 * 1.5 = 2.7x (down from 3.0 * 2.5 = 7.5x)
         base_weights = {
             self.SPARSE_HIGH_POWER: 1.8,
             self.SPARSE_LONG_CYCLE: 1.5,
@@ -411,7 +367,6 @@ class AdaptiveDeviceLoss(nn.Module):
 
         if not math.isfinite(mean_on) or mean_on <= 0:
             mean_on = 1.0
-        # V8: Moderate duty factors — prevent gradient drowning without dominance
         if duty_cycle < 0.01:
             duty_factor = 1.5
         elif duty_cycle < 0.05:
@@ -425,7 +380,7 @@ class AdaptiveDeviceLoss(nn.Module):
 
         weight = base * duty_factor
 
-        # V29: Apply optional loss_weight_multiplier from params
+        # Apply optional per-device multiplier from params
         if params is not None:
             multiplier = float(params.get("loss_weight_multiplier", 1.0))
             weight = weight * multiplier
@@ -437,38 +392,30 @@ class AdaptiveDeviceLoss(nn.Module):
         self.current_epoch = int(epoch)
 
     def _get_epoch_adjusted_params(self, params: dict, epoch: int, total_epochs: int = 25, **kwargs) -> dict:
-        """
-        Adjust loss parameters based on training epoch for curriculum learning.
+        """Optionally adjust loss parameters based on epoch for curriculum learning.
 
-        V8: Fully parameter-driven. Curriculum is controlled by params["use_curriculum"]
-        (default False). When enabled, applies 3-phase schedule:
-          - Phase 1 (epoch < 8): Detection priority - higher recall, lower FP penalty
-          - Phase 2 (8 <= epoch < 16): Balanced - use original parameters
-          - Phase 3 (epoch >= 16): Precision priority - lower recall, higher FP penalty
+        Curriculum is disabled by default. Enable per-device by setting
+        params["use_curriculum"] = True. When enabled, applies a 3-phase schedule:
+          - Phase 1 (epoch < 8): Higher w_recall, lower w_off_fp (detection focus)
+          - Phase 2 (8 <= epoch < 16): Original parameters (balanced)
+          - Phase 3 (epoch >= 16): Lower w_recall, higher w_off_fp (precision focus)
 
         Args:
-            params: Device-specific parameters (must include use_curriculum to enable)
-            epoch: Current epoch number
-            total_epochs: Total training epochs (default 25)
-            device_name: Name of the device (optional, for device-type-aware adjustment)
+            params: Device-specific loss parameters dict.
+            epoch: Current training epoch.
+            total_epochs: Total training epochs (unused, reserved).
+            **kwargs: Accepts device_name (unused, reserved).
 
         Returns:
-            Adjusted parameters dict (copy, does not modify original)
+            Copy of params with adjustments applied (original is not modified).
         """
-        # Make a copy to avoid modifying original
         adjusted = dict(params)
-
-        # V8: Curriculum is fully parameter-driven — no device_type branching.
-        # Default: disabled (False). Can be enabled per-device via loss_override.
-        # LESSON: Curriculum caused collapse for fridge, MW, and hurt WM/DW recall.
         if not params.get("use_curriculum", False):
             return adjusted
 
-        # Get current values
         w_recall = float(adjusted.get("w_recall", 0.1))
         w_off_fp = float(adjusted.get("w_off_fp", 0.1))
 
-        # Apply curriculum only for sparse_high_power and other devices
         if epoch < 8:
             # Phase 1: Detection priority
             # Increase recall weight, decrease FP penalty
@@ -486,35 +433,33 @@ class AdaptiveDeviceLoss(nn.Module):
         return adjusted
 
     def _compute_cycling_loss(self, pred, target, params, device_name: str = None, device_idx: int = 0):
-        """
-        V6: SIMPLIFIED per-device loss with 7 core components.
+        """Compute per-device loss with 8 weighted components.
 
-        REMOVED (from V5's 15 components):
-        - Learnable alpha/focal/regression/uncertainty weights (125 params)
-        - Global stability loss (redundant with main)
-        - Peak-aware loss (absorbed into ON power accuracy)
-        - Gradient smoothness loss (marginal benefit, adds noise)
-        - Power range constraint (model already clamps)
-        - Edge detection loss (redundant with recall)
-        - Event-level loss (expensive, redundant with recall)
-        - Amplitude matching loss (redundant with ON power)
-        - Background suppression (redundant with hard zero)
-        - BCE classification loss (conflicts with regression)
+        Components:
+        1. Main regression: SmoothL1 weighted by alpha_on (ON regions) and alpha_off (OFF regions)
+        2. ON recall: penalizes under-prediction in ON regions (recall_coef * target - pred)
+        3. OFF false positive: penalizes over-prediction beyond off_margin in OFF regions
+        4. ON power accuracy: relative error |pred - target| / target in ON regions
+        5. Energy regression: relative error of summed energy per sample
+        6. Hard zero: penalizes any prediction above margin in true-zero regions
+        7. Peak amplitude: relative error of peak values in ON regions
+        8. Temporal gradient: SmoothL1 on first-order temporal differences
 
-        KEPT (6 core components):
-        1. Main regression loss (alpha_on/alpha_off weighted)
-        2. ON recall loss (prevents collapse to zero)
-        3. OFF false positive loss (prevents over-prediction)
-        4. ON power accuracy (relative error for NDE)
-        5. Energy regression (total energy matching)
-        6. Hard zero loss (forces true zeros in OFF)
-        Note: Gate classification loss is computed separately in the training step.
+        ON/OFF regions are determined by soft sigmoid masks around `threshold`.
+        All component weights are fixed from device_params (not learnable).
 
-        All weights are FIXED from device config (HPO-optimized).
+        Args:
+            pred: Predictions, shape (B, 1, L).
+            target: Targets, shape (B, 1, L).
+            params: Device-specific parameter dict.
+            device_name: Device name (unused, reserved).
+            device_idx: Device channel index (unused, reserved).
+
+        Returns:
+            Scalar loss tensor.
         """
         eps = 1e-6
 
-        # Read FIXED parameters from device config (not learnable)
         alpha_on = float(params.get("alpha_on", 2.0))
         alpha_off = float(params.get("alpha_off", 1.0))
         threshold = float(params.get("threshold", 0.01))
@@ -523,16 +468,14 @@ class AdaptiveDeviceLoss(nn.Module):
         p_on = torch.sigmoid((target - threshold) / soft_temp)
         p_off = 1.0 - p_on
 
-        # === Component 1: Main regression loss (alpha-weighted) ===
+        # Component 1: Main regression loss (alpha-weighted SmoothL1)
         point_loss = self.base_loss(pred, target)
         loss_on = (point_loss * p_on).sum() / (p_on.sum() + eps)
         loss_off = (point_loss * p_off).sum() / (p_off.sum() + eps)
         loss_main = alpha_on * loss_on + alpha_off * loss_off
 
-        # === Component 2: ON recall loss ===
-        # V8: recall_coef fully parameter-driven — no device_type branching.
-        # recall_coef = base + scale * w_recall, clamped to [0, max].
-        # All values come from _derive_params_from_stats → loss_override.
+        # Component 2: ON recall loss
+        # recall_coef = base + scale * w_recall, clamped to [0, max]
         w_recall = float(params.get("w_recall", 0.1))
         recall_coef_base = float(params.get("recall_coef_base", 0.10))
         recall_coef_scale = float(params.get("recall_coef_scale", 0.10))
@@ -542,12 +485,12 @@ class AdaptiveDeviceLoss(nn.Module):
         on_deficit = torch.relu(recall_coef * target - pred) * p_on
         on_recall_loss = on_deficit.sum() / (p_on.sum() + eps)
 
-        # === Component 3: OFF false positive loss ===
+        # Component 3: OFF false positive loss
         off_margin = float(params.get("off_margin", 0.01))
         off_excess = torch.relu(pred - off_margin) * p_off
         off_fp_loss = off_excess.sum() / (p_off.sum() + eps)
 
-        # === Component 4: ON power accuracy (relative error) ===
+        # Component 4: ON power accuracy (relative error)
         w_on_power = float(params.get("w_on_power", 0.1))
         on_mask = (target > threshold).float()
         if on_mask.sum() > 0:
@@ -557,14 +500,14 @@ class AdaptiveDeviceLoss(nn.Module):
         else:
             on_power_loss = pred.new_tensor(0.0)
 
-        # === Component 5: Energy regression loss ===
+        # Component 5: Energy regression (relative error of total energy per sample)
         w_energy = float(params.get("w_energy", 0.15))
         pred_energy = pred.sum(dim=-1)
         target_energy = target.sum(dim=-1)
         energy_error = torch.abs(pred_energy - target_energy) / (target_energy.abs() + eps)
         energy_loss = torch.clamp(energy_error.mean(), 0.0, 2.0)
 
-        # === Component 6: Hard zero loss ===
+        # Component 6: Hard zero loss (penalizes predictions in true-zero regions)
         w_hard_zero = float(params.get("w_hard_zero", 0.0))
         hard_zero_loss = pred.new_tensor(0.0)
         if w_hard_zero > 0:
@@ -574,7 +517,7 @@ class AdaptiveDeviceLoss(nn.Module):
             hard_zero_loss = non_zero_penalty.sum() / (true_zero_mask.sum() + eps)
             hard_zero_loss = torch.clamp(hard_zero_loss, 0.0, 3.0)
 
-        # === Component 7: Peak amplitude loss ===
+        # Component 7: Peak amplitude loss (relative error of per-sample peak in ON regions)
         w_peak = float(params.get("w_peak", 0.0))
         peak_loss = pred.new_tensor(0.0)
         if w_peak > 0 and on_mask.sum() > 0:
@@ -588,11 +531,7 @@ class AdaptiveDeviceLoss(nn.Module):
                 peak_loss = (peak_error * active).sum() / (active.sum() + eps)
                 peak_loss = torch.clamp(peak_loss, 0.0, 3.0)
 
-        # === Component 8: Temporal gradient smoothness loss ===
-        # V31: Re-added from T5 era. Penalizes predictions that don't match
-        # the target's temporal pattern. Critical for multi-phase devices (WM):
-        # - All-ON flat predictions have pred_grad≈0 but target has transitions → penalized
-        # - Forces model to learn temporal structure, not just average power
+        # Component 8: Temporal gradient smoothness (SmoothL1 on first differences)
         w_grad = float(params.get("w_grad", 0.0))
         grad_loss = pred.new_tensor(0.0)
         if w_grad > 0 and pred.shape[-1] > 1:
@@ -601,7 +540,7 @@ class AdaptiveDeviceLoss(nn.Module):
             grad_loss = torch.nn.functional.smooth_l1_loss(pred_diff, target_diff)
             grad_loss = torch.clamp(grad_loss, 0.0, 3.0)
 
-        # === Combine all components with FIXED weights ===
+        # Weighted sum of all components
         w_main = float(params.get("w_main", 0.45))
         w_off_fp = float(params.get("w_off_fp", 0.1))
 
@@ -617,23 +556,33 @@ class AdaptiveDeviceLoss(nn.Module):
         return total
 
     def _crop_center(self, x, ratio):
-        """Crop to center region of sequence for seq2subseq training."""
+        """Crop to center region along the last dimension.
+
+        Args:
+            x: Tensor with sequence in last dimension.
+            ratio: Fraction of sequence to keep (0-1). Returns x unchanged if >= 1.0.
+        """
         if ratio >= 1.0:
             return x
         L = x.shape[-1]
-        crop_len = int(L * ratio)
-        # Ensure at least 1 point and even number for symmetry
-        crop_len = max(1, crop_len)
+        crop_len = max(1, int(L * ratio))
         start = (L - crop_len) // 2
         end = start + crop_len
         return x[..., start:end]
 
     def forward(self, pred, target, gate=None):
-        """
-        Forward pass with device-specific parameters and dynamic weighting.
+        """Compute weighted average loss across all device channels.
 
-        Key improvement: Uses device_weights to balance learning across devices
-        with different activity patterns, preventing "robbing Peter to pay Paul".
+        Crops pred/target to center region (output_ratio), computes per-device
+        loss with device-specific parameters, and returns weighted average.
+
+        Args:
+            pred: Predictions, shape (B, C, L) or (B, L).
+            target: Targets, shape (B, C, L) or (B, L).
+            gate: Unused (gate classification loss is computed externally).
+
+        Returns:
+            Scalar loss tensor.
         """
         pred = pred.float()
         target = target.float()
@@ -643,7 +592,6 @@ class AdaptiveDeviceLoss(nn.Module):
         if target.dim() < 3:
             target = target.unsqueeze(1)
 
-        # Crop to center region for seq2subseq (reduces boundary effects)
         pred = self._crop_center(pred, self.output_ratio)
         target = self._crop_center(target, self.output_ratio)
 
@@ -659,25 +607,17 @@ class AdaptiveDeviceLoss(nn.Module):
             params = self.device_params[c]
             device_name = self.device_names[c] if c < len(self.device_names) else None
 
-            # Apply epoch-adjusted parameters (curriculum controlled by params)
             adjusted_params = self._get_epoch_adjusted_params(
                 params, self.current_epoch
             )
 
-            # Apply unified stable loss structure with device-specific parameters
-            # Device-type-aware: recall_coef varies by device type
-            # Pass device_idx for learnable parameters
             device_loss = self._compute_cycling_loss(p_c, t_c, adjusted_params, device_name=device_name, device_idx=c)
 
-            # Numerical stability
             device_loss = torch.nan_to_num(device_loss, nan=1.0, posinf=10.0, neginf=0.0)
-
-            # Apply device-specific weight
             weight = self.device_weights[c]
             total_loss = total_loss + weight * device_loss
             total_weight = total_weight + weight
 
-        # Weighted average across devices
         final_loss = total_loss / (total_weight + 1e-6)
         return torch.nan_to_num(final_loss, nan=1.0, posinf=10.0, neginf=0.0)
 

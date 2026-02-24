@@ -1,6 +1,8 @@
-"""STNILM baseline -- CondiNILM.
+"""STNILM: Switch Transformer for non-intrusive load monitoring.
 
-Author: Siyi Li
+Uses the same conv+pool front-end and decoder as BERT4NILM, but replaces
+the standard feed-forward layer with a Switch Transformer Mixture-of-Experts
+(MoE) routing layer. Returns an auxiliary load-balancing loss during training.
 """
 import math
 import torch
@@ -139,7 +141,6 @@ class STNILM(nn.Module):
         embedding = x_token + self.position(x)
         x = self.dropout(self.layer_norm(embedding))
 
-        # Mixture Of Expert router
         counts, route_prob, n_dropped, route_prob_max = [], [], [], []
         for layer in self.transformer_blocks:
             x, f, p, n_d, p_max = layer(x)
@@ -158,11 +159,8 @@ class STNILM(nn.Module):
             route_prob_max = torch.stack(route_prob_max)
 
             total = counts.sum(dim=-1, keepdims=True)
-            # Fraction of tokens routed to each expert
             route_frac = counts / total
-            # Mean routing probability
             route_prob = route_prob / total
-            # Load balancing loss
             loss_moe = self.n_experts * (route_frac * route_prob).sum()
 
             return x.permute(0, 2, 1), loss_moe

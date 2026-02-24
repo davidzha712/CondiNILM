@@ -1,7 +1,4 @@
-"""Data loading, windowing, and train/valid splitting -- CondiNILM.
-
-Author: Siyi Li
-"""
+"""Data loading, windowing, train/valid splitting, and dataset builders for UKDALE, REFIT, and REDD."""
 
 import os
 import numpy as np
@@ -10,15 +7,15 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 
 
-# ========================================= Convert NILM dataset to TSER ========================================= #
 def nilmdataset_to_tser(data):
-    """
-    Input:
-        data: Convention of 4D array obtained with every NILM Databuilder available in data_processing
+    """Convert a 4D NILM array to time series extrinsic regression format.
 
-    Output:
-        X: 2D array of input time series
-        y: 2D array as (len(X), 1) -> sum of energy consumed in each window
+    Args:
+        data: np.ndarray of shape [N, M+1, 2, L] from any DataBuilder.
+
+    Returns:
+        X: np.ndarray of shape [N, L] containing aggregate power.
+        y: np.ndarray of shape [N] with total appliance energy per window.
     """
     X = data[:, 0, 0, :]
     y = np.sum(data[:, 1, 0, :], axis=-1)
@@ -77,17 +74,18 @@ def split_train_valid_test(data, test_size=0.2, valid_size=0, nb_label_col=1):
 def split_train_valid_test_pdl(
     df_data, test_size=0.2, valid_size=0, nb_label_col=1, seed=0, return_df=False
 ):
-    """
-    Split DataFrame based on index ID (ID PDL for example)
+    """Split a DataFrame into train/valid/test by unique index IDs (e.g. household IDs).
 
-    - Input : df_data -> DataFrame
-              test_size -> Percentage data for test
-              valid_size -> Percentage data for valid
-              nb_label_col -> Number of columns of label
-              seed -> Set seed
-              return_df -> Return DataFrame instances, or Numpy Instances
-    - Output:
-            np.arrays or DataFrame Instances
+    Args:
+        df_data: DataFrame with a non-unique index identifying groups.
+        test_size: Fraction of groups for the test set.
+        valid_size: Fraction of remaining groups for the validation set (0 to skip).
+        nb_label_col: Number of trailing columns treated as labels.
+        seed: Random seed for reproducibility.
+        return_df: If True return DataFrames; otherwise return numpy arrays.
+
+    Returns:
+        (X_train, y_train, [X_valid, y_valid,] X_test, y_test) as arrays or DataFrames.
     """
 
     np.random.seed(seed)
@@ -433,10 +431,6 @@ def create_exogene(
     return values
 
 
-# ===================== UKDALE DataBuilder =====================#
-
-# Appliance alias mapping: allow similar devices to be merged for learning
-# Keys are target appliance names; values are lists of alternative names
 APPLIANCE_ALIASES = {
     "fridge": ["freezer", "fridge_freezer", "fridge-freezer"],
     "freezer": ["fridge", "fridge_freezer", "fridge-freezer"],
@@ -447,6 +441,9 @@ APPLIANCE_ALIASES = {
 
 
 class UKDALE_DataBuilder(object):
+    """Loads UK-DALE .dat files, resamples, computes appliance activation status,
+    and produces windowed 4D arrays [N, M+1, 2, L] for NILM training."""
+
     def __init__(
         self,
         data_path,
@@ -459,7 +456,6 @@ class UKDALE_DataBuilder(object):
         use_appliance_aliases=True,
         appliance_params=None,
     ):
-        # =============== Class variables =============== #
         self.data_path = data_path
         self.mask_app = mask_app
         self.sampling_rate = sampling_rate
@@ -510,18 +506,14 @@ class UKDALE_DataBuilder(object):
         else:
             self.window_stride = self.window_size
 
-        # ======= Add aggregate to appliance(s) list ======= #
         self._check_appliance_names()
         self.mask_app = ["aggregate"] + self.mask_app
 
-        # ======= Dataset Parameters ======= #
         self.cutoff = 6000
-
         self.use_status_from_kelly_paper = use_status_from_kelly_paper
 
-        # All parameters are in Watts and taken from Kelly et all. NeuralNILM paper
         if self.use_status_from_kelly_paper:
-            # Threshold parameters are in Watts and time parameter in 10sec (minimum resampling)
+            # Thresholds in Watts; duration params in 10s steps (base resampling rate)
             self.appliance_param = {
                 "kettle": {
                     "min_threshold": 2000,
@@ -560,7 +552,6 @@ class UKDALE_DataBuilder(object):
                 },
             }
         else:
-            # Threshold parameters are in Watts
             self.appliance_param = {
                 "kettle": {"min_threshold": 500, "max_threshold": 6000},
                 "washing_machine": {"min_threshold": 300, "max_threshold": 3000},
@@ -569,7 +560,6 @@ class UKDALE_DataBuilder(object):
                 "fridge": {"min_threshold": 50, "max_threshold": 300},
             }
 
-        # Override with external params if provided (from dataset_params.yaml)
         if self._external_appliance_params is not None:
             for app_name, params in self._external_appliance_params.items():
                 app_key = app_name.lower()
@@ -585,17 +575,13 @@ class UKDALE_DataBuilder(object):
         return self._get_dataframe(house_indicies[0])
 
     def get_classif_dataset(self, house_indicies):
-        """
-        Process data to build classif dataset
+        """Build a binary classification dataset from NILM windows.
 
-        Return :
-            -Time Series: np.ndarray of size [N_ts, Win_Size]
-            -Associated label for each subsequences: np.ndarray of size [N_ts, 1] in 0 or 1 for each TS
-            -st_date: pandas.Dataframe as :
-                - index: id of each house
-                - column 'start_date': Starting timestamp of each TS
+        Returns:
+            X: np.ndarray [N, L] of aggregate power windows.
+            y: np.ndarray [N] with 1 if appliance was active in the window, else 0.
+            st_date: DataFrame with house IDs as index and 'start_date' column.
         """
-
         nilm_dataset, st_date = self.get_nilm_dataset(house_indicies)
         y = np.zeros(len(nilm_dataset))
 
@@ -606,27 +592,13 @@ class UKDALE_DataBuilder(object):
         return nilm_dataset[:, 0, 0, :], y, st_date
 
     def get_nilm_dataset(self, house_indicies):
+        """Build the windowed 4D NILM dataset from specified houses.
+
+        Returns:
+            data: np.ndarray [N, M+1, 2, L] where axis 1 index 0 is aggregate,
+                  axis 2 index 0 is power and index 1 is activation status.
+            st_date: DataFrame with house IDs as index and 'start_date' column.
         """
-        Process data to build NILM usecase
-
-        Return :
-            - np.ndarray of size [N_ts, M_appliances, 2, Win_Size] as :
-
-                -1st dimension : nb ts obtained after slicing the total load curve of chosen Houses
-                -2nd dimension : nb chosen appliances
-                                -> indice 0 for aggregate load curve
-                                -> Other appliance in same order as given "appliance_names" list
-                -3rd dimension : access to load curve (values of consumption in Wh) or states of activation
-                                of the appliance (0 or 1 for each time step)
-                                -> indice 0 : access to load curve
-                                -> indice 1 : access to states of activation (0 or 1 for each time step) or Probability (i.e. value in [0, 1]) if soft_label
-                -4th dimension : values
-
-            - pandas.Dataframe as :
-                index: id of each house
-                column 'start_date': Starting timestamp of each TS
-        """
-
         output_data = np.array([])
         st_date = pd.DataFrame()
 
@@ -652,9 +624,7 @@ class UKDALE_DataBuilder(object):
                     i * self.window_stride : i * self.window_stride + self.window_size,
                 ]
 
-                if not self._check_anynan(
-                    tmp
-                ):  # Check if nan -> skip the subsequences if it's the case
+                if not self._check_anynan(tmp):
                     tmp_list_st_date.append(st_date_stems[i * self.window_stride])
 
                     X[cpt, 0, 0, :] = tmp[0, :]
@@ -666,7 +636,7 @@ class UKDALE_DataBuilder(object):
                         X[cpt, j, 1, :] = tmp[key + 1, :]
                         key += 2
 
-                    cpt += 1  # Add one subsequence
+                    cpt += 1
 
             tmp_st_date = pd.DataFrame(
                 data=tmp_list_st_date,
@@ -716,7 +686,6 @@ class UKDALE_DataBuilder(object):
             off_events = off_events[on_duration >= min_on]
             assert len(on_events) == len(off_events)
 
-        # Filter activations based on minimum continuous points after applying min_on and min_off
         activation_durations = off_events - on_events
         valid_activations = activation_durations >= min_activation_time
         on_events = on_events[valid_activations]
@@ -728,10 +697,12 @@ class UKDALE_DataBuilder(object):
         return tmp_status
 
     def _get_stems(self, dataframe):
-        """
-        Extract load curve for each chosen appliances.
+        """Extract aggregate + per-appliance power and status into a 2D array.
 
-        Return : np.ndarray instance
+        Returns:
+            stems: np.ndarray [1 + 2*(M), T] with aggregate at row 0,
+                   then (power, status) pairs for each appliance.
+            dates: list of datetime index values from the dataframe.
         """
         stems = np.empty((1 + (len(self.mask_app) - 1) * 2, dataframe.shape[0]))
         stems[0, :] = dataframe["aggregate"].values
@@ -745,11 +716,7 @@ class UKDALE_DataBuilder(object):
         return stems, list(dataframe.index)
 
     def _get_dataframe(self, indice):
-        """
-        Load houses data and return one dataframe with aggregate and appliance resampled at chosen time step.
-        
-        Return : pd.core.frame.DataFrame instance
-        """
+        """Load one house's .dat files, merge channels, resample, and compute status."""
         candidates = [
             os.path.join(self.data_path, f"house_{indice}"),
             os.path.join(self.data_path, f"house{indice}"),
@@ -767,23 +734,18 @@ class UKDALE_DataBuilder(object):
             )
         self._check_if_file_exist(path_house + "labels.dat")
 
-        # House labels
         house_label = pd.read_csv(path_house + "labels.dat", sep=" ", header=None)
         house_label.columns = ["id", "appliance_name"]
 
-        # Load aggregate load curve and resample to a base rate.
-        # UKDALE raw data is ~6s. When target sampling_rate <= 10s (e.g. "6s"),
-        # resample directly to the target to preserve native resolution.
-        # Otherwise, resample to 10s first (cheaper merge), then downsample later.
         house_data = pd.read_csv(path_house + "channel_1.dat", sep=" ", header=None)
         house_data.columns = ["time", "aggregate"]
         house_data["time"] = pd.to_datetime(house_data["time"], unit="s")
-        house_data = house_data.set_index("time")  # Set index to time
+        house_data = house_data.set_index("time")
         _base_rate = self.sampling_rate if self.sampling_rate in ("6s", "6S") else "10s"
         house_data = (
             house_data.resample(_base_rate).mean().ffill(limit=6)
         )
-        house_data[house_data < 5] = 0  # Remove small value
+        house_data[house_data < 5] = 0
 
         if self.flag_week:
             tmp_min = house_data[
@@ -802,16 +764,13 @@ class UKDALE_DataBuilder(object):
             house_data = house_data[house_data.index >= tmp_min.index[0]]
 
         for appliance in self.mask_app[1:]:
-            # Try to find device: first exact match, then aliases
             matched_name = None
             matched_id = None
 
-            # 1. First attempt exact matching
             exact_match = house_label.loc[house_label["appliance_name"] == appliance]["id"].values
             if len(exact_match) != 0:
                 matched_name = appliance
                 matched_id = exact_match[0]
-            # 2. If no exact match and aliases enabled, try aliases
             elif self.use_appliance_aliases and appliance in APPLIANCE_ALIASES:
                 for alias in APPLIANCE_ALIASES[appliance]:
                     alias_match = house_label.loc[house_label["appliance_name"] == alias]["id"].values
@@ -823,29 +782,22 @@ class UKDALE_DataBuilder(object):
             if matched_id is not None:
                 i = matched_id
 
-                # Load aggregate load curve and resample to lowest sampling rate
                 appl_data = pd.read_csv(
                     path_house + "channel_" + str(i) + ".dat", sep=" ", header=None
                 )
-                # Use the target appliance name as the column name (not the alias)
                 appl_data.columns = ["time", appliance]
                 appl_data["time"] = pd.to_datetime(appl_data["time"], unit="s")
                 appl_data = appl_data.set_index("time")
                 appl_data = appl_data.resample(_base_rate).mean().ffill(limit=6)
-                appl_data[appl_data < 5] = 0  # Remove small value
+                appl_data[appl_data < 5] = 0
 
-                # Merge aggregate load curve with appliance load curve
                 house_data = pd.merge(house_data, appl_data, how="inner", on="time")
                 del appl_data
-                house_data = house_data.clip(
-                    lower=0, upper=self.cutoff
-                )  # Apply general cutoff
+                house_data = house_data.clip(lower=0, upper=self.cutoff)
                 house_data = house_data.sort_index()
 
-                # Replace nan values by -1 during appliance activation status filtering
                 house_data[appliance] = house_data[appliance].replace(np.nan, -1)
 
-                # Creating status
                 initial_status = (
                     (
                         (
@@ -871,7 +823,6 @@ class UKDALE_DataBuilder(object):
                 else:
                     house_data[appliance + "_status"] = initial_status
 
-                # Finally replacing nan values put to -1 by nan
                 house_data[appliance] = house_data[appliance].replace(-1, np.nan)
 
         if self.sampling_rate not in ("10s", _base_rate):
@@ -895,9 +846,7 @@ class UKDALE_DataBuilder(object):
         return house_data
 
     def _check_appliance_names(self):
-        """
-        Check appliances names for UKDALE case.
-        """
+        """Assert all requested appliance names are valid for UK-DALE."""
         for appliance in self.mask_app:
             assert appliance in [
                 "washing_machine",
@@ -908,27 +857,17 @@ class UKDALE_DataBuilder(object):
                 "microwave",
                 "electric_heater",
             ], f"Selected applicance unknow for UKDALE Dataset, got: {appliance}"
-        return
 
     def _check_if_file_exist(self, file):
-        """
-        Check if file exist at provided path.
-        """
-        if os.path.isfile(file):
-            pass
-        else:
+        """Raise FileNotFoundError if path does not exist."""
+        if not os.path.isfile(file):
             raise FileNotFoundError
-        return
 
     def _check_anynan(self, a):
-        """
-        Fast check of NaN in a numpy array.
-        """
+        """Return True if the array contains any NaN."""
         return np.isnan(np.sum(a))
 
 
-# Mapping from standard REFIT appliance names to variant column names
-# found in HOUSES_Labels. Priority order: most common variant first.
 REFIT_APPLIANCE_ALIASES = {
     "Fridge": ["Fridge-Freezer", "Fridge & Freezer", "Fridge(garage)", "Freezer"],
     "WashingMachine": ["Washer Dryer", "WashingMachine (1)"],
@@ -936,8 +875,10 @@ REFIT_APPLIANCE_ALIASES = {
 }
 
 
-# ===================== REFIT DataBuilder =====================#
 class REFIT_DataBuilder(object):
+    """Loads REFIT CSV files, resamples, computes appliance activation status,
+    and produces windowed 4D arrays [N, M+1, 2, L] for NILM training."""
+
     def __init__(
         self,
         data_path,
@@ -949,7 +890,6 @@ class REFIT_DataBuilder(object):
         soft_label=False,
         appliance_params=None,
     ):
-        # =============== Class variables =============== #
         self.data_path = data_path
         self.mask_app = mask_app
         self.sampling_rate = sampling_rate
@@ -998,18 +938,14 @@ class REFIT_DataBuilder(object):
         else:
             self.window_stride = self.window_size
 
-        # ======= Add aggregate to appliance(s) list ======= #
         self._check_appliance_names()
         self.mask_app = ["Aggregate"] + self.mask_app
 
-        # ======= Dataset Parameters ======= #
         self.cutoff = 10000
-
         self.use_status_from_kelly_paper = use_status_from_kelly_paper
 
-        # All parameters are in Watts and adapted from Kelly et all. NeuralNILM paper
         if self.use_status_from_kelly_paper:
-            # Threshold parameters are in Watts and time parameter in 10sec
+            # Thresholds in Watts; duration params in 10s steps
             self.appliance_param = {
                 "Kettle": {
                     "min_threshold": 1000,
@@ -1048,7 +984,6 @@ class REFIT_DataBuilder(object):
                 },
             }
         else:
-            # Threshold parameters are in Watts
             self.appliance_param = {
                 "Kettle": {"min_threshold": 500, "max_threshold": 6000},
                 "WashingMachine": {"min_threshold": 300, "max_threshold": 4000},
@@ -1057,7 +992,6 @@ class REFIT_DataBuilder(object):
                 "Fridge": {"min_threshold": 50, "max_threshold": 300},
             }
 
-        # Override with external params if provided (from dataset_params.yaml)
         if self._external_appliance_params is not None:
             for app_name, params in self._external_appliance_params.items():
                 if app_name not in self.appliance_param:
@@ -1072,17 +1006,13 @@ class REFIT_DataBuilder(object):
         return self._get_dataframe(house_indicies[0])
 
     def get_classif_dataset(self, house_indicies):
-        """
-        Process data to build classif dataset
+        """Build a binary classification dataset from NILM windows.
 
-        Return :
-            -Time Series: np.ndarray of size [N_ts, Win_Size]
-            -Associated label for each subsequences: np.ndarray of size [N_ts, 1] in 0 or 1 for each TS
-            -st_date: pandas.Dataframe as :
-                - index: id of each house
-                - column 'start_date': Starting timestamp of each TS
+        Returns:
+            X: np.ndarray [N, L] of aggregate power windows.
+            y: np.ndarray [N] with 1 if appliance was active in the window, else 0.
+            st_date: DataFrame with house IDs as index and 'start_date' column.
         """
-
         nilm_dataset, st_date = self.get_nilm_dataset(house_indicies)
         y = np.zeros(len(nilm_dataset))
 
@@ -1093,27 +1023,13 @@ class REFIT_DataBuilder(object):
         return nilm_dataset[:, 0, 0, :], y, st_date
 
     def get_nilm_dataset(self, house_indicies):
+        """Build the windowed 4D NILM dataset from specified houses.
+
+        Returns:
+            data: np.ndarray [N, M+1, 2, L] where axis 1 index 0 is aggregate,
+                  axis 2 index 0 is power and index 1 is activation status.
+            st_date: DataFrame with house IDs as index and 'start_date' column.
         """
-        Process data to build NILM usecase
-
-        Return :
-            - np.ndarray of size [N_ts, M_appliances, 2, Win_Size] as :
-
-                -1st dimension : nb ts obtained after slicing the total load curve of chosen Houses
-                -2nd dimension : nb chosen appliances
-                                -> indice 0 for aggregate load curve
-                                -> Other appliance in same order as given "appliance_names" list
-                -3rd dimension : access to load curve (values of consumption in Wh) or states of activation
-                                of the appliance (0 or 1 for each time step)
-                                -> indice 0 : access to load curve
-                                -> indice 1 : access to states of activation (0 or 1 for each time step) or Probability (i.e. value in [0, 1]) if soft_label
-                -4th dimension : values
-
-            - pandas.Dataframe as :
-                index: id of each house
-                column 'start_date': Starting timestamp of each TS
-        """
-
         output_data = np.array([])
         st_date = pd.DataFrame()
 
@@ -1139,9 +1055,7 @@ class REFIT_DataBuilder(object):
                     i * self.window_stride : i * self.window_stride + self.window_size,
                 ]
 
-                if not self._check_anynan(
-                    tmp
-                ):  # Check if nan -> skip the subsequences if it's the case
+                if not self._check_anynan(tmp):
                     tmp_list_st_date.append(st_date_stems[i * self.window_stride])
 
                     X[cpt, 0, 0, :] = tmp[0, :]
@@ -1153,7 +1067,7 @@ class REFIT_DataBuilder(object):
                         X[cpt, j, 1, :] = tmp[key + 1, :]
                         key += 2
 
-                    cpt += 1  # Add one subsequence
+                    cpt += 1
 
             tmp_st_date = pd.DataFrame(
                 data=tmp_list_st_date,
@@ -1174,11 +1088,7 @@ class REFIT_DataBuilder(object):
         return output_data, st_date
 
     def _get_stems(self, dataframe):
-        """
-        Extract load curve for each chosen appliances.
-
-        Return : np.ndarray instance
-        """
+        """Extract aggregate + per-appliance power and status into a 2D array."""
         stems = np.empty((1 + (len(self.mask_app) - 1) * 2, dataframe.shape[0]))
         stems[0, :] = dataframe["Aggregate"].values
 
@@ -1220,7 +1130,6 @@ class REFIT_DataBuilder(object):
             off_events = off_events[on_duration >= min_on]
             assert len(on_events) == len(off_events)
 
-        # Filter activations based on minimum continuous points after applying min_on and min_off
         activation_durations = off_events - on_events
         valid_activations = activation_durations >= min_activation_time
         on_events = on_events[valid_activations]
@@ -1232,11 +1141,7 @@ class REFIT_DataBuilder(object):
         return tmp_status
 
     def _get_dataframe(self, indice):
-        """
-        Load houses data and return one dataframe with aggregate and appliance resampled at chosen time step.
-
-        Return : pd.core.frame.DataFrame instance
-        """
+        """Load one house's CSV, merge channels, resample, and compute activation status."""
         file = self.data_path + "CLEAN_House" + str(indice) + ".csv"
         self._check_if_file_exist(file)
         labels_houses = pd.read_csv(self.data_path + "HOUSES_Labels").set_index(
@@ -1258,11 +1163,9 @@ class REFIT_DataBuilder(object):
         house_data.index = pd.to_datetime(house_data.index)
         idx_to_drop = house_data[house_data["Issues"] == 1].index
         house_data = house_data.drop(index=idx_to_drop, axis=0)
-        house_data = (
-            house_data.resample(rule="10s").mean().ffill(limit=9)
-        )  # Resample to minimum of 10sec and ffill for 1min30
-        house_data[house_data < 5] = 0  # Remove small value
-        house_data = house_data.clip(lower=0, upper=self.cutoff)  # Apply general cutoff
+        house_data = house_data.resample(rule="10s").mean().ffill(limit=9)
+        house_data[house_data < 5] = 0
+        house_data = house_data.clip(lower=0, upper=self.cutoff)
         house_data = house_data.sort_index()
 
         if self.flag_week:
@@ -1282,12 +1185,10 @@ class REFIT_DataBuilder(object):
             house_data = house_data[house_data.index >= tmp_min.index[0]]
 
         for appliance in self.mask_app[1:]:
-            # Check if appliance is in this house
             if appliance in house_data:
-                # Replace nan values by -1 during appliance activation status filtering
+                # Temporarily replace NaN with -1 so threshold comparison ignores missing values
                 house_data[appliance] = house_data[appliance].replace(np.nan, -1)
 
-                # Creating status
                 initial_status = (
                     (
                         (
@@ -1313,7 +1214,6 @@ class REFIT_DataBuilder(object):
                 else:
                     house_data[appliance + "_status"] = initial_status
 
-                # Finally replacing nan values put to -1 by nan
                 house_data[appliance] = house_data[appliance].replace(-1, np.nan)
 
         if self.sampling_rate != "10s":
@@ -1343,9 +1243,7 @@ class REFIT_DataBuilder(object):
         return house_data
 
     def _check_appliance_names(self):
-        """
-        Check appliances names for REFIT case.
-        """
+        """Assert all requested appliance names are valid for REFIT."""
         for appliance in self.mask_app:
             assert appliance in [
                 "WashingMachine",
@@ -1357,24 +1255,16 @@ class REFIT_DataBuilder(object):
         return
 
     def _check_if_file_exist(self, file):
-        """
-        Check if file exist at provided path.
-        """
-        if os.path.isfile(file):
-            pass
-        else:
+        """Raise FileNotFoundError if path does not exist."""
+        if not os.path.isfile(file):
             raise FileNotFoundError
-        return
 
     def _check_anynan(self, a):
-        """
-        Fast check of NaN in a numpy array.
-        """
+        """Return True if the array contains any NaN."""
         return np.isnan(np.sum(a))
 
 
-# ===================== REDD DataBuilder =====================#
-# REDD device name mapping to standardized names (compatible with UKDALE)
+
 REDD_APPLIANCE_MAPPING = {
     "dish washer": "dishwasher",
     "washer dryer": "washing_machine",
@@ -1387,10 +1277,8 @@ REDD_APPLIANCE_MAPPING = {
     "waste disposal unit": "waste_disposal",
 }
 
-# Reverse mapping for lookup
 REDD_APPLIANCE_REVERSE_MAPPING = {v: k for k, v in REDD_APPLIANCE_MAPPING.items()}
 
-# REDD appliance aliases
 REDD_APPLIANCE_ALIASES = {
     "fridge": ["freezer", "fridge_freezer"],
     "washing_machine": ["washer_dryer", "washer dryer"],
@@ -1428,7 +1316,7 @@ class REDD_DataBuilder(object):
         soft_label=False,
         use_status_from_kelly_paper=True,
         use_appliance_aliases=True,
-        appliance_params=None,  # External appliance params from config
+        appliance_params=None,
     ):
         self.data_path = data_path
         self.mask_app = mask_app
@@ -1486,7 +1374,6 @@ class REDD_DataBuilder(object):
         self.cutoff = 6000
         self.use_status_from_kelly_paper = use_status_from_kelly_paper
 
-        # Appliance parameters for status detection (compatible with UKDALE)
         if self.use_status_from_kelly_paper:
             self.appliance_param = {
                 "kettle": {
@@ -1544,7 +1431,6 @@ class REDD_DataBuilder(object):
                 "waste_disposal": {"min_threshold": 100, "max_threshold": 1500},
             }
 
-        # Override with external params if provided (from dataset_params.yaml)
         if self._external_appliance_params is not None:
             for app_name, params in self._external_appliance_params.items():
                 app_key = app_name.lower()
@@ -1580,13 +1466,11 @@ class REDD_DataBuilder(object):
         """
         import logging
 
-        # Validate devices for the requested houses
-        if auto_filter_devices and len(self.mask_app) > 1:  # More than just aggregate
+        if auto_filter_devices and len(self.mask_app) > 1:
             try:
                 valid_devices = self.validate_devices_for_houses(
                     house_indicies, auto_filter=True, activity_threshold=0.3
                 )
-                # Update mask_app to only include valid devices + aggregate
                 original_devices = [d for d in self.mask_app if d != "aggregate"]
                 if set(valid_devices) != set(original_devices):
                     self.mask_app = ["aggregate"] + valid_devices
@@ -1718,11 +1602,9 @@ class REDD_DataBuilder(object):
 
         house_data = pd.concat(all_data, ignore_index=True)
 
-        # Rename 'main' to 'aggregate'
         if 'main' in house_data.columns:
             house_data = house_data.rename(columns={'main': 'aggregate'})
 
-        # Map REDD device names to standardized names
         column_mapping = {}
         for col in house_data.columns:
             if col != 'aggregate' and col in REDD_APPLIANCE_MAPPING:
@@ -1730,11 +1612,10 @@ class REDD_DataBuilder(object):
         if column_mapping:
             house_data = house_data.rename(columns=column_mapping)
 
-        # Create time index (assume 1s intervals for REDD)
+        # Synthetic 1s time index (REDD CSV lacks timestamps)
         house_data.index = pd.date_range(start='2011-04-01', periods=len(house_data), freq='1s')
         house_data[house_data < 5] = 0
 
-        # Process each target appliance
         for appliance in self.mask_app[1:]:
             matched_col = None
 
@@ -1779,7 +1660,6 @@ class REDD_DataBuilder(object):
                 house_data[appliance] = 0
                 house_data[appliance + "_status"] = 0
 
-        # Resample to target sampling rate
         if self.sampling_rate != "1s":
             house_data = house_data.resample(self.sampling_rate).mean()
 
@@ -1852,7 +1732,6 @@ class REDD_DataBuilder(object):
             if not csv_files:
                 continue
 
-            # Load data
             all_data = []
             for csv_file in csv_files:
                 df = pd.read_csv(csv_file, index_col=0)
@@ -1863,7 +1742,6 @@ class REDD_DataBuilder(object):
             for col in house_data.columns:
                 if col in ["main", "aggregate", "Unnamed: 0", "index"]:
                     continue
-                # Map to standardized name
                 std_name = REDD_APPLIANCE_MAPPING.get(col, col)
                 if col in house_data.columns:
                     activity = (house_data[col] > 10).mean() * 100
@@ -1871,13 +1749,11 @@ class REDD_DataBuilder(object):
 
             house_devices[house] = devices
 
-        # Find common devices for different house combinations
         common_devices = {}
         house_list = sorted(house_devices.keys())
 
         for n in range(len(house_list), 0, -1):
             for combo in combinations(house_list, n):
-                # Get devices common to all houses in combo with sufficient activity
                 device_sets = []
                 for h in combo:
                     active_devices = {

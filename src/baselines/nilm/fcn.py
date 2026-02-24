@@ -1,19 +1,18 @@
-"""FCN baseline -- CondiNILM.
+"""FCN: Fully convolutional network for non-intrusive load monitoring.
 
-Author: Siyi Li
+Five 1D conv+ReLU layers, a flattened fully connected layer with dropout,
+and a linear output. Supports both seq2seq and seq2point modes.
+
+Reference: Zhang et al., "Sequence-to-point learning with neural networks
+for non-intrusive load monitoring", AAAI, 2018.
 """
 import torch
 import torch.nn as nn
 
 
-# ======================= Simple Fully Convolutional Network (Zhang, AAAI 2018) =======================#
 class FCN(nn.Module):
     def __init__(self, window_size, c_in=1, downstreamtask="seq2seq"):
-        """
-        FCN Pytorch implementation as described in the original paper "Sequence-to-point learning with neural networks for non-intrusive load monitoring".
-
-        Plain Fully Convolutional Neural Network Architecture
-        """
+        """Initialize FCN with five conv layers and a linear head."""
         super().__init__()
         self.downstreamtask = downstreamtask
 

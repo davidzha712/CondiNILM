@@ -1,6 +1,12 @@
-"""DResNet and DAResNet baselines -- CondiNILM.
+"""DResNet and DAResNet: Dilated residual network baselines for NILM.
 
-Author: Siyi Li
+DResNet uses four groups of dilated residual blocks (inspired by ResNet-34).
+DAResNet extends DResNet with an attention branch parallel to the third group.
+
+References:
+- Xia et al., "Non-intrusive load disaggregation based on deep dilated
+  residual network".
+- Xia et al., "Dilated residual attention network for load disaggregation".
 """
 import torch
 import torch.nn as nn
@@ -141,11 +147,7 @@ class AttentionBranch(nn.Module):
 
 
 class DResNet(nn.Module):
-    """
-    DResNet Pytorch implementation as described in the original paper "Non-intrusive load disaggregation based on deep dilated residual network, Min Xia et al.".
-
-    Inspired by ResNet-34, the architecture use 4 residual groups with a dilation parameter.
-    """
+    """Dilated ResNet for NILM with four dilated residual groups and a linear head."""
 
     def __init__(self, window_size=128, c_in=1, kernel_size=3):
         super(DResNet, self).__init__()
@@ -201,16 +203,11 @@ class DResNet(nn.Module):
 
 
 class DAResNet(nn.Module):
-    """
-    DAResNet Pytorch implementation as described in the original paper "Dilated residual attention network for load disaggregation".
-
-    As DResNet, the architecture is based on ResNet34, the only difference is the use of forward attention mechanism in parrallel of the 3rd dilated convolutional group.
-    """
+    """Dilated Attention ResNet: DResNet with an attention branch parallel to the third group."""
 
     def __init__(self, window_size=128, c_in=1, kernel_size=3):
         super(DAResNet, self).__init__()
 
-        # According to original ResNet34 architecture kernel size in the first Conv set to 7
         self.input_conv = nn.Conv1d(
             in_channels=c_in, out_channels=30, kernel_size=7, padding=3
         )

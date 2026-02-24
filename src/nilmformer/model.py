@@ -14,27 +14,21 @@ from src.nilmformer.config import NILMFormerConfig
 
 class SimpleDeviceHead(nn.Module):
     """
-    Ultra-simple direct predictor for two-state devices (Kettle, Microwave).
+    Direct predictor for two-state sparse devices (e.g. Kettle, Microwave).
 
-    RESEARCH FINDING: Simple models achieve F1 > 0.9 on these devices because:
-    1. NO instance normalization - preserves sparse peak amplitude
-    2. NO attention mechanism - no smoothing of sharp transitions
-    3. Direct signal → output mapping - learns exact ON/OFF patterns
-
-    This is intentionally SIMPLE. Complexity hurts simple devices.
+    Operates on raw (un-normalized) aggregate signal to preserve amplitude.
 
     Architecture (per device):
-    - Input: Raw aggregate signal (NO normalization!)
-    - 3-layer CNN for pattern detection
-    - Separate classification head (ON/OFF) and regression head (power)
-    - Hard gating during inference ensures TRUE ZEROS
+    - 2-layer shared CNN feature extractor (Conv1d -> ReLU -> Conv1d -> ReLU)
+    - Per-device classification head (ON/OFF logit)
+    - Per-device regression head (power amplitude)
+    - Soft gating (smoothstep) during training, hard gating during inference
     """
     def __init__(self, d_in=1, hidden_dim=64, n_devices=2):
         super().__init__()
         self.n_devices = n_devices
 
-        # Shared feature extractor - VERY SIMPLE
-        # Key: No normalization, no complex operations
+        # Shared 2-layer CNN feature extractor (no normalization layers)
         self.shared_conv = nn.Sequential(
             nn.Conv1d(d_in, hidden_dim, kernel_size=5, padding=2),
             nn.ReLU(),
@@ -56,11 +50,9 @@ class SimpleDeviceHead(nn.Module):
         ])
 
         # Per-device learnable parameters
-        # Amplitude scale: learns typical ON power for each device
-        # NOTE: Initialize to 2.0 so softplus(2.0) ≈ 2.13, allowing larger initial outputs
-        # Previous value of 1.0 gave softplus(1.0) ≈ 1.31, which limited peak prediction
+        # Amplitude scale: passed through softplus to stay positive (init 2.0 -> softplus ~ 2.13)
         self.amplitude_scales = nn.Parameter(torch.full((n_devices,), 2.0))
-        # Classification threshold
+        # Classification threshold: passed through sigmoid then mapped to [0.3, 0.7]
         self.cls_thresholds = nn.Parameter(torch.zeros(n_devices))
 
         self._init_weights()
@@ -74,18 +66,16 @@ class SimpleDeviceHead(nn.Module):
 
     def forward_device(self, x, device_idx, training=None, return_ungated=False):
         """
-        Forward for single device.
+        Forward pass for a single device.
 
         Args:
-            x: (B, 1, L) raw aggregate signal - NOT NORMALIZED!
-            device_idx: which device
-            training: override training mode
-            return_ungated: if True, return raw amplitude without internal gate.
-                Used by forward_with_gate so trainer's _apply_soft_gate is the ONLY gate,
-                preventing double-gating that causes sparse device collapse.
+            x: (B, 1, L) raw aggregate signal (not instance-normalized)
+            device_idx: index of the device head to use
+            training: if not None, overrides self.training to select gating mode
+            return_ungated: if True, return raw amplitude before any gating is applied
 
         Returns:
-            power: (B, 1, L) predicted power
+            power: (B, 1, L) predicted power (gated unless return_ungated=True)
             cls_logit: (B, 1, L) classification logits
         """
         if training is None:
@@ -93,7 +83,7 @@ class SimpleDeviceHead(nn.Module):
 
         head = self.device_heads[device_idx]
 
-        # Shared features - simple convolutions
+        # Shared feature extraction
         feat = self.shared_conv(x)
 
         # Classification branch: Is the device ON?
@@ -109,8 +99,7 @@ class SimpleDeviceHead(nn.Module):
         amplitude = F.relu(power_raw) * F.softplus(self.amplitude_scales[device_idx])
 
         if return_ungated:
-            # Return raw amplitude for external gating (trainer's _apply_soft_gate).
-            # This eliminates double-gating that suppresses sparse devices.
+            # Return raw amplitude before any gating is applied
             return amplitude, cls_logit
 
         # Classification probability
@@ -144,12 +133,15 @@ class SimpleDeviceHead(nn.Module):
 
 class SparseDeviceCNN(nn.Module):
     """
-    Wrapper for backward compatibility. Uses SimpleDeviceHead internally.
+    Backward-compatible wrapper around SimpleDeviceHead.
+
+    Translates use_hard_gate into SimpleDeviceHead's training flag
+    and exposes per-device and batch forward methods.
     """
     def __init__(self, d_in, d_model, n_sparse_devices=2, kernel_size=5):
         super().__init__()
         self.n_sparse_devices = n_sparse_devices
-        # Use the simpler, more effective architecture
+        # Delegates to SimpleDeviceHead for all computation
         self.simple_head = SimpleDeviceHead(d_in=d_in, hidden_dim=d_model, n_devices=n_sparse_devices)
 
     def forward_device(self, x, device_idx, use_hard_gate=None, return_ungated=False):
@@ -194,17 +186,11 @@ class NILMFormer(nn.Module):
         d_model = NFConfig.d_model
 
         # ============ Device Task Mode Configuration ============#
-        # KEY INSIGHT from NILM research: For simple two-state devices (Kettle/Microwave),
-        # CLASSIFICATION-BASED learning outperforms REGRESSION-BASED learning.
-        # Reference: "Deep Learning-Based Energy Disaggregation and On/Off Detection"
-        #
-        # Device modes:
-        # - "regression": Standard power regression (for complex multi-state devices)
-        # - "classification_first": Binary ON/OFF classification, then power regression only for ON
-        #
-        # This allows the SAME Transformer to handle both device types optimally!
+        # Per-device task modes:
+        # - "regression": standard power regression (multi-state devices)
+        # - "classification_first": binary ON/OFF classification, then power regression
         self.sparse_device_indices = []
-        sparse_device_names = getattr(NFConfig, "sparse_device_names", ["kettle"])  # V14: removed microwave - CNN bypass feeds raw aggregate, causing MW to learn aggregate identity
+        sparse_device_names = getattr(NFConfig, "sparse_device_names", ["kettle"])  # Default sparse device for CNN bypass
         self.sparse_device_names = [n.lower() for n in sparse_device_names]
 
         # Device task modes: "regression" or "classification_first"
@@ -215,13 +201,11 @@ class NILMFormer(nn.Module):
         # Will be set from device_stats during training
         self.register_buffer("device_mean_on_power", torch.ones(c_out))
 
-        # CNN bypass module for sparse devices - operates on raw input
-        # Maximum number of sparse devices (Kettle, Microwave, etc.)
+        # CNN bypass module for sparse devices, operates on raw (un-normalized) input
         self.max_sparse_devices = 2
         self.sparse_cnn = SparseDeviceCNN(d_in=c_in, d_model=d_model, n_sparse_devices=self.max_sparse_devices, kernel_size=5)
 
-        # Learnable blend weight per device: 0=use transformer, 1=use CNN
-        # Initialize sparse devices to prefer CNN path
+        # Learnable blend logit per device (not used in current forward; reserved for blending)
         self.cnn_blend_logit = nn.Parameter(torch.zeros(c_out))
 
         # ============ Embedding ============#
@@ -321,15 +305,14 @@ class NILMFormer(nn.Module):
             self.device_embed = nn.Embedding(c_out, film_hidden_dim)
             self.film_fc1 = nn.Linear(d_feat + film_hidden_dim, film_hidden_dim)
             self.film_fc2 = nn.Linear(film_hidden_dim, 2)
-            # Device-specific encoder FiLM: each device gets independent encoder modulation
+            # Per-device encoder FiLM layers (outputs averaged across devices in forward)
             self.encoder_device_embed = nn.Embedding(c_out, film_hidden_dim)
             self.encoder_film_fc1 = nn.Linear(d_feat + film_hidden_dim, film_hidden_dim)
             self.encoder_film_fc2 = nn.Linear(
                 film_hidden_dim, n_encoder_layers * 2 * d_model
             )
 
-        # Device-specific adapter layers to reduce gradient conflict
-        # Each device gets a small adapter after SharedHead
+        # Per-device adapter: bottleneck Conv1d(d_model -> d_model//2 -> d_model) applied after SharedHead
         self.device_adapters = nn.ModuleList([
             nn.Sequential(
                 nn.Conv1d(d_model, d_model // 2, kernel_size=1),
@@ -341,40 +324,35 @@ class NILMFormer(nn.Module):
 
         # ============ Initialize Weights ============#
         self.initialize_weights()
-        # NOTE: Previous bias=-1.0 caused Softplus output to be very small (softplus(-1)≈0.31)
-        # This prevented the model from predicting high peak values.
-        # FIX: Use small negative bias (-0.3) to allow larger initial outputs while still
-        # preventing explosive outputs. softplus(-0.3) ≈ 0.55, much better for peak prediction.
+        # Initialize PowerHead bias to small negative value for conservative initial outputs
         if hasattr(self, "PowerHead"):
             if self.PowerHead.bias is not None:
-                nn.init.constant_(self.PowerHead.bias, -0.3)  # Changed from -1.0
+                nn.init.constant_(self.PowerHead.bias, -0.3)
         if self.type_power_heads is not None:
             for head in self.type_power_heads:
                 if head.bias is not None:
-                    nn.init.constant_(head.bias, -0.3)  # Changed from -1.0
+                    nn.init.constant_(head.bias, -0.3)
 
     def set_sparse_device_indices(self, device_names, device_stats=None):
         """
-        Set which device indices should use special handling for sparse devices.
+        Identify sparse devices by name and configure their CNN bypass and task mode.
 
-        This configures BOTH:
-        1. CNN bypass path (for direct amplitude preservation)
-        2. Classification-first task mode (research shows this beats regression for sparse devices)
+        For each device whose name matches self.sparse_device_names:
+        - Adds its index to self.sparse_device_indices
+        - Sets cnn_blend_logit to 2.0 (sigmoid ~ 0.88)
+        - Sets task mode to "classification_first"
+        - Optionally stores mean ON power from device_stats
 
         Args:
-            device_names: list of device names in order (e.g., ["washing_machine", "dishwasher", "kettle", "microwave", "fridge"])
-            device_stats: optional list of dicts with device statistics including 'mean_on' power
+            device_names: list of device names in order
+            device_stats: optional list of dicts with 'mean_on' key
         """
         self.sparse_device_indices = []
         for idx, name in enumerate(device_names):
             if name.lower() in self.sparse_device_names:
                 self.sparse_device_indices.append(idx)
-                # Initialize blend weight to prefer CNN for sparse devices
                 with torch.no_grad():
-                    self.cnn_blend_logit.data[idx] = 2.0  # sigmoid(2) ≈ 0.88, strong CNN preference
-
-                # Set task mode to classification_first for sparse devices
-                # This is the KEY insight: classification beats regression for simple ON/OFF devices
+                    self.cnn_blend_logit.data[idx] = 2.0  # sigmoid(2) ~ 0.88
                 self.device_task_modes[idx] = "classification_first"
 
                 # Set mean ON power for amplitude estimation
@@ -385,14 +363,15 @@ class NILMFormer(nn.Module):
 
     def set_device_task_modes(self, device_names, device_stats=None):
         """
-        Configure task mode for each device based on its characteristics.
+        Configure task mode for each device based on its name.
 
-        Research finding: "For the task of on/off detection, the classification-based
-        learning framework outperforms the regression-based learning framework."
+        Devices in self.sparse_device_names get "classification_first" mode;
+        all others get "regression" mode. Also updates device_mean_on_power
+        from device_stats if provided.
 
         Args:
             device_names: list of device names
-            device_stats: list of dicts with 'duty_cycle', 'mean_on', etc.
+            device_stats: optional list of dicts with 'mean_on' key
         """
         for idx, name in enumerate(device_names):
             name_lower = name.lower()
@@ -468,22 +447,21 @@ class NILMFormer(nn.Module):
         gb = self.film_fc2(h)
         raw_gamma = gb[..., 0:1]
         raw_beta = gb[..., 1:2]
-        # Increased FiLM range from ±0.1 to ±0.5 for better power range adaptation
+        # FiLM modulation clamped to [-0.5, 0.5]
         gamma = 0.5 * torch.tanh(raw_gamma)
         beta = 0.5 * torch.tanh(raw_beta)
         return gamma, beta
 
     def _compute_encoder_film_params(self, x_main):
         """
-        Compute device-specific encoder FiLM parameters.
+        Compute per-device, per-layer encoder FiLM parameters from condition features.
 
-        CRITICAL FIX: Now computes independent FiLM parameters for each device,
-        preventing the "robbing Peter to pay Paul" problem where optimizing
-        one device hurts another.
+        Concatenates condition features with per-device embeddings, then projects
+        to produce gamma/beta for each encoder layer, clamped to [-0.5, 0.5].
 
         Returns:
-            gamma: (B, n_devices, n_layers, d_model) - per-device, per-layer gamma
-            beta: (B, n_devices, n_layers, d_model) - per-device, per-layer beta
+            gamma: (B, C_out, n_layers, d_model)
+            beta: (B, C_out, n_layers, d_model)
         """
         if not self.use_film:
             return None, None
@@ -493,7 +471,6 @@ class NILMFormer(nn.Module):
         d_model = self.NFConfig.d_model
         C_out = self.NFConfig.c_out
 
-        # Get device embeddings for ALL devices
         device_ids = torch.arange(C_out, device=x_main.device)
         dev_emb = self.encoder_device_embed(device_ids)  # (C_out, film_hidden_dim)
         dev_emb = dev_emb.unsqueeze(0).expand(B, -1, -1)  # (B, C_out, film_hidden_dim)
@@ -512,7 +489,7 @@ class NILMFormer(nn.Module):
         raw_gamma = gb[:, :, :, 0, :]  # (B, C_out, n_layers, d_model)
         raw_beta = gb[:, :, :, 1, :]   # (B, C_out, n_layers, d_model)
 
-        # Increased FiLM range from ±0.1 to ±0.5 for better power range adaptation
+        # FiLM modulation clamped to [-0.5, 0.5]
         gamma = 0.5 * torch.tanh(raw_gamma)
         beta = 0.5 * torch.tanh(raw_beta)
         return gamma, beta
@@ -526,7 +503,7 @@ class NILMFormer(nn.Module):
             self.output_stats_std_max = float(std_max)
 
     def initialize_weights(self):
-        """Initialize nn.Linear and nn.LayerNorm weights."""
+        """Initialize nn.Linear, nn.Conv1d, and nn.LayerNorm weights."""
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
@@ -535,7 +512,6 @@ class NILMFormer(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.Conv1d):
-            # Initialize Conv1d layers properly
             torch.nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
@@ -567,18 +543,13 @@ class NILMFormer(nn.Module):
         x_input = x_main_original
 
         # === Per-Device CNN Bypass for Sparse Devices === #
-        # Compute CNN predictions BEFORE instance normalization to preserve amplitude
-        # Each sparse device gets its own CNN head to avoid gradient interference
-        # CRITICAL: Use hard gating during inference to ensure true zeros for OFF state
+        # CNN operates on raw input before instance normalization
         cnn_powers = None
         if self.sparse_device_indices:
-            # During training: soft gating for gradient flow
-            # During inference: hard gating for true zeros
             use_hard_gate = not self.training
             cnn_powers, _ = self.sparse_cnn.forward_all(x_main_original, return_gate=True, use_hard_gate=use_hard_gate)
 
         # === Instance Normalization === #
-        # Use standard normalization but pass original stats to preserve amplitude info
         inst_mean = torch.mean(x_input, dim=-1, keepdim=True).detach()
         inst_std = torch.sqrt(
             torch.var(x_input, dim=-1, keepdim=True, unbiased=False) + 1e-6
@@ -604,8 +575,7 @@ class NILMFormer(nn.Module):
         )
         for idx, layer in enumerate(self.encoder_layers):
             if encoder_gamma is not None and encoder_beta is not None:
-                # Use mean across devices for shared encoder (balanced approach)
-                # Shape: encoder_gamma is (B, C_out, n_layers, d_model)
+                # Average per-device FiLM params across devices for this layer
                 gamma_l = encoder_gamma[:, :, idx, :].mean(dim=1).unsqueeze(1)  # (B, 1, d_model)
                 beta_l = encoder_beta[:, :, idx, :].mean(dim=1).unsqueeze(1)    # (B, 1, d_model)
                 x_input = layer(x_input, gamma=gamma_l, beta=beta_l)
@@ -617,25 +587,20 @@ class NILMFormer(nn.Module):
         x_enc = x_enc.permute(0, 2, 1)
         shared_feat = self.SharedHead(x_enc)
 
-        # Apply device-specific adapters BEFORE the prediction heads
-        # This reduces gradient conflict between devices
+        # Apply per-device adapters with residual connection
         B, D, L = shared_feat.shape
         c_out = self.NFConfig.c_out
         adapted_feats = []
         for dev_idx in range(c_out):
-            # Each device gets its own adapted feature
             adapted = self.device_adapters[dev_idx](shared_feat)  # (B, D, L)
-            # Residual connection - increased from 0.1 to 0.4 for stronger device-specific adaptation
+            # Residual connection with 0.4 scaling
             adapted = shared_feat + 0.4 * adapted
             adapted_feats.append(adapted)
 
         gamma, beta = self._compute_film_params(x_main=x_main_original)
 
         if self.type_ids is None or self.type_power_heads is None:
-            # V6 FIX: Stack per-device adapted features and batch the PowerHead call.
-            # Previous: averaged all adapted features, destroying device-specific info.
-            # Now: each device channel uses its own adapted features through PowerHead.
-            # We stack along batch dim to compute all devices in one PowerHead call.
+            # Stack per-device adapted features along batch dim for a single PowerHead call
             stacked = torch.stack(adapted_feats, dim=1)  # (B, c_out, D, L)
             stacked_flat = stacked.reshape(B * c_out, D, L)  # (B*c_out, D, L)
             all_power = self.PowerHead(stacked_flat)  # (B*c_out, c_out, L)
@@ -659,7 +624,7 @@ class NILMFormer(nn.Module):
 
         if gamma is not None and beta is not None:
             power_raw = (1.0 + gamma) * power_raw + beta
-        # ReLU: clean zeros in OFF state, constant gradient for peaks (better than softplus)
+        # ReLU activation to ensure non-negative power output
         transformer_power = F.relu(power_raw)
 
         alpha = float(getattr(self, "output_stats_alpha", 0.0))
@@ -674,13 +639,8 @@ class NILMFormer(nn.Module):
             std = torch.clamp(std, min=1e-3)
             transformer_power = transformer_power * std + mean
 
-        # === Per-Device Task Mode Handling === #
-        # RESEARCH INSIGHT: For simple two-state devices, classification beats regression.
-        # We now support two modes per device:
-        # - "regression": Standard power regression (complex multi-state devices)
-        # - "classification_first": Binary ON/OFF classification, then power only for ON
-        #
-        # Additionally, sparse devices can use CNN bypass for better amplitude preservation.
+        # === Per-Device Output Assembly === #
+        # Sparse devices use CNN bypass; non-sparse devices use Transformer output.
 
         if cnn_powers is not None and self.sparse_device_indices:
             power_list = []
@@ -689,21 +649,17 @@ class NILMFormer(nn.Module):
                 task_mode = self.device_task_modes[dev_idx] if dev_idx < len(self.device_task_modes) else "regression"
 
                 if dev_idx in self.sparse_device_indices:
-                    # Use per-device CNN output
                     cnn_power = cnn_powers[sparse_idx]
                     sparse_idx += 1
 
-                    # For classification_first mode during inference: apply hard thresholding
+                    # In classification_first mode at inference, zero out values below noise floor
                     if task_mode == "classification_first" and not self.training:
-                        # Hard threshold: output is either 0 or the CNN power
-                        # This ensures TRUE ZEROS during OFF state
-                        threshold = 0.05  # 5% of normalized signal is noise floor
+                        threshold = 0.05
                         hard_mask = (cnn_power > threshold).float()
                         cnn_power = hard_mask * cnn_power
 
                     power_list.append(cnn_power)
                 else:
-                    # Use Transformer for non-sparse devices
                     power_list.append(transformer_power[:, dev_idx:dev_idx+1, :])
             power = torch.cat(power_list, dim=1)
         else:
@@ -713,21 +669,20 @@ class NILMFormer(nn.Module):
 
     def forward_with_gate(self, x):
         """
-        Forward pass with gate outputs for training.
+        Forward pass returning both power predictions and gate logits.
 
-        Returns raw power and gate logits; the loss function decides how to use them.
+        Returns:
+            power: (B, C_out, L) predicted power
+            gate: (B, C_out, L) gate logits (pre-sigmoid)
         """
         encoding = x[:, 1:, :]
         x_main_original = x[:, :1, :]
 
         # === Per-Device CNN Bypass for Sparse Devices === #
-        # Each sparse device gets its own CNN to avoid gradient interference
-        # CRITICAL: Always use soft gating during training for gradient flow
         cnn_powers = None
         cnn_gates = None
         if self.sparse_device_indices:
-            # Return UNGATED amplitude so trainer's _apply_soft_gate is the ONLY gate.
-            # This eliminates double-gating that caused sparse device collapse.
+            # Return ungated amplitude; external caller handles gating
             cnn_powers, cnn_gates = self.sparse_cnn.forward_all(x_main_original, return_gate=True, use_hard_gate=False, return_ungated=True)
 
         inst_mean = torch.mean(x_main_original, dim=-1, keepdim=True).detach()
@@ -749,7 +704,7 @@ class NILMFormer(nn.Module):
         )
         for idx, layer in enumerate(self.encoder_layers):
             if encoder_gamma is not None and encoder_beta is not None:
-                # Use mean across devices for shared encoder
+                # Average per-device FiLM params across devices for this layer
                 gamma_l = encoder_gamma[:, :, idx, :].mean(dim=1).unsqueeze(1)
                 beta_l = encoder_beta[:, :, idx, :].mean(dim=1).unsqueeze(1)
                 x_enc = layer(x_enc, gamma=gamma_l, beta=beta_l)
@@ -766,13 +721,13 @@ class NILMFormer(nn.Module):
         adapted_feats = []
         for dev_idx in range(c_out):
             adapted = self.device_adapters[dev_idx](shared_feat)
-            adapted = shared_feat + 0.4 * adapted  # Residual connection (same as forward)
+            adapted = shared_feat + 0.4 * adapted  # Residual connection
             adapted_feats.append(adapted)
 
         gamma, beta = self._compute_film_params(x_main=x_main_original)
 
         if self.type_ids is None or self.type_power_heads is None:
-            # V6 FIX: Stack per-device adapted features and batch PowerHead/GateHead
+            # Stack per-device adapted features for batched PowerHead/GateHead calls
             stacked = torch.stack(adapted_feats, dim=1)  # (B, c_out, D, L)
             stacked_flat = stacked.reshape(B * c_out, D, L)
             all_power = self.PowerHead(stacked_flat).reshape(B, c_out, c_out, L)
@@ -803,7 +758,7 @@ class NILMFormer(nn.Module):
         alpha = float(getattr(self, "output_stats_alpha", 0.0))
         mean_max = float(getattr(self, "output_stats_mean_max", 0.0))
         std_max = float(getattr(self, "output_stats_std_max", 0.0))
-        # ReLU: clean zeros in OFF state, constant gradient for peaks
+        # ReLU activation to ensure non-negative power output
         transformer_power = F.relu(power_raw)
         if alpha > 0.0 and (mean_max > 0.0 or std_max > 0.0):
             stats_out = self.ProjStats2(stats_feat).float()
@@ -814,22 +769,16 @@ class NILMFormer(nn.Module):
             std = torch.clamp(std, min=1e-3)
             transformer_power = transformer_power * std + mean
 
-        # === Per-Device CNN-only path for sparse devices === #
-        # KEY INSIGHT: Simple CNNs achieve F1>0.9 on Kettle/Microwave because:
-        # 1. No instance normalization compressing sparse signals
-        # 2. No attention smoothing/averaging peaks
-        # 3. Direct supervised learning without complex gating
-        #
-        # Strategy: COMPLETELY BYPASS Transformer for sparse devices.
-        # Each sparse device uses its OWN dedicated CNN to avoid gradient interference.
+        # === Per-Device Output Assembly === #
+        # Sparse devices use CNN bypass; non-sparse devices use Transformer output.
         if cnn_powers is not None and self.sparse_device_indices:
-            # Build output by selecting per-device CNN for sparse devices, Transformer for others
+            # Assemble per-device outputs: CNN for sparse, Transformer for others
             power_list = []
             gate_list = []
             sparse_idx = 0  # Index into cnn_powers/cnn_gates lists
             for dev_idx in range(c_out):
                 if dev_idx in self.sparse_device_indices:
-                    # Use per-device CNN ungated amplitude; trainer's _apply_soft_gate handles gating
+                    # CNN bypass: ungated amplitude + gate logits
                     power_list.append(cnn_powers[sparse_idx])
                     gate_list.append(cnn_gates[sparse_idx])  # CNN's cls_logit for gating
                     sparse_idx += 1
@@ -846,42 +795,31 @@ class NILMFormer(nn.Module):
 
     def forward_gated(self, x, gate_mode="soft", gate_threshold=0.5, soft_scale=1.0):
         """
-        Forward pass with gating for inference.
-
-        It is recommended to use the "soft" mode to avoid hard gating driving
-        the outputs to exactly zero.
+        Forward pass that applies gating to the power output.
 
         Args:
             x: input sequence (B, 1+e, L)
-            gate_mode: gating mode
-                - "none": no gating, return power directly (recommended for debugging)
-                - "soft": soft gating, power * sigmoid(gate * soft_scale)
-                - "soft_relu": soft gating with ReLU to ensure non-negative outputs
-                - "hard": hard gating, zero out positions below threshold (not recommended)
-            gate_threshold: hard-gating threshold (used only in "hard" mode)
-            soft_scale: scaling factor for soft gating (larger => closer to hard gating)
+            gate_mode: gating strategy
+                - "none": return power without gating
+                - "soft": power * sigmoid(gate * soft_scale) (default)
+                - "soft_relu": same as "soft" (both apply sigmoid gating)
+                - "hard": binarize gate at gate_threshold, then multiply
+            gate_threshold: threshold for "hard" mode (default 0.5)
+            soft_scale: temperature for sigmoid in soft modes (larger = sharper)
 
         Returns:
-            gated_power: gated power prediction (B, C_out, L)
+            gated_power: (B, C_out, L) gated power prediction
         """
         power, gate = self.forward_with_gate(x)
 
         if gate_mode == "none":
-            # No gating; return raw power (for debugging)
             return power
 
         gate_prob = torch.sigmoid(gate * soft_scale)
 
         if gate_mode == "hard":
-            # Hard gating: binarize gate (not recommended, may lead to all-zero outputs)
             gate_mask = (gate_prob > gate_threshold).float()
             return power * gate_mask
 
-        elif gate_mode == "soft_relu":
-            # Soft gating with ReLU
-            return power * gate_prob
-
-        else:  # "soft"
-            # Soft gating (recommended)
-            # Use soft gating and let the model learn appropriate behavior
+        else:  # "soft" or "soft_relu"
             return power * gate_prob

@@ -1,20 +1,22 @@
-"""CNN1D baseline -- CondiNILM.
+"""CNN1D: 1D convolutional model for multi-task NILM.
 
-Author: Siyi Li
+Four strided 1D conv layers with BatchNorm and PReLU, followed by adaptive
+average pooling and two MLP heads for power quantile regression and appliance
+state classification.
+
+Reference: Martins et al., "Multi-label learning for appliance recognition in
+NILM using Fryze-current decomposition and convolutional neural network".
+Code adapted from: https://github.com/sambaiga/UNETNiLM
 """
 import torch
 from torch import nn
 
 
 class CNN1D(nn.Module):
-    """
-    Baseline 1D CNN implementation
-    """
-
     def __init__(
         self,
         window_size=128,
-        quantiles=[0.5],  # [0.0025,0.1, 0.5, 0.9, 0.975]
+        quantiles=[0.5],
         c_in=1,
         num_classes=1,
         dropout=0.1,
@@ -22,22 +24,17 @@ class CNN1D(nn.Module):
         return_values="power",
         verbose_loss=False,
     ):
-        """
-        CNN1D-NILM Pytorch implementation as described in the original paper "Multi-label learning for appliance recognition in NILM using Fryze-current decomposition and convolutional neural network".
-
-        Code adapted from: https://github.com/sambaiga/UNETNiLM
+        """Initialize CNN1D with strided convolutions, adaptive pooling, and dual output heads.
 
         Args:
-            window_size (int) : window size of the input
-            quantiles (int) : number of quantiles used
-            in_channels (int) : number of input channels
-            dropout (float) : Dropout probability
-            num_classes (int) : number of output classes / appliances
-            pooling_size (int) : size of global average pooling filter
-            return_values (str) : 'power', 'states' or 'both' -> return if tuple
-            verbose loss
-        Returns:
-            model (CNN1D) : CNN1D model object
+            window_size: Length of the input time window.
+            quantiles: List of quantile values for power regression output.
+            c_in: Number of input channels.
+            num_classes: Number of output appliances.
+            dropout: Dropout probability.
+            pooling_size: Output size of adaptive average pooling.
+            return_values: 'power', 'states', or 'both'.
+            verbose_loss: If True, return individual loss components.
         """
         super(CNN1D, self).__init__()
 
@@ -149,14 +146,14 @@ class CNN1D(nn.Module):
         return q_loss + bce_loss, q_loss, bce_loss
 
     def quantile_regression_loss(self, inputs, targets):
-        """
-        Function that computes the quantile regression loss
+        """Compute pinball (quantile regression) loss.
 
-        Arguments:
-            y_hat (torch.Tensor) : Shape (B x T x N x M) model regression predictions
-            y (torch.Tensor) : Shape (B x T x M) ground truth targets
+        Args:
+            inputs: Predicted quantiles, shape (B, T, N_quantiles, M).
+            targets: Ground truth targets, shape (B, T, M).
+
         Returns:
-            loss (float): value of quantile regression loss
+            Scalar mean quantile loss.
         """
         targets = targets.unsqueeze(2).expand_as(inputs)
         quantiles = self.quantiles.to(targets.device)
@@ -164,6 +161,3 @@ class CNN1D(nn.Module):
         loss = torch.max(quantiles * error, (quantiles - 1) * error)
 
         return loss.mean()
-
-
-        return total_loss

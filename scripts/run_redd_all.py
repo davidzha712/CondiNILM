@@ -1,7 +1,4 @@
-"""Batch REDD training across appliances -- CondiNILM.
-
-Author: Siyi Li
-"""
+"""Batch REDD training across appliances -- CondiNILM."""
 
 import os
 import sys
@@ -19,8 +16,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-# REDD appliances and their availability across houses
-# NOTE: Houses selected based on actual data availability analysis (see analyze_redd_devices.py)
+# REDD appliances and their availability across houses.
+# Houses selected based on data availability analysis (see analyze_redd_devices.py).
 #
 # Device availability by house (activity > 0.3%):
 #   - fridge: houses 1,2,3,5,6 (house 4 has no fridge column)
@@ -33,7 +30,7 @@ logger = logging.getLogger(__name__)
 #   - cooker: sparse in all houses (<0.5%)
 #
 # Best multi-device configurations:
-#   - Houses 1,2,3: fridge, microwave, dishwasher (3 devices, RECOMMENDED)
+#   - Houses 1,2,3: fridge, microwave, dishwasher (3 devices, best coverage)
 #   - Houses 1,3: fridge, microwave, dishwasher, washing_machine (4 devices)
 #   - Houses 3,5: fridge, microwave, electric_furnace, ce_appliance (4 devices)
 #
@@ -128,7 +125,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Determine appliances to train
     if "all" in args.appliances:
         appliances = list(REDD_APPLIANCES.keys())
     else:
@@ -143,7 +139,6 @@ def main():
         success = run_single_appliance(appliance, args)
         results[appliance] = "OK" if success else "FAIL"
 
-    # Summary
     logger.info("\n" + "=" * 60)
     logger.info("TRAINING SUMMARY")
     logger.info("=" * 60)

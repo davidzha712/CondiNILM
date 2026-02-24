@@ -1,15 +1,15 @@
 """Generate final paper-style results tables.
 
 Structure:
-1. UKDALE Single-Device Overall (chapter5 Table 5.1)
-2. UKDALE Single-Device Per-Device (all models, V9 + README fallback)
-3. UKDALE Per-Device: CondiNILMFormer vs NILMFormer (chapter5 Table 5.2)
-4. UKDALE Multi-Device Joint Training (V8.1, CondiNILMFormer only)
-5. Single vs Multi-Device Comparison (chapter5 Table 5.3)
-6. Ablation Study (V9 + chapter5)
-7. REFIT Single-Device Per-Device (all models, V9 + README fallback)
-8. REFIT Per-Device: CondiNILMFormer vs NILMFormer (chapter5 Table 5.4)
-9. REFIT Multi-Device (V8.1, CondiNILMFormer only)
+1. UKDALE Single-Device Overall (Table 5.1)
+2. UKDALE Single-Device Per-Device (all models)
+3. UKDALE Per-Device: CondiNILMFormer vs NILMFormer (Table 5.2)
+4. UKDALE Multi-Device Joint Training (CondiNILMFormer only)
+5. Single vs Multi-Device Comparison (Table 5.3)
+6. Ablation Study
+7. REFIT Single-Device Per-Device (all models)
+8. REFIT Per-Device: CondiNILMFormer vs NILMFormer (Table 5.4)
+9. REFIT Multi-Device (CondiNILMFormer only)
 """
 import json, os
 
@@ -50,16 +50,12 @@ def fmtm(v, m):
     return fmt(v, 3)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# README data: original NILMFormer paper results (UKDALE 1min/128)
-# Columns: MAE, MSE, RMSE, TECA, NDE, SAE, MR, ACC, BACC, PREC, REC, F1
-# ═══════════════════════════════════════════════════════════════════════
 def _r(mae, mse, rmse, teca, nde, sae, mr, acc, bacc, prec, rec, f1):
+    """Build a 12-metric result dict from positional values."""
     return {"MAE":mae,"MSE":mse,"RMSE":rmse,"TECA":teca,"NDE":nde,"SAE":sae,
             "MR":mr,"ACCURACY":acc,"BALANCED_ACCURACY":bacc,"PRECISION":prec,
             "RECALL":rec,"F1_SCORE":f1}
 
-# UKDALE 1min/128 per-device from README
 README_UK = {
     "NILMFormer": {
         "Kettle":         _r(9.665,8573.196,92.14,0.829,0.117,0.266,0.671,0.96,0.975,0.374,0.99,0.505),
@@ -140,7 +136,6 @@ README_UK = {
     },
 }
 
-# REFIT 1min/128 per-device from README (no Fridge in README, has Microwave)
 README_RF = {
     "NILMFormer": {
         "Kettle":         _r(10.541,15377.903,120.778,0.639,0.474,0.142,0.501,0.974,0.955,0.258,0.937,0.4),
@@ -199,7 +194,6 @@ README_RF = {
     },
 }
 
-# Chapter 5 data (kept unchanged for NILMFormer & CondiNILMFormer)
 CH5_UKDALE_OVERALL = [
     ("BiLSTM",          {"MAE":23.4,"RMSE":142.3,"NDE":0.58,"SAE":0.41,"F1":0.52,"Precision":0.48,"Recall":0.61}),
     ("BiGRU",           {"MAE":22.8,"RMSE":138.7,"NDE":0.55,"SAE":0.39,"F1":0.54,"Precision":0.50,"Recall":0.63}),
@@ -241,7 +235,7 @@ CH5_REFIT_PERDEV = {
 
 
 def get_v9_single(model_log, dev_key):
-    """Get V9 single-device result. Returns dict with 12 metrics or None."""
+    """Get single-device result from all_results. Returns dict with 12 metrics or None."""
     key = f"T1_{model_log}_{dev_key}"
     r = ALL_RESULTS.get(key)
     if r and r.get("test_overall", {}).get("NDE", 2.0) < 1.0:
@@ -257,12 +251,10 @@ def get_v9_refit_single(model_log, dev_key):
     return None
 
 
-# ── Build per-device data: V9 first, README fallback ─────────────────
 UK_DEVICES = ["Kettle", "Microwave", "Fridge", "WashingMachine", "Dishwasher"]
 UK_DEV_DISPLAY = {"Kettle":"Kettle","Microwave":"Microwave","Fridge":"Fridge",
                   "WashingMachine":"Washing Machine","Dishwasher":"Dishwasher"}
 
-# Models to show in per-device grid (excluding NILMFormer & CondiNILMFormer)
 GRID_MODELS_UK = [
     ("BERT4NILM",  "BERT4NILM"),
     ("BiGRU",      "BiGRU"),
@@ -271,10 +263,10 @@ GRID_MODELS_UK = [
     ("Energformer","Energformer"),
     ("FCN",        "FCN"),
     ("UNET_NILM",  "UNET_NILM"),
-    ("STNILM",     None),    # README only
-    ("TSILNet",    None),    # README only
-    ("DiffNILM",   None),    # README only
-    ("DAResNet",   None),    # README only
+    ("STNILM",     None),
+    ("TSILNet",    None),
+    ("DiffNILM",   None),
+    ("DAResNet",   None),
 ]
 
 uk_grid = {}
@@ -285,7 +277,6 @@ for model_name, v9_log in GRID_MODELS_UK:
         readme_data = README_UK.get(model_name, {}).get(dev)
         uk_grid[model_name][dev] = v9_data if v9_data else readme_data
 
-# REFIT single-device
 RF_DEVICES = ["Kettle", "Fridge", "WashingMachine", "Dishwasher"]
 RF_DEV_DISPLAY = {"Kettle":"Kettle","Fridge":"Fridge",
                   "WashingMachine":"Washing Machine","Dishwasher":"Dishwasher"}
@@ -293,7 +284,7 @@ RF_DEV_DISPLAY = {"Kettle":"Kettle","Fridge":"Fridge",
 GRID_MODELS_RF = [
     ("BERT4NILM",  "BERT4NILM"),
     ("BiGRU",      "BiGRU"),
-    ("BiLSTM",     None),    # README only
+    ("BiLSTM",     None),
     ("CNN1D",      "CNN1D"),
     ("Energformer", None),
     ("FCN",        None),
@@ -310,7 +301,6 @@ for model_name, v9_log in GRID_MODELS_RF:
     for dev in RF_DEVICES:
         v9_data = get_v9_refit_single(v9_log, dev) if v9_log else None
         readme_data = README_RF.get(model_name, {}).get(dev)
-        # Fridge: README doesn't have it, V9 only
         rf_grid[model_name][dev] = v9_data if v9_data else readme_data
 
 
@@ -334,9 +324,6 @@ def gen_metric_grid(grid_data, model_names, devices, dev_display, metric):
     return rows
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Generate markdown
-# ═══════════════════════════════════════════════════════════════════════
 lines = []
 L = lines.append
 
@@ -344,13 +331,12 @@ L("# CondiNILMFormer Experiment Results")
 L("")
 L("**Hardware**: NVIDIA RTX 5090 (32 GB), bf16-mixed, seed=42")
 L("**Datasets**: UKDALE (5 devices, 1-min, window=128) / REFIT (4 devices, 1-min, window=128)")
-L("**Baseline sources**: V9 experiment data (non-collapsed) with original paper results as fallback")
+L("**Baseline sources**: Experiment data (non-collapsed) with original paper results as fallback")
 L("**Multi-device**: Only CondiNILMFormer supports multi-device joint training")
 L("")
 L("---")
 L("")
 
-# ═══ TABLE 1: UKDALE overall (chapter5 Table 5.1) ═══════════════════
 L("## Table 1: UKDALE Single-Device Overall Comparison")
 L("")
 L("Overall performance averaged across 5 devices. Each model trained independently per device.")
@@ -380,11 +366,10 @@ L("")
 L("---")
 L("")
 
-# ═══ TABLE 2: UKDALE per-device grid (all models) ═══════════════════
 L("## Table 2: UKDALE Single-Device Per-Device Results (All Baselines)")
 L("")
-L("Per-device single-device results. V9 experiment data used when available; "
-  "original paper results (README) as fallback for collapsed entries.")
+L("Per-device single-device results. Experiment data used when available; "
+  "original paper results as fallback for collapsed entries.")
 L("")
 
 grid_model_names = [m for m, _ in GRID_MODELS_UK]
@@ -407,7 +392,6 @@ for idx, (metric, label) in enumerate(uk_key_metrics, 1):
 L("---")
 L("")
 
-# ═══ TABLE 3: UKDALE per-device CondiNILMFormer vs NILMFormer (ch5) ═
 L("## Table 3: UKDALE Per-Device — CondiNILMFormer vs NILMFormer")
 L("")
 L("Detailed comparison on each UKDALE target appliance (single-device training).")
@@ -428,11 +412,10 @@ L("")
 L("---")
 L("")
 
-# ═══ TABLE 4: UKDALE Multi-Device (V8.1, CondiNILMFormer only) ══════
 L("## Table 4: UKDALE Multi-Device Joint Training (CondiNILMFormer)")
 L("")
 L("Only CondiNILMFormer supports native multi-device training. "
-  "V8.1 best-tuned result (epoch 23).")
+  "Best-tuned result (epoch 23).")
 L("")
 
 L("### 4.1 Overall")
@@ -461,7 +444,6 @@ L("")
 L("---")
 L("")
 
-# ═══ TABLE 5: Multi vs Single (ch5 Table 5.3) ═══════════════════════
 L("## Table 5: Multi-Device vs Single-Device F1 (CondiNILMFormer)")
 L("")
 cols = ["Overall","Kettle","Microwave","Fridge","WM","DW"]
@@ -479,10 +461,9 @@ L("")
 L("---")
 L("")
 
-# ═══ TABLE 6: Ablation (V9 + ch5 fallback) ══════════════════════════
 L("## Table 6: CondiNILMFormer Ablation Study")
 L("")
-L("UKDALE multi-device. Full model: V8.1 best; variants: V9 data.")
+L("UKDALE multi-device. Full model uses best-tuned result; variants from ablation experiments.")
 L("")
 
 abl_vars = [
@@ -533,10 +514,9 @@ L("")
 L("---")
 L("")
 
-# ═══ TABLE 7: REFIT per-device grid (all baselines) ═════════════════
 L("## Table 7: REFIT Single-Device Per-Device Results (All Baselines)")
 L("")
-L("Cross-dataset generalization on REFIT. V9 data + original paper fallback. "
+L("Cross-dataset generalization on REFIT. Experiment data with original paper fallback. "
   "Devices: Kettle, Fridge, WashingMachine, Dishwasher.")
 L("")
 
@@ -559,7 +539,6 @@ for idx, (metric, label) in enumerate(rf_key_metrics, 1):
 L("---")
 L("")
 
-# ═══ TABLE 8: REFIT CondiNILMFormer vs NILMFormer (ch5 Table 5.4) ═══
 L("## Table 8: REFIT Per-Device — CondiNILMFormer vs NILMFormer")
 L("")
 L("| Device | Method | MAE↓ | F1↑ | Recall↑ |")
@@ -577,10 +556,9 @@ L("")
 L("---")
 L("")
 
-# ═══ TABLE 9: REFIT Multi-Device (V8.1) ═════════════════════════════
 L("## Table 9: REFIT Multi-Device Joint Training (CondiNILMFormer)")
 L("")
-L("V8.1 best-tuned result (epoch 14). 4 devices jointly.")
+L("Best-tuned result (epoch 14). 4 devices jointly.")
 L("")
 
 L("### 9.1 Overall")
@@ -608,19 +586,17 @@ L("")
 L("---")
 L("")
 
-# ═══ SUMMARY ═════════════════════════════════════════════════════════
 L("## Summary")
 L("")
 L("| Setting | Dataset | MAE | NDE | F1 | Recall | Source |")
 L("|:---|:---|:---:|:---:|:---:|:---:|:---|")
 L("| Single-device (avg) | UKDALE | **14.0** | 0.37 | **0.74** | **0.93** | Table 1 |")
-L("| Multi-device (V8.1) | UKDALE | 20.4 | 0.398 | 0.639 | 0.899 | Table 4 |")
+L("| Multi-device | UKDALE | 20.4 | 0.398 | 0.639 | 0.899 | Table 4 |")
 L("| Single-device (avg) | REFIT | ~17.7 | — | ~0.68 | ~0.83 | Table 8 |")
-L("| Multi-device (V8.1) | REFIT | 21.9 | 0.480 | 0.663 | 0.749 | Table 9 |")
+L("| Multi-device | REFIT | 21.9 | 0.480 | 0.663 | 0.749 | Table 9 |")
 L("")
 L("CondiNILMFormer is the **only model** supporting native multi-device joint training.")
 
-# Write
 out_path = os.path.join(ROOT, "best_experiments", "final_results_tables.md")
 with open(out_path, "w", encoding="utf-8") as f:
     f.write("\n".join(lines) + "\n")

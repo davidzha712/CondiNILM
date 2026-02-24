@@ -1,13 +1,14 @@
-"""DiffNILM baseline -- CondiNILM.
+"""DiffNILM: Diffusion-based model for non-intrusive load monitoring.
 
-Author: Siyi Li
+Adapts the NuWave architecture for NILM by conditioning on aggregate power
+and timestamp encodings instead of low-resolution audio. Uses a residual
+backbone with dilated convolutions and a diffusion noise schedule for
+iterative denoising at inference.
+
+Reference: Jiang et al., "DiffNILM: A Novel Framework for Non-Intrusive Load
+Monitoring Based on the Conditional Diffusion Model", Sensors, 2023.
+Code adapted from NuWave, DiffWave, WaveGrad, and related implementations.
 """
-# Codes are mainly taken and adapted from:
-# https://github.com/maum-ai/nuwave
-# https://github.com/lmnt-com/diffwave
-# https://github.com/ivanvovk/WaveGrad
-# https://github.com/lucidrains/denoising-diffusion-pytorch
-# https://github.com/hojonathanho/diffusion
 
 import torch
 import torch.nn as nn
@@ -39,7 +40,6 @@ class DiffusionEmbedding(nn.Module):
         self.projection1 = Linear(self.n_channels, self.out_channels)
         self.projection2 = Linear(self.out_channels, self.out_channels)
 
-    # noise_level: [B]
     def forward(self, noise_level):
         x = self.scale * noise_level * self.exponents.unsqueeze(0)
         x = torch.cat([x.sin(), x.cos()], dim=-1)
@@ -90,10 +90,10 @@ class ResidualBlock(nn.Module):
 
 
 class DiffNILMBackbone(nn.Module):
-    """
-    Adaptation of NuWave backbone (https://arxiv.org/pdf/2104.02321) to NILM accoridng to DiffNILM paper: https://www.mdpi.com/1424-8220/23/7/3540
+    """Residual backbone for DiffNILM.
 
-    The only difference with NuWave is that the conditioning is based on the additioon of the aggregate load curve signal and Timestamp encoded information
+    Processes the noisy appliance signal through stacked dilated residual blocks,
+    conditioned on aggregate power plus timestamp encoding and a diffusion noise level.
     """
 
     def __init__(
@@ -133,17 +133,20 @@ class DiffNILMBackbone(nn.Module):
         nn.init.kaiming_normal_(self.output_projection.weight)
 
     def forward(self, x, x_agg, timestamp_enc, noise_level):
-        """
-        x: 2D Tensor (B, L)
-        x_agg: 2D Tensor (B, L)
-        timestamp_enc: 3D Tensor (B, 3, L) for hour, dow, month
-        """
+        """Forward pass through the residual backbone.
 
-        # Appliance proj embedding and clipping
+        Args:
+            x: Noisy appliance signal, shape (B, L).
+            x_agg: Aggregate power signal, shape (B, L).
+            timestamp_enc: Timestamp features, shape (B, 3, L) for hour/dow/month.
+            noise_level: Diffusion noise level, shape (B, 1).
+
+        Returns:
+            Predicted noise, shape (B, L).
+        """
         x = self.input_projection(x.unsqueeze(1))
         x = silu(x)
 
-        # Conditional proj embedding (aggregate power and timestamp info)
         x_agg = torch.add(
             self.agg_projection(x_agg.unsqueeze(1)), self.time_projection(timestamp_enc)
         )
@@ -166,17 +169,15 @@ class DiffNILMBackbone(nn.Module):
 
 @torch.jit.script
 def lognorm(pred, target):
-    """
-    lognorm Loss as used in NuWave
-    """
+    """Log-norm loss: log of mean absolute error per sample, averaged over batch."""
     return (pred - target).abs().mean(dim=-1).clamp(min=1e-20).log().mean()
 
 
 class DiffNILM(nn.Module):
-    """
-    Adaptation of NuWave (https://arxiv.org/pdf/2104.02321) to NILM accoridng to DiffNILM paper: https://www.mdpi.com/1424-8220/23/7/3540
+    """DiffNILM: Diffusion training and sampling wrapper around DiffNILMBackbone.
 
-    NuWave PL class 'NuWave(pl.LightningModule)' taken and adapted to perform Diffusion training
+    Manages noise schedules, the forward diffusion process (q_sample), and
+    iterative reverse sampling for inference. Includes its own Adam optimizer.
     """
 
     def __init__(
@@ -198,12 +199,12 @@ class DiffNILM(nn.Module):
                 [1e-6, 2e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 9e-1]
             )
 
-        # Store parameters for reuse
+        # Store schedule parameters for reuse
         self.max_step = max_step
         self.infer_step = infer_step
         self.infer_schedule = infer_schedule
 
-        # Init noise schedling buffers
+        # Initialize noise schedule buffers
         self.init_noise_schedule(train=self.training)
 
     def init_noise_schedule(self, train=True):
@@ -259,15 +260,9 @@ class DiffNILM(nn.Module):
     def forward(self, batch):
         if self.training:
             agg, x, _ = batch
-            x = x[
-                :, 0, :
-            ]  # True appliance load curve (2D Tensor to meet NuWave convention, stand for wav)
-            encoding = agg[
-                :, 1:, :
-            ]  # Timestamp encoding (3D Tensor: [B, 3 (hour, dow, month), values])
-            agg = agg[
-                :, 0, :
-            ]  # Aggregate load curve (2D Tensor to meet NuWave convention, stand for wav_l)
+            x = x[:, 0, :]  # Appliance power, shape (B, L)
+            encoding = agg[:, 1:, :]  # Timestamp encoding, shape (B, 3, L)
+            agg = agg[:, 0, :]  # Aggregate power, shape (B, L)
 
             step = torch.randint(0, self.max_step, (x.shape[0],), device=x.device) + 1
             loss, *_ = self.common_step(x, agg, encoding, step)
@@ -286,12 +281,6 @@ class DiffNILM(nn.Module):
             y = self.sample(agg, encoding, self.infer_step)
 
             return y.unsqueeze(1)
-
-    """
-    Diffusion backbone directly taken from NuWave
-
-    Argument for conditioning wav_l (i.e. low resolution sound in NuWave paper) is simply replaced by agg (aggregate load curve) and encoding (timestamp information), the two conditioning variable used for diffusion in DiffNILM
-    """
 
     def sample_continuous_noise_level(self, step):
         rand = torch.rand_like(step, dtype=torch.float, device=step.device)
@@ -331,9 +320,9 @@ class DiffNILM(nn.Module):
             - self.sqrt_alphas_cumprod_m1[t].unsqueeze(-1) * eps
         )
 
-    # t: interger not tensor
     @torch.no_grad()
     def p_mean_variance(self, y, y_down, encoding, t, clip_denoised: bool):
+        """Compute predicted mean and log-variance for the reverse step at integer timestep t."""
         batch_size = y.shape[0]
         noise_level = self.sqrt_alphas_cumprod_prev[t + 1].repeat(batch_size, 1)
         eps_recon = self.model_backbone(y, y_down, encoding, noise_level)
@@ -398,10 +387,6 @@ class DiffNILM(nn.Module):
 
         return loss, y, y_low, y_noisy, eps, eps_recon
 
-    """
-    Optimizer directly init in model with patemeters reported in DiffNILM (copy paste of NuWave as the entire paper)
-    """
-
     def configure_optimizers(
         self, lr=0.00003, eps=1e-9, betas=(0.5, 0.999), weight_decay=0.00
     ):
@@ -410,10 +395,6 @@ class DiffNILM(nn.Module):
         )
 
         return opt
-
-    """
-    Update Noise schedule buffers according to training or validation mode
-    """
 
     def set_noise_schedule(self, train):
         max_step = self.max_step if train else self.infer_step

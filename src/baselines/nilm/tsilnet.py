@@ -1,6 +1,10 @@
-"""TSILNet baseline -- CondiNILM.
+"""TSILNet: Temporal Self-attention Improved LSTM Network for NILM.
 
-Author: Siyi Li
+Combines a Temporal Self-attention TCN (TSTCN) block with an IECA-LSTM block
+and a fully connected head. The TSTCN stacks temporal blocks with dilated
+causal convolutions and residual self-attention. The IECA-LSTM applies
+channel attention via dilated causal convolution before two LSTM layers.
+Supports seq2seq and seq2point output modes.
 """
 import torch
 import torch.nn as nn
@@ -114,28 +118,13 @@ class TSTCN_Block(nn.Module):
 
 
 class CausalConv1D(nn.Module):
-    """
-    A 1D causal convolution layer.
-    Ensures that the convolution output at time t is only influenced by inputs from time t and earlier.
-    """
+    """1D causal convolution: output at time t depends only on inputs at time <= t."""
 
     def __init__(self, in_channels, out_channels, kernel_size, stride=1, dilation=1):
-        """
-        Args:
-            in_channels (int): Number of input channels.
-            out_channels (int): Number of output channels.
-            kernel_size (int): Size of the convolutional kernel.
-            stride (int): Stride of the convolution. Default is 1.
-            dilation (int): Dilation factor. Default is 1.
-        """
         super(CausalConv1D, self).__init__()
         self.kernel_size = kernel_size
         self.dilation = dilation
-
-        # Padding to ensure causality
         self.padding = (kernel_size - 1) * dilation
-
-        # Convolution layer
         self.conv = nn.Conv1d(
             in_channels,
             out_channels,
@@ -146,17 +135,8 @@ class CausalConv1D(nn.Module):
         )
 
     def forward(self, x):
-        """
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, sequence_length).
-
-        Returns:
-            torch.Tensor: Output tensor after causal convolution.
-        """
-        # Perform the convolution
+        """Apply causal conv. Input/output shape: (batch, channels, seq_len)."""
         output = self.conv(x)
-
-        # Remove the extra padding on the right to ensure causality
         if self.padding != 0:
             output = output[:, :, : -self.padding]
 
@@ -164,9 +144,7 @@ class CausalConv1D(nn.Module):
 
 
 class IECA(nn.Module):
-    """
-    Improved Efficient Channel Attention (IECA) Mechanism with Dilated Causal Convolution.
-    """
+    """Improved Efficient Channel Attention using dilated causal convolution."""
 
     def __init__(self, kernel_size=3, dilation=8):
         super(IECA, self).__init__()
@@ -177,22 +155,15 @@ class IECA(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # Global average pooling to summarize each channel
-        avg_pooled = self.global_avg_pool(x)  # Shape: [B, C, 1]
-
-        # Apply dilated causal convolution
-        conv_out = self.dilated_conv(avg_pooled.transpose(1, 2))  # Shape: [B, 1, C]
-        attention_weights = self.sigmoid(conv_out.transpose(1, 2))  # Shape: [B, C, 1]
-
-        # Multiply attention weights with the original input
-        out = x * attention_weights
-        return out
+        """Compute channel attention weights and scale input. Shape: (B, C, T)."""
+        avg_pooled = self.global_avg_pool(x)
+        conv_out = self.dilated_conv(avg_pooled.transpose(1, 2))
+        attention_weights = self.sigmoid(conv_out.transpose(1, 2))
+        return x * attention_weights
 
 
 class IECA_LSTM(nn.Module):
-    """
-    IECA-LSTM Block: Combines Improved Efficient Channel Attention (IECA) and LSTM.
-    """
+    """IECA-LSTM block: channel attention via IECA with skip connection, then two LSTM layers."""
 
     def __init__(self, input_channels, dilation=8, hidden_size=[128, 256], dropout=0.2):
         super(IECA_LSTM, self).__init__()
@@ -214,19 +185,17 @@ class IECA_LSTM(nn.Module):
         )
 
     def forward(self, x):
-        # Input shape: [B, C, T]
-        out = self.ieca(x)  # Shape: [B, C, T]
-        x = x + out  # Skip connection as shown in Fig 1
-        x = x.permute(0, 2, 1)  # Shape: [B, T, C] for LSTM
-        x, _ = self.lstm1(x)  # Shape: [B, T, H]
+        """Input/output shape: (B, C, T)."""
+        out = self.ieca(x)
+        x = x + out
+        x = x.permute(0, 2, 1)
+        x, _ = self.lstm1(x)
         x, _ = self.lstm2(x)
         return x.permute(0, 2, 1)
 
 
 class TSILNet(nn.Module):
-    """
-    TSILNet: A hybrid model combining TSTCN and IECA-LSTM for sequence modeling.
-    """
+    """TSILNet: TSTCN + IECA-LSTM with a fully connected head for NILM."""
 
     def __init__(
         self,
@@ -276,16 +245,10 @@ class TSILNet(nn.Module):
             self.fc2 = nn.Linear(head_ffn_dim, 1)  # Seq2Point
 
     def forward(self, x):
-        # Input shape: [B, C, T]
-
-        # TSTCN Block
-        x = self.tstcn(x)  # Shape: [B, C_TCN, T]
-
-        # IECA-LSTM Block
-        x = self.ieca_lstm(x)  # Shape: [B, C_LSTM, T]
-
-        # Fully connected layers
-        x = self.fc1(x)  # Shape: [B, 512]
+        """Forward pass. Input: (B, C, T). Output: (B, 1, T) for seq2seq or (B, 1) for seq2point."""
+        x = self.tstcn(x)
+        x = self.ieca_lstm(x)
+        x = self.fc1(x)
         x = self.fc2(x)
 
         if self.downstreamtask == "seq2seq":

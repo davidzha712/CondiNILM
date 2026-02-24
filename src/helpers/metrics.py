@@ -1,7 +1,4 @@
-"""NILM evaluation metrics (F1, MAE, SAE) -- CondiNILM.
-
-Author: Siyi Li
-"""
+"""NILM evaluation metrics: classification, regression, and energy aggregation."""
 
 import torch
 
@@ -23,18 +20,12 @@ from sklearn.metrics import (
 )
 
 
-# ========================================= Constants ========================================= #
-EPS = 1e-12  # Machine epsilon for numerical stability
-BINARY_THRESHOLD = 0.5  # Threshold for binary classification
-
-
-# ========================================= Metrics ========================================= #
+EPS = 1e-12
+BINARY_THRESHOLD = 0.5
 
 
 class Classifmetrics:
-    """
-    Basics metrics for classification
-    """
+    """Binary classification metrics: accuracy, precision, recall, F1, ROC-AUC, AP."""
 
     def __init__(self, round_to=5):
         self.round_to = round_to
@@ -42,7 +33,6 @@ class Classifmetrics:
     def __call__(self, y, y_hat):
         metrics = {}
 
-        # Handle empty arrays
         y = np.asarray(y)
         y_hat = np.asarray(y_hat)
         if y.size == 0 or y_hat.size == 0:
@@ -81,7 +71,6 @@ class Classifmetrics:
             self.round_to,
         )
 
-        # ROC-AUC and AP require both classes to be present
         unique_classes = np.unique(y)
         if len(unique_classes) >= 2:
             metrics["ROC_AUC_SCORE"] = round(roc_auc_score(y, y_hat), self.round_to)
@@ -94,9 +83,7 @@ class Classifmetrics:
 
 
 class NILMmetrics:
-    """
-    Basics metrics for NILM
-    """
+    """NILM-specific metrics: MAE, MSE, RMSE, TECA, NDE, SAE, MR, plus event detection F1."""
 
     def __init__(self, round_to=3):
         self.round_to = round_to
@@ -104,7 +91,6 @@ class NILMmetrics:
     def __call__(self, y=None, y_hat=None, y_state=None, y_hat_state=None):
         metrics = {}
 
-        # ======= Basic regression Metrics ======= #
         if y is not None:
             assert y_hat is not None, (
                 "Target y_hat not provided, please provide y_hat to compute regression metrics."
@@ -116,7 +102,6 @@ class NILMmetrics:
                 np.asarray(y_hat, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
             )
 
-            # Handle empty arrays for regression metrics
             if y.size == 0 or y_hat.size == 0:
                 metrics["MAE"] = 0.0
                 metrics["MSE"] = 0.0
@@ -126,19 +111,14 @@ class NILMmetrics:
                 metrics["SAE"] = 0.0
                 metrics["MR"] = 0.0
             else:
-                # MAE, MSE and RMSE
                 metrics["MAE"] = round(mean_absolute_error(y, y_hat), self.round_to)
                 metrics["MSE"] = round(mean_squared_error(y, y_hat), self.round_to)
                 metrics["RMSE"] = round(
                     np.sqrt(mean_squared_error(y, y_hat)), self.round_to
                 )
 
-                # =======  NILM Metrics ======= #
-
-                # Total Energy Correctly Assigned (TECA)
                 abs_y_sum = float(np.sum(np.abs(y)))
                 if abs_y_sum < EPS:
-                    # When all ground truth is zero, TECA is 1.0 if prediction is also zero
                     metrics["TECA"] = 1.0 if np.sum(np.abs(y_hat)) < EPS else 0.0
                 else:
                     metrics["TECA"] = round(
@@ -146,38 +126,31 @@ class NILMmetrics:
                         self.round_to,
                     )
 
-                # Normalized Disaggregation Error (NDE)
                 y_sq_sum = float(np.sum(y**2))
                 if y_sq_sum < EPS:
-                    # When all ground truth is zero, NDE is 0 if prediction is also zero
                     metrics["NDE"] = 0.0 if np.sum(y_hat**2) < EPS else float("inf")
                 else:
                     metrics["NDE"] = round(
                         (np.sum((y_hat - y) ** 2)) / y_sq_sum, self.round_to
                     )
 
-                # Signal Aggregate Error (SAE)
-                # Use absolute value of y_sum to handle negative sums correctly
                 y_sum = float(np.sum(y))
                 abs_y_sum_for_sae = max(abs(y_sum), EPS)
                 metrics["SAE"] = round(
                     np.abs(np.sum(y_hat) - y_sum) / abs_y_sum_for_sae, self.round_to
                 )
 
-                # Matching Rate (MR)
-                # Clip negative values to 0 as MR assumes non-negative power values
                 y_clipped = np.maximum(y, 0)
                 y_hat_clipped = np.maximum(y_hat, 0)
                 mr_denom = float(np.sum(np.maximum(y_hat_clipped, y_clipped)))
                 if mr_denom < EPS:
-                    metrics["MR"] = 1.0  # Both are zero, perfect match
+                    metrics["MR"] = 1.0
                 else:
                     metrics["MR"] = round(
                         np.sum(np.minimum(y_hat_clipped, y_clipped)) / mr_denom,
                         self.round_to,
                     )
 
-        # =======  Event Detection Metrics ======= #
         if y_state is not None:
             assert y_hat_state is not None, (
                 "Target y_hat_state not provided, please pass y_hat_state to compute classification metrics."
@@ -196,16 +169,13 @@ class NILMmetrics:
                 metrics["F1_SCORE"] = 0.0
                 return metrics
 
-            # Binarize using configurable threshold
             y_state = (y_state > BINARY_THRESHOLD).astype(np.int64, copy=False)
             y_hat_state = (y_hat_state > BINARY_THRESHOLD).astype(np.int64, copy=False)
 
-            # Accuracy
             metrics["ACCURACY"] = round(
                 accuracy_score(y_state, y_hat_state), self.round_to
             )
 
-            # Check if both classes are present in ground truth (more robust check)
             uniq_true = np.unique(y_state)
             if uniq_true.size >= 2:
                 metrics["BALANCED_ACCURACY"] = round(
@@ -224,7 +194,6 @@ class NILMmetrics:
                     self.round_to,
                 )
             else:
-                # Single class in ground truth: degrade gracefully
                 metrics["BALANCED_ACCURACY"] = metrics["ACCURACY"]
                 metrics["PRECISION"] = 0.0
                 metrics["RECALL"] = 0.0
@@ -234,9 +203,7 @@ class NILMmetrics:
 
 
 class REGmetrics:
-    """
-    Basics regression metrics
-    """
+    """Regression metrics: MAE, MSE, RMSE, MAPE."""
 
     def __init__(self, round_to=5):
         self.round_to = round_to
@@ -244,7 +211,6 @@ class REGmetrics:
     def __call__(self, y, y_hat):
         metrics = {}
 
-        # Clean data BEFORE computing any metrics
         y_arr = np.nan_to_num(
             np.asarray(y, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
         )
@@ -252,7 +218,6 @@ class REGmetrics:
             np.asarray(y_hat, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0
         )
 
-        # Handle empty arrays
         if y_arr.size == 0 or y_hat_arr.size == 0:
             return {
                 "MAE": 0.0,
@@ -261,14 +226,12 @@ class REGmetrics:
                 "MAPE": 0.0,
             }
 
-        # Now compute metrics with clean data
         metrics["MAE"] = round(mean_absolute_error(y_arr, y_hat_arr), self.round_to)
         metrics["MSE"] = round(mean_squared_error(y_arr, y_hat_arr), self.round_to)
         metrics["RMSE"] = round(
             np.sqrt(mean_squared_error(y_arr, y_hat_arr)), self.round_to
         )
 
-        # MAPE with numerical stability
         denom = np.maximum(np.abs(y_arr), EPS)
         mape = float(np.mean(np.abs((y_arr - y_hat_arr) / denom)))
         if not np.isfinite(mape):
@@ -295,6 +258,30 @@ def eval_win_energy_aggregation(
     use_temperature=False,
     log_dict=None,
 ):
+    """Evaluate per-household energy disaggregation at daily, weekly, and monthly granularity.
+
+    Runs model inference on each test window, inverse-scales predictions, then aggregates
+    true and predicted appliance power per household at D/W/ME frequencies. Computes
+    regression metrics on both absolute power and appliance-to-aggregate ratios.
+    Results are stored in log_dict under keys like "{mask_metric}_{freq_agg}".
+
+    Args:
+        input_data_test: 4D array [N, M+1, 2, L] of scaled test data.
+        input_st_date_test: DataFrame with house IDs as index and start dates.
+        model: Trained PyTorch model returning appliance power predictions.
+        device: torch.device for inference.
+        scaler: NILMscaler instance for inverse transforms.
+        metrics: Callable returning a dict of metric_name -> value.
+        window_size: Number of time steps per window.
+        freq: Pandas frequency string for the original sampling rate.
+        cosinbase: Whether to use sin/cos encoding for exogenous features.
+        new_range: Target range for linear normalization of exogenous features.
+        mask_metric: Prefix for log_dict keys.
+        list_exo_variables: List of time features to append (e.g. ["hour", "dow"]).
+        threshold_small_values: Predictions below this value are zeroed out.
+        use_temperature: Whether to include the temperature channel as input.
+        log_dict: Mutable dict to store evaluation results; skipped if None.
+    """
     data_test = input_data_test.copy()
     st_date_test = input_st_date_test.copy()
 
@@ -303,7 +290,7 @@ def eval_win_energy_aggregation(
     list_pdl_test = st_date_test["ID_PDL"].unique()
 
     for freq_agg in ["D", "W", "ME"]:
-        all_dfs = []  # Collect DataFrames for efficient concat
+        all_dfs = []
 
         true_app_power = []
         pred_app_power = []
@@ -356,7 +343,6 @@ def eval_win_energy_aggregation(
                             )
                         )
 
-                # Use torch.no_grad() to prevent unnecessary gradient computation
                 with torch.no_grad():
                     pred = model(input_seq.to(device))
                     pred = scaler.inverse_transform_appliance(pred)
@@ -367,8 +353,6 @@ def eval_win_energy_aggregation(
 
                 agg = inv_scale[0, 0, :]
                 app = inv_scale[1, 0, :]
-                # Align lengths when using seq2subseq (output_ratio < 1.0)
-                # Model prediction length may be smaller than window_size.
                 full_dates = pd.date_range(
                     tmp_st_date_test.iloc[k, 1], periods=window_size, freq=freq
                 )
@@ -388,7 +372,7 @@ def eval_win_energy_aggregation(
                 pdl_total_power.extend(list(agg))
                 pdl_true_app_power.extend(list(app))
                 pdl_pred_app_power.extend(list(pred))
-            # Safety: enforce equal lengths (seq2subseq may change per-window output length)
+            # Enforce equal lengths across parallel lists
             min_len = min(len(list_date), len(pdl_total_power), len(pdl_true_app_power), len(pdl_pred_app_power))
             if min_len <= 0:
                 continue
@@ -417,12 +401,10 @@ def eval_win_energy_aggregation(
             true_app_power.extend(df_inst["true_app_power"].tolist())
             pred_app_power.extend(df_inst["pred_app_power"].tolist())
 
-            # Calculate ratios with proper zero handling (no +1 offset)
             total_power_arr = df_inst["total_power"].values
             true_app_arr = df_inst["true_app_power"].values
             pred_app_arr = df_inst["pred_app_power"].values
 
-            # Safe division: only divide where total_power > 0
             df_inst["true_ratio"] = np.divide(
                 true_app_arr,
                 total_power_arr,
@@ -436,7 +418,6 @@ def eval_win_energy_aggregation(
                 where=total_power_arr > EPS,
             )
 
-            # Clean up any remaining inf/nan values
             df_inst = df_inst.replace([np.inf, -np.inf], 0)
             df_inst = df_inst.fillna(value=0)
 
@@ -445,7 +426,6 @@ def eval_win_energy_aggregation(
 
             all_dfs.append(df_inst)
 
-        # Efficient single concat at the end
         df = pd.concat(all_dfs, axis=0) if all_dfs else pd.DataFrame()
 
         if log_dict is not None:

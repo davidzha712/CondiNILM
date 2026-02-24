@@ -1,6 +1,12 @@
-"""UNet-NILM baseline -- CondiNILM.
+"""UNet-NILM: U-Net based multi-task model for non-intrusive load monitoring.
 
-Author: Siyi Li
+A UNet encoder-decoder with skip connections, followed by a second encoder,
+adaptive pooling, and dual MLP heads for power quantile regression and
+appliance state classification.
+
+Reference: Faustine & Pereira, "UNet-NILM: A Deep Neural Network for
+Multi-tasks Appliances State Detection and Power Estimation in NILM", 2020.
+Code adapted from: https://github.com/sambaiga/UNETNiLM
 """
 import torch
 import torch.nn.functional as F
@@ -9,9 +15,7 @@ from torch import nn
 
 
 class Encoder(nn.Module):
-    """
-    Taken from https://github.com/sambaiga/UNETNiLM/blob/master/src/net/layers.py
-    """
+    """Stacked strided 1D conv encoder that halves spatial dimensions at each layer."""
 
     def __init__(self, n_channels=10, n_kernels=16, n_layers=3, seq_size=50):
         super(Encoder, self).__init__()
@@ -38,9 +42,7 @@ class Encoder(nn.Module):
 
 
 class Deconv1D(nn.Module):
-    """
-    Taken from https://github.com/sambaiga/UNETNiLM/blob/master/src/net/unet.py
-    """
+    """1D transposed convolution block with optional BatchNorm and activation."""
 
     def __init__(
         self,
@@ -67,9 +69,7 @@ class Deconv1D(nn.Module):
 
 
 class Conv1D(nn.Module):
-    """
-    Taken from https://github.com/sambaiga/UNETNiLM/blob/master/src/net/unet.py
-    """
+    """1D convolution block with weight normalization, optional BatchNorm and activation."""
 
     def __init__(
         self,
@@ -95,9 +95,7 @@ class Conv1D(nn.Module):
 
 
 class Up(nn.Module):
-    """
-    Taken from https://github.com/sambaiga/UNETNiLM/blob/master/src/net/unet.py
-    """
+    """Upsample-and-concatenate block for the UNet decoder path."""
 
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
@@ -114,9 +112,7 @@ class Up(nn.Module):
 
 
 class UNetCNN1D(nn.Module):
-    """
-    Taken from https://github.com/sambaiga/UNETNiLM/blob/master/src/net/unet.py
-    """
+    """1D U-Net backbone with symmetric encoder-decoder and skip connections."""
 
     def __init__(
         self,
@@ -173,25 +169,20 @@ class UNetNiLM(nn.Module):
         return_values="power",
         verbose_loss=False,
     ):
-        """
-        UNet-NILM Pytorch implementation as described in the original paper "UNet-NILM: A Deep Neural Network for Multi-tasks Appliances state detection and power estimation in NILM".
-
-        Code adapted from: https://github.com/sambaiga/UNETNiLM
+        """Initialize UNet-NILM with UNet backbone, encoder, and dual output heads.
 
         Args:
-            num_layers (int) : number of down-and upsampling layers
-            features_start (int) : number of output feature maps for the first conv layer
-            in_channels (int) : number of feature maps the input has
-            num_classes (int) : number of output classes / appliances
-            pooling_size (int) : size of global average pooling filter
-            window_size (int) : window size of the input
-            quantiles (int) : list of quantiles used for regression
-            d_model (int) : number of output feature maps of the Encoder block
-            dropout (float) : Dropout rate
-            return_values (str) : "dual", "states" or "power"
-            dropout (float) : Dropout rate
-        Returns:
-            model (UNetNILM) : UNetNILM model object
+            num_layers: Number of down/up-sampling layers in the UNet.
+            features_start: Number of feature maps after the first conv layer.
+            c_in: Number of input channels.
+            num_classes: Number of output appliances.
+            pooling_size: Output size for adaptive average pooling.
+            window_size: Length of the input time window.
+            quantiles: List of quantile values for power regression.
+            d_model: Number of output feature maps of the Encoder block.
+            dropout: Dropout rate.
+            return_values: 'power', 'states', or 'both'.
+            verbose_loss: If True, return individual loss components.
         """
         super().__init__()
         self.return_values = return_values
@@ -236,12 +227,12 @@ class UNetNiLM(nn.Module):
             self.fc_out_state(mlp_out)
             .view(B, self.window_size, self.num_classes)
             .permute(0, 2, 1)
-        )  # Return: Batch, Num_classes, Win_size
+        )
         power_logits = (
             self.fc_out_power(mlp_out)
             .view(B, self.window_size, self.num_quantiles, self.num_classes)
             .permute(0, 3, 2, 1)
-        )  # Return: Batch, Num_classes, N_Quantiles, Win_size
+        )
 
         if self.num_quantiles > 1:
             power_logits = power_logits[:, :, self.num_quantiles // 2, :]
@@ -266,12 +257,12 @@ class UNetNiLM(nn.Module):
             self.fc_out_state(mlp_out)
             .view(B, self.window_size, self.num_classes)
             .permute(0, 2, 1)
-        )  # Return: Batch, Num_classes, Win_size
+        )
         power_logits = (
             self.fc_out_power(mlp_out)
             .view(B, self.window_size, self.num_quantiles, self.num_classes)
             .permute(0, 3, 2, 1)
-        )  # Return: Batch, Num_classes, N_Quantiles, Win_size
+        )
 
         q_loss = self.quantile_regression_loss(
             power_logits.permute(0, 3, 2, 1), y_power.permute(0, 2, 1)
@@ -281,14 +272,14 @@ class UNetNiLM(nn.Module):
         return q_loss + bce_loss, q_loss, bce_loss
 
     def quantile_regression_loss(self, inputs, targets):
-        """
-        Function that computes the quantile regression loss
+        """Compute pinball (quantile regression) loss.
 
-        Arguments:
-            y_hat (torch.Tensor) : Shape (B x T x N x M) model regression predictions
-            y (torch.Tensor) : Shape (B x T x M) ground truth targets
+        Args:
+            inputs: Predicted quantiles, shape (B, T, N_quantiles, M).
+            targets: Ground truth targets, shape (B, T, M).
+
         Returns:
-            loss (float): value of quantile regression loss
+            Scalar mean quantile loss.
         """
         targets = targets.unsqueeze(2).expand_as(inputs)
         quantiles = self.quantiles.to(targets.device)

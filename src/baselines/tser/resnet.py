@@ -1,6 +1,8 @@
-"""ResNet baseline for time-series regression -- CondiNILM.
+"""ResNet: Residual network baseline for time-series classification/regression.
 
-Author: Siyi Li
+Three ResNet blocks (each with three conv+BN+ReLU layers and a shortcut),
+followed by global average pooling and a linear classifier. Uses same-padding
+convolutions throughout.
 """
 
 import torch.nn as nn

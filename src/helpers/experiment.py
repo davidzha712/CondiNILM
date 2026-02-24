@@ -95,11 +95,10 @@ def _sanitize_tb_tag(value):
 
 
 def _coerce_appliance_names(expes_config, n_app, fallback_name=None):
-    """
-    Get appliance names from config, with fallback to numeric indices.
+    """Return appliance names from config, falling back to numeric indices.
 
-    FIXED: Now handles partial matches - if config has fewer names than n_app,
-    use available names and fill remaining with numeric indices.
+    If the config provides fewer names than n_app, the available names are
+    used and the remaining slots are filled with numeric indices.
     """
     app_names = None
     group_members = None
@@ -206,11 +205,8 @@ def _get_num_workers(num_workers):
             return cpu_count
         return num_workers
 
-    # Windows uses spawn (not fork) for multiprocessing, which pickles the entire
-    # Dataset object through a pipe to each worker. For large multi-device datasets
-    # (e.g. 5 devices x 53K samples = ~327MB), this exceeds the pipe buffer limit
-    # and crashes with OSError: [Errno 22]. Default to 0 workers on Windows.
-    # Users can still override via num_workers in config/HPO if their dataset fits.
+    # Windows spawn-based multiprocessing pickles the Dataset to each worker,
+    # which can exceed pipe buffer limits for large datasets. Default to 0.
     if platform.system() == "Windows":
         return 0
 
@@ -247,10 +243,7 @@ def _dataloader_worker_init(worker_id):
 
 
 def get_model_instance(name_model, c_in, window_size, **kwargs):
-    """
-    Get model instances
-    """
-    # Filter kwargs to only pass parameters the model actually accepts
+    """Instantiate a model by name, forwarding only the kwargs it accepts."""
     def _filter_kwargs(cls, extra_kwargs):
         import inspect
         sig = inspect.signature(cls.__init__)

@@ -1,13 +1,9 @@
-"""Parse and rank experiment results -- CondiNILM.
-
-Author: Siyi Li
-"""
+"""Parse and rank experiment results -- CondiNILM."""
 
 import json
 import os
 import glob
 
-# Find all Multi_T* results across all configurations
 results = []
 
 for report_path in glob.glob('result/UKDALE_*/*/Multi_T*/val_report.jsonl'):
@@ -20,7 +16,6 @@ for report_path in glob.glob('result/UKDALE_*/*/Multi_T*/val_report.jsonl'):
         with open(report_path, 'r') as f:
             lines = f.readlines()
 
-        # Find best epoch (highest weighted F1)
         best_weighted_f1 = 0
         best_epoch_data = None
 
@@ -28,11 +23,9 @@ for report_path in glob.glob('result/UKDALE_*/*/Multi_T*/val_report.jsonl'):
             data = json.loads(line)
             per_device = data.get('metrics_timestamp_per_device', {})
 
-            # Skip if not 5 devices
             if len(per_device) != 5:
                 continue
 
-            # Calculate weighted F1
             weights = {'microwave': 2.0, 'kettle': 1.5, 'fridge': 1.0, 'washing_machine': 1.0, 'dishwasher': 1.0}
             total_weight = sum(weights.values())
 
@@ -50,7 +43,6 @@ for report_path in glob.glob('result/UKDALE_*/*/Multi_T*/val_report.jsonl'):
     except Exception as e:
         pass
 
-# Sort by weighted F1
 results.sort(key=lambda x: x[3], reverse=True)
 
 print('Top 10 5-device results across ALL configurations:')

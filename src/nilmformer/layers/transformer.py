@@ -1,4 +1,4 @@
-"""Transformer encoder layers -- CondiNILM.
+"""Transformer encoder layers with diagonal-masked self-attention for CondiNILM.
 
 Author: Siyi Li
 """
@@ -12,6 +12,21 @@ from src.nilmformer.config import NILMFormerConfig
 
 
 class DiagonnalyMaskedSelfAttention(nn.Module):
+    """Multi-head self-attention that optionally masks diagonal entries.
+
+    When mask_diagonal is True, each position is prevented from attending to
+    itself. Diagonal scores are set to -1e4 before softmax and zeroed after,
+    forcing the model to aggregate information exclusively from other positions.
+
+    Args:
+        dim: Input/output feature dimension.
+        n_heads: Number of attention heads.
+        head_dim: Dimension per head. Total projection size is n_heads * head_dim.
+        dropout: Dropout rate applied to attention weights and output projection.
+        use_efficient_attention: Stored but not used in the current forward pass.
+        mask_diagonal: If True, zero out self-attention on the diagonal.
+    """
+
     def __init__(
         self,
         dim: int,
@@ -45,19 +60,30 @@ class DiagonnalyMaskedSelfAttention(nn.Module):
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
+        """Compute diagonally-masked multi-head self-attention.
+
+        Args:
+            x: (B, L, dim) input tensor.
+
+        Returns:
+            (B, L, dim) output tensor after attention and output projection.
+        """
         batch, seqlen, _ = x.shape
         xq = self.wq(x)
         xk = self.wk(x)
         xv = self.wv(x)
 
+        # Reshape to (B, n_heads, L, head_dim)
         xq = xq.view(batch, seqlen, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
         xk = xk.view(batch, seqlen, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
         xv = xv.view(batch, seqlen, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
 
+        # Scaled dot-product attention scores: (B, n_heads, L, L)
         scores = torch.einsum("bhle,bhse->bhls", xq, xk)
         scores = scores * self.scale
         scores = torch.nan_to_num(scores, nan=0.0, posinf=1e4, neginf=-1e4)
 
+        # Optionally mask diagonal to prevent self-attention
         diag_mask = None
         if self.mask_diagonal:
             diag_mask = torch.eye(seqlen, dtype=torch.bool, device=xq.device).unsqueeze(
@@ -71,12 +97,26 @@ class DiagonnalyMaskedSelfAttention(nn.Module):
         attn = torch.nan_to_num(attn, nan=0.0, posinf=0.0, neginf=0.0)
         attn = self.attn_dropout(attn)
 
+        # Weighted sum of values: (B, n_heads, L, head_dim) -> (B, L, dim)
         output = torch.einsum("bhls,bhsd->bhld", attn, xv)
         output = output.permute(0, 2, 1, 3)
         return self.out_dropout(self.wo(output.reshape(batch, seqlen, -1)))
 
 
 class PositionWiseFeedForward(nn.Module):
+    """Two-layer feed-forward network with activation and dropout.
+
+    Expands to hidden_dim, applies activation and dropout, then projects back.
+
+    Args:
+        dim: Input and output dimension.
+        hidden_dim: Inner expansion dimension.
+        dp_rate: Dropout rate applied after activation.
+        activation: Activation function (default: GELU).
+        bias1: Use bias in the first linear layer.
+        bias2: Use bias in the second linear layer.
+    """
+
     def __init__(
         self,
         dim: int,
@@ -93,11 +133,32 @@ class PositionWiseFeedForward(nn.Module):
         self.activation = activation
 
     def forward(self, x) -> torch.Tensor:
+        """Apply FFN: linear -> activation -> dropout -> linear.
+
+        Args:
+            x: (*, dim) input tensor.
+
+        Returns:
+            (*, dim) output tensor.
+        """
         x = self.layer2(self.dropout(self.activation(self.layer1(x))))
         return x
 
 
 class EncoderLayer(nn.Module):
+    """Pre-norm Transformer encoder block with optional FiLM conditioning.
+
+    Architecture (pre-norm):
+        1. LayerNorm -> DiagonallyMaskedSelfAttention -> residual add
+        2. LayerNorm -> PositionWiseFeedForward -> optional FiLM -> dropout -> residual add
+
+    FiLM conditioning is applied to the feed-forward output (after PFFN, before
+    the residual connection) as: new_x = (1 + gamma) * new_x + beta.
+
+    Args:
+        NFconfig: Model configuration dataclass.
+    """
+
     def __init__(self, NFconfig: NILMFormerConfig):
         super().__init__()
         assert not NFconfig.d_model % NFconfig.n_head, (
@@ -125,10 +186,22 @@ class EncoderLayer(nn.Module):
         )
 
     def forward(self, x, gamma=None, beta=None) -> torch.Tensor:
+        """Forward pass through the encoder layer.
+
+        Args:
+            x: (B, L, d_model) input tensor.
+            gamma: Optional FiLM scale parameter, broadcastable to (B, L, d_model).
+            beta: Optional FiLM shift parameter, broadcastable to (B, L, d_model).
+
+        Returns:
+            (B, L, d_model) output tensor.
+        """
+        # Pre-norm self-attention block
         x = self.norm1(x)
         new_x = self.attention_layer(x)
         x = torch.add(x, new_x)
 
+        # Pre-norm feed-forward block with optional FiLM after PFFN output
         x = self.norm2(x)
         new_x = self.pffn(x)
         if gamma is not None and beta is not None:

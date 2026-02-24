@@ -1,7 +1,4 @@
-"""Main entry point for NILM experiments -- CondiNILM.
-
-Author: Siyi Li
-"""
+"""Main entry point for NILM experiments -- CondiNILM."""
 
 import argparse
 import os
@@ -51,7 +48,6 @@ from src.helpers.dataset_params import (
 FIXED_EXPERIMENT_SEED = 42
 
 
-# Helper functions for config management
 def _set_cfg_value(expes_config, key, value, default_value=None):
     """Set config value, optionally only if current equals default."""
     if key not in expes_config:
@@ -431,7 +427,6 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
         except Exception as e:
             logging.debug("_configure_nilm_loss_hyperparams: multi-device stats failed: %s", e)
 
-    # ============== Basic statistics ==============
     on_values = flat[on_mask] if on_mask.any() else flat
     off_values = flat[~on_mask] if (~on_mask).any() else flat
     try:
@@ -449,7 +444,7 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     std_on = float(on_values.std()) if on_values.size > 1 else 0.0
     cv_on = std_on / (mean_on + 1e-6)  # coefficient of variation
 
-    # ============== ON-event statistics (avoid false events from window stitching) ==============
+    # Count ON-events using per-row diffs to avoid false events from window stitching
     total_samples = int(status_bin.size)
     try:
         if status_bin.ndim == 2 and status_bin.shape[0] > 0 and status_bin.shape[1] > 1:
@@ -477,7 +472,6 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
         logging.debug("_configure_nilm_loss_hyperparams: overlap adjustment failed: %s", e)
         n_events_adj = int(n_events)
 
-    # ============== Device type classification ==============
     device_type = classify_device_type(
         duty_cycle,
         peak_power,
@@ -507,7 +501,6 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
         if "output_stats_std_max" not in expes_config:
             expes_config["output_stats_std_max"] = 0.2
 
-    # ============== Power change statistics ==============
     if flat.size > 1:
         diff_all = np.abs(np.diff(flat))
         diff_on = np.abs(np.diff(on_values)) if on_values.size > 1 else diff_all
@@ -523,12 +516,6 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     ratio = edge_level / (noise_level + 1e-6)
     ratio = 1.0 if not np.isfinite(ratio) else min(max(ratio, 1.0), 10.0)
     lambda_grad = 0.2 + (0.8 - 0.2) * (ratio - 1.0) / 9.0
-
-    # ============== Set parameters based on device type ==============
-    # Key improvements:
-    # 1. Reduce OFF penalty weight (lambda_off_hard) to avoid all-zero outputs
-    # 2. Add ON recall penalty (lambda_on_recall) to ensure non-zero outputs when ON
-    # 3. Set a reasonable off_margin that allows small noise
 
     device_params = get_device_loss_params(device_type, duty_cycle)
     try:
@@ -552,16 +539,15 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
             device_params["lambda_on_recall"] = max(1.5, min(2.5, lam_on * 1.2))
             device_params["lambda_gate_cls"] = min(0.25, lam_gate * 1.1)
 
-            # Only set anti_collapse_weight if not already configured from YAML (has positive value)
+            # Only set anti_collapse_weight if not already configured from YAML
             try:
                 cur_anti = float(getattr(expes_config, "anti_collapse_weight", 0.0) or 0.0)
             except Exception:
                 cur_anti = 0.0
-            if cur_anti <= 0:  # Only force default if not configured
+            if cur_anti <= 0:
                 expes_config["anti_collapse_weight"] = 1.0
-            # Note: YAML anti_collapse_weight=0.3 will be respected, not overwritten to 1.0
 
-            # Only set penalty weights if not already configured from YAML (have positive value)
+            # Only set penalty weights if not already configured from YAML
             cur_szp = float(getattr(expes_config, "state_zero_penalty_weight", -1.0) or -1.0)
             cur_ohap = float(getattr(expes_config, "off_high_agg_penalty_weight", -1.0) or -1.0)
             if cur_szp < 0:  # Not configured from YAML
@@ -586,7 +572,6 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
     lambda_energy = device_params["lambda_energy"]
     off_margin = device_params["off_margin"]
 
-    # ============== soft_temp and edge_eps ==============
     soft_temp_raw = max(0.25 * thr, 2.0 * noise_level, 1.0)
     edge_eps_raw = max(3.0 * noise_level, 0.5 * edge_level, 0.1 * thr, 1.0)
 
@@ -604,7 +589,7 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
         logging.debug("_configure_nilm_loss_hyperparams: off_margin calculation failed: %s", e)
         off_margin_raw = 0.0
     
-    # ============== energy_floor ==============
+    # Compute energy_floor from per-window energy distribution
     try:
         energy_all = power.sum(axis=-1)
         if energy_all.size > 0:
@@ -621,7 +606,6 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
         logging.debug("_configure_nilm_loss_hyperparams: energy_floor calculation failed: %s", e)
         energy_floor_raw = thr * power.shape[-1] * 0.1
 
-    # ============== Write back to config ==============
     # Allow user overrides from command line / config files
     if "loss_lambda_zero" not in expes_config or expes_config.loss_lambda_zero == 0.0:
         expes_config["loss_lambda_zero"] = float(lambda_zero)
@@ -704,8 +688,7 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
         off_margin,
     )
 
-    # ============== Ensure device_stats_for_loss is set for single device training ==============
-    # This is critical for per-device gate tuning in AdaptiveDeviceLoss
+    # Populate device_stats_for_loss for single-device training (needed by AdaptiveDeviceLoss)
     if n_ch == 1 and not device_stats_for_loss:
         app_name = str(getattr(expes_config, "appliance", "") or "")
         if app_name:
@@ -797,11 +780,10 @@ def _configure_nilm_loss_hyperparams(expes_config, data, threshold):
 
 
 def get_cache_path(expes_config: OmegaConf):
-    """
-    Generate cache path that uniquely identifies the data configuration.
+    """Generate cache path that uniquely identifies the data configuration.
 
-    FIXED: Now includes specific device list (app) AND house numbers in the cache key
-    to prevent loading wrong cached data when different configurations are used.
+    Includes specific device list (app) and house numbers in the cache key
+    to avoid loading cached data from a different configuration.
     """
     overlap = getattr(expes_config, "overlap", 0.0)
     overlap_str = "ov{}".format(str(overlap).replace(".", "p"))
@@ -950,9 +932,8 @@ def launch_one_experiment(expes_config: OmegaConf):
             expes_config["train_num_crops"] = 1
             logging.info("Non-NILMFormer model: set train_num_crops=1 (override expes.yaml default of %d)", cur_crops)
         # limit_train/val_batches: respect expes.yaml / hpo_override values for all models.
-        # V9 showed that forcing 1.0 causes transformer baselines (BERT4NILM, Energformer)
-        # to collapse, while simple models (CNN1D, BiGRU) work fine with either setting.
-        # Let each model's config decide; hpo_override can further customize per-model.
+        # Forcing 1.0 causes transformer baselines (BERT4NILM, Energformer) to collapse.
+        # Each model's config decides; hpo_override can further customize per-model.
 
     ds_post = params_manager.get_postprocess_config(dataset_name)
     if isinstance(ds_post, dict) and ds_post:
@@ -1043,12 +1024,11 @@ def launch_one_experiment(expes_config: OmegaConf):
             expes_config["loss_params_per_device"] = merged
 
     hpo_override = getattr(expes_config, "hpo_override", None)
-    # Fix: OmegaConf DictConfig is not isinstance(dict), check for items() method
+    # OmegaConf DictConfig does not pass isinstance(dict); check for items() instead
     if hpo_override is not None and hasattr(hpo_override, 'items'):
-        # V8: UNIFIED HPO guard — same logic for ALL datasets.
-        # HPO params apply UNLESS the dataset's ds_loss explicitly overrides them.
-        # For non-NILMFormer models, ds_loss was not applied, so don't protect those keys
-        # (allow HPO to set loss_type, output_ratio, etc. from baseline_configs.yaml).
+        # HPO params apply unless the dataset's ds_loss explicitly overrides them.
+        # For non-NILMFormer models, ds_loss was not applied, so those keys are unprotected
+        # (allowing HPO to set loss_type, output_ratio, etc. from baseline_configs.yaml).
         _ds_loss_keys = set(ds_loss.keys()) if (ds_loss and _is_nilmformer) else set()
         skipped = []
         for key, value in hpo_override.items():
@@ -1064,7 +1044,7 @@ def launch_one_experiment(expes_config: OmegaConf):
                 pass
         if skipped:
             logging.info("HPO override for %s: applied all except ds_loss keys %s", dataset_name, skipped)
-        # V9: Map flat 'lr' key to model_training_param.lr for baseline configs
+        # Map flat 'lr' key to model_training_param.lr for baseline configs
         hpo_lr = hpo_override.get("lr") if hasattr(hpo_override, "get") else None
         if hpo_lr is not None:
             try:
@@ -1085,12 +1065,12 @@ def launch_one_experiment(expes_config: OmegaConf):
         logging.info("Load cached preprocessed data from %s", cache_path)
         cache = torch.load(cache_path, weights_only=False)
 
-        # V8: Cache version check - reject pre-fix cache (scaler fitted on all houses)
+        # Reject stale cache where scaler was fitted on all houses (data leakage)
         cache_ver = cache.get("cache_version", 1)
         if cache_ver < 2:
             raise RuntimeError(
-                f"STALE CACHE (v{cache_ver}): {cache_path} was generated before V8 scaler fix. "
-                f"Scaler was fitted on test data (data leakage). "
+                f"STALE CACHE (v{cache_ver}): {cache_path} was generated before the "
+                f"train-only scaler fix. Scaler was fitted on test data (data leakage). "
                 f"Delete this file and re-run to regenerate with train-only scaler."
             )
 
@@ -1114,7 +1094,7 @@ def launch_one_experiment(expes_config: OmegaConf):
                 logging.info(f"Updated c_out from cache: {n_devices}")
 
         _apply_cutoff_to_loss_params(expes_config)
-        # V8: Use tuple_data[0] (train data) for loss config, not tuple_data[3] (all data)
+        # Use train data for loss config to avoid test data leakage
         try:
             if isinstance(tuple_data, tuple) and len(tuple_data) >= 1:
                 data_for_loss_cfg = tuple_data[0]
@@ -1141,10 +1121,10 @@ def launch_one_experiment(expes_config: OmegaConf):
                 except Exception:
                     pass
         hpo_override = getattr(expes_config, "hpo_override", None)
-        # Fix: OmegaConf DictConfig is not isinstance(dict), check for items() method
+        # OmegaConf DictConfig does not pass isinstance(dict); check for items() instead
         if hpo_override is not None and hasattr(hpo_override, 'items'):
             # For NILMFormer, ds_loss keys are protected from HPO override.
-            # For baselines, ds_loss was not applied, so don't protect those keys.
+            # For baselines, ds_loss was not applied, so those keys are unprotected.
             _ds_loss_keys = set(ds_loss.keys()) if (ds_loss and _is_nilmformer) else set()
             hpo_dict = dict(hpo_override)
             applied = 0
@@ -1162,7 +1142,7 @@ def launch_one_experiment(expes_config: OmegaConf):
                 except Exception as e:
                     logging.warning("Failed to apply HPO override %s=%s: %s", key, value, e)
             logging.info("Applied %d/%d HPO overrides (cached branch, dataset=%s, skipped ds_loss keys: %s)", applied, len(hpo_dict), dataset_name, skipped)
-            # V9: Map flat 'lr' key to model_training_param.lr for baseline configs
+            # Map flat 'lr' key to model_training_param.lr for baseline configs
             hpo_lr = hpo_dict.get("lr")
             if hpo_lr is not None:
                 try:
@@ -1209,7 +1189,7 @@ def launch_one_experiment(expes_config: OmegaConf):
             appliance_params=ukdale_appliance_params if ukdale_appliance_params else None,
         )
 
-        # V8: Only load train+test houses (not all 5) to avoid non-target house contamination
+        # Only load train+test houses to avoid non-target house contamination
         all_houses = list(set(
             list(expes_config.ind_house_train_val) + list(expes_config.ind_house_test)
         ))
@@ -1225,8 +1205,8 @@ def launch_one_experiment(expes_config: OmegaConf):
             house_indicies=expes_config.ind_house_test
         )
 
-        # CRITICAL FIX: Sync expes_config.app with actual data shape
-        # This ensures device names match actual data for visualization and metrics
+        # Sync expes_config.app with actual data shape so device names
+        # match actual data for visualization and metrics
         actual_n_devices = data_train.shape[1] - 1  # Subtract aggregate
         actual_devices = [d for d in data_builder.mask_app if d != "aggregate"]
         original_devices = expes_config.app if isinstance(expes_config.app, list) else [expes_config.app]
@@ -1361,7 +1341,7 @@ def launch_one_experiment(expes_config: OmegaConf):
                 )
             )
 
-        # CRITICAL FIX: Sync expes_config.app with actual data shape
+        # Sync expes_config.app with actual data shape
         actual_n_devices = data_train.shape[1] - 1  # Subtract aggregate
         actual_devices = [d for d in data_builder.mask_app if d != "Aggregate"]
         original_devices = expes_config.app if isinstance(expes_config.app, list) else [expes_config.app]
@@ -1427,8 +1407,8 @@ def launch_one_experiment(expes_config: OmegaConf):
             house_indicies=expes_config.ind_house_test
         )
 
-        # CRITICAL FIX: Sync expes_config.app with actual filtered devices
-        # After auto_filter_devices, data_builder.mask_app may have changed
+        # Sync expes_config.app with actual filtered devices.
+        # After auto_filter_devices, data_builder.mask_app may have changed.
         actual_devices = [d for d in data_builder.mask_app if d != "aggregate"]
         original_devices = expes_config.app if isinstance(expes_config.app, list) else [expes_config.app]
         if set(actual_devices) != set(original_devices):
@@ -1469,7 +1449,7 @@ def launch_one_experiment(expes_config: OmegaConf):
 
     logging.info("             ... Done.")
 
-    # V8: Safety assertion — train and test houses must never overlap
+    # Assert train and test houses are disjoint to prevent data leakage
     _train_h = set(getattr(expes_config, "ind_house_train_val", []) or [])
     _test_h = set(getattr(expes_config, "ind_house_test", []) or [])
     if _train_h and _test_h:
@@ -1491,7 +1471,7 @@ def launch_one_experiment(expes_config: OmegaConf):
         app_key = candidates[0]
     threshold = data_builder.appliance_param[app_key]["min_threshold"]
     expes_config.threshold = threshold
-    # V8: Use train-only data for loss config to prevent test info leakage
+    # Use train-only data for loss config to prevent test info leakage
     _configure_nilm_loss_hyperparams(expes_config, data_train, threshold)
     logging.info("Loss auto-config source: data_train only (%d windows, shape=%s)", data_train.shape[0], data_train.shape)
 
@@ -1532,7 +1512,7 @@ def launch_one_experiment(expes_config: OmegaConf):
         power_scaling_type=expes_config.power_scaling_type,
         appliance_scaling_type=expes_config.appliance_scaling_type,
     )
-    # V8: Fit scaler on TRAIN data only to prevent test data leakage
+    # Fit scaler on train data only to prevent test data leakage
     scaler.fit(data_train)
     data_train = scaler.transform(data_train)
     data_valid = scaler.transform(data_valid)
@@ -1580,7 +1560,7 @@ def launch_one_experiment(expes_config: OmegaConf):
         "cutoff": expes_config.cutoff,
         "threshold": expes_config.threshold,
         "app_list": app_list_serializable,  # Save device names for visualization
-        "cache_version": 2,  # V8: scaler fit on train only, data excludes non-target houses
+        "cache_version": 2,  # scaler fit on train only, data excludes non-target houses
     }
     torch.save(cache, cache_path, pickle_protocol=4)
 
@@ -1778,9 +1758,9 @@ def main(
         expes_config["ind_house_test"] = ind_house_test
         logging.info("      Using custom test houses: %s", ind_house_test)
 
-    # V8: UNIFIED default multi-device house split from dataset_params.yaml.
-    # All datasets use the same code path — no dataset-specific hardcoding.
-    # Splits are defined in training.default_multi_train / default_multi_test.
+    # Default multi-device house split from dataset_params.yaml.
+    # All datasets use the same code path. Splits are defined in
+    # training.default_multi_train / default_multi_test.
     is_multi_device = len(selected_keys) > 1 or appliance_lower == "multi"
     if is_multi_device and ind_house_train_val is None and ind_house_test is None:
         training_cfg = params_manager.get_training_config(dataset_key)
@@ -1966,7 +1946,6 @@ if __name__ == "__main__":
         default=None,
         help="Comma-separated list of house indices for testing (e.g., '5').",
     )
-    # ============ Two-Stage Training Arguments ============
     parser.add_argument(
         "--freeze_devices",
         type=str,

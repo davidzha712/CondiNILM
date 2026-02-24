@@ -1,6 +1,8 @@
-"""InceptionTime baseline for time-series regression -- CondiNILM.
+"""InceptionTime: Inception-based model for time-series classification/regression.
 
-Author: Siyi Li
+Stacks InceptionBlocks, each containing three InceptionModules with multi-scale
+convolutions (bottleneck + parallel branches at different kernel sizes + maxpool
+branch) and a residual shortcut. Ends with global average pooling and a linear head.
 """
 
 import torch
@@ -171,17 +173,15 @@ class InceptionModule(nn.Module):
         activation=nn.ReLU(),
         return_indices=False,
     ):
-        """
-        : param in_channels          Number of input channels (input features)
-        : param n_filters            Number of filters per convolution layer => out_channels = 4*n_filters
-        : param kernel_sizes         List of kernel sizes for each convolution.
-                                     Each kernel size must be odd number that meets -> "kernel_size % 2 !=0".
-                                     This is nessesery because of padding size.
-                                     For correction of kernel_sizes use function "correct_sizes".
-        : param bottleneck_channels  Number of output channels in bottleneck.
-                                     Bottleneck wont be used if nuber of in_channels is equal to 1.
-        : param activation           Activation function for output tensor (nn.ReLU()).
-        : param return_indices       Indices are needed only if we want to create decoder with InceptionTranspose with MaxUnpool1d.
+        """Single Inception module with bottleneck, multi-scale parallel convolutions, and maxpool branch.
+
+        Args:
+            in_channels: Number of input channels. Bottleneck is bypassed when equal to 1.
+            n_filters: Number of filters per conv branch. Total output channels = (len(kernel_sizes) + 1) * n_filters.
+            kernel_sizes: List of odd kernel sizes for each parallel conv branch.
+            bottleneck_channels: Number of channels in the bottleneck 1x1 conv.
+            activation: Activation function applied after batch normalization.
+            return_indices: If True, also return maxpool indices (for decoder use).
         """
         super(InceptionModule, self).__init__()
         self.return_indices = return_indices

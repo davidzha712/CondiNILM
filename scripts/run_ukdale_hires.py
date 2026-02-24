@@ -22,7 +22,6 @@ import subprocess
 import sys
 import yaml
 
-# ── Default high-res experiment parameters ──────────────────────────
 HIRES_DEFAULTS = dict(
     sampling_rate="6s",
     window_size=480,          # 480 × 6s = 48 min
@@ -122,7 +121,6 @@ def main():
     dataset_key, all_appliances = get_ukdale_appliances()
     appliances = parse_appliance_list(all_appliances, args.appliances)
 
-    # ── Build parameters ────────────────────────────────────────────
     sampling_rate = HIRES_DEFAULTS["sampling_rate"]
     window_size = args.window_size or HIRES_DEFAULTS["window_size"]
     batch_size = args.batch_size or HIRES_DEFAULTS["batch_size"]
@@ -191,7 +189,6 @@ def main():
         else:
             logging.info("<<< %s completed successfully.", appliance)
 
-    # ── Summary ─────────────────────────────────────────────────────
     logging.info("=" * 60)
     logging.info("SUMMARY")
     logging.info("=" * 60)

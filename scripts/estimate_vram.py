@@ -8,11 +8,9 @@ from src.nilmformer.model import NILMFormer
 def count_params(model):
     return sum(p.numel() for p in model.parameters())
 
-# c_in=1 (load curve only), c_embedding=8 (sin/cos encoded exo)
-# 4 exo vars * 2 (sin+cos) = 8 channels + 1 power = 9 total
+# 4 exogenous vars * 2 (sin+cos) = 8 embedding channels + 1 power channel = 9
 N_INPUT_CHANNELS = 9
 
-# Current config: d_model=128, 4 layers
 cfg128 = NILMFormerConfig(
     c_in=1, c_out=5, c_embedding=8,
     kernel_size=3, kernel_size_head=1,
@@ -27,7 +25,6 @@ model_128 = NILMFormer(cfg128)
 p128 = count_params(model_128)
 print(f"d_model=128, 4L: {p128:,} params ({p128*4/1024/1024:.1f}MB fp32)")
 
-# Larger: d_model=256, 6 layers
 cfg256 = NILMFormerConfig(
     c_in=1, c_out=5, c_embedding=8,
     kernel_size=3, kernel_size_head=1,
@@ -42,7 +39,6 @@ model_256 = NILMFormer(cfg256)
 p256 = count_params(model_256)
 print(f"d_model=256, 6L: {p256:,} params ({p256*4/1024/1024:.1f}MB fp32)")
 
-# Actual VRAM test with different batch sizes
 if torch.cuda.is_available():
     device = torch.device("cuda")
     torch.cuda.reset_peak_memory_stats()

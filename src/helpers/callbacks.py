@@ -1,7 +1,4 @@
-"""Lightning callbacks for validation and logging -- CondiNILM.
-
-Author: Siyi Li
-"""
+"""PyTorch Lightning callbacks for NILM validation, metric logging, and adaptive tuning."""
 
 import os
 import logging
@@ -25,26 +22,32 @@ from src.helpers.evaluation import _save_val_data
 
 
 def _coerce_appliance_names(expes_config, n_app, fallback_name=None):
+    """Delegate to experiment._coerce_appliance_names."""
     from src.helpers.experiment import _coerce_appliance_names as _impl
     return _impl(expes_config, n_app, fallback_name)
 
 
 def _to_jsonable(value):
+    """Delegate to experiment._to_jsonable."""
     from src.helpers.experiment import _to_jsonable as _impl
     return _impl(value)
 
 
 def _sanitize_tb_tag(value):
+    """Delegate to experiment._sanitize_tb_tag."""
     from src.helpers.experiment import _sanitize_tb_tag as _impl
     return _impl(value)
 
 
 def _append_jsonl(path, record):
+    """Delegate to experiment._append_jsonl."""
     from src.helpers.experiment import _append_jsonl as _impl
     return _impl(path, record)
 
 
 class ValidationHTMLCallback(pl.Callback):
+    """Save validation predictions to disk at the end of each validation epoch."""
+
     def __init__(self, valid_loader, scaler, expes_config):
         super().__init__()
         self.valid_loader = valid_loader
@@ -61,11 +64,7 @@ class ValidationHTMLCallback(pl.Callback):
 
 
 class RobustLossEpochCallback(pl.Callback):
-    """
-    Callback to update epoch for RobustMultiDeviceLoss.
-
-    This enables warmup scheduling and collapse detection/recovery.
-    """
+    """Notify RobustMultiDeviceLoss of epoch boundaries for warmup and collapse recovery."""
 
     def on_train_epoch_start(self, trainer, pl_module):
         criterion = getattr(pl_module, "criterion", None)
@@ -83,10 +82,9 @@ class RobustLossEpochCallback(pl.Callback):
                     "RobustMultiDeviceLoss: Collapse detected at epoch %d, recovery mode active",
                     trainer.current_epoch
                 )
-                # Reset collapse flag after logging
                 criterion.collapse_detected = False
 
-        # Log device weights if using uncertainty weighting
+        # Log per-device loss weights when available
         if criterion is not None:
             if hasattr(criterion, "inner_loss"):
                 inner = criterion.inner_loss
@@ -99,6 +97,13 @@ class RobustLossEpochCallback(pl.Callback):
 
 
 class ValidationNILMMetricCallback(pl.Callback):
+    """Compute NILM metrics on validation data, log to TensorBoard, and write JSONL reports.
+
+    Applies post-processing (thresholding, short-activation suppression, gate suppression,
+    gap filling, power clipping) per device, then computes timestamp-level and window-level
+    metrics. Also runs adaptive loss tuning and collapse detection.
+    """
+
     def __init__(self, valid_loader, scaler, expes_config):
         super().__init__()
         self.valid_loader = valid_loader
@@ -106,7 +111,7 @@ class ValidationNILMMetricCallback(pl.Callback):
         self.expes_config = expes_config
         self.metrics = NILMmetrics()
         self.adaptive_tuner = AdaptiveLossTuner()
-        self.epoch_records = []  # V9: track per-epoch metrics for training curves
+        self.epoch_records = []
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if getattr(trainer, "sanity_checking", False):
@@ -191,8 +196,6 @@ class ValidationNILMMetricCallback(pl.Callback):
             "off_long_run_pred_max": 0.0,
             "off_long_run_total_len": 0,
         }
-        # Use FP32 for validation to match training precision (force_fp32=True)
-        # bfloat16 autocast removed to prevent numerical instability
         with torch.no_grad():
             for batch in self.valid_loader:
                 if isinstance(batch, (list, tuple)):
@@ -649,10 +652,7 @@ class ValidationNILMMetricCallback(pl.Callback):
                     thr_j = float(threshold_postprocess)
                     if isinstance(cfg_j, Mapping):
                         thr_j = float(cfg_j.get("postprocess_threshold", thr_j))
-                    # FIX: Use SAME threshold for BOTH y_state and y_hat_state
-                    # This ensures consistent ON/OFF determination for metrics
-                    # Previously y_state used dataset labels (high threshold like 2000W)
-                    # while y_hat_state used postprocess threshold (low like 20W)
+                    # Derive ON/OFF state from power using the same threshold for both
                     y_state_j = (y_j > thr_j).astype(int)
                     y_hat_state_j = (y_hat_j > thr_j).astype(int)
                     metrics_timestamp_per_device[str(device_names[j])] = self.metrics(
@@ -805,13 +805,13 @@ class ValidationNILMMetricCallback(pl.Callback):
         _append_jsonl(os.path.join(group_dir, "val_report.jsonl"), record)
         logging.info("VAL_REPORT_JSON: %s", json.dumps(_to_jsonable(record), ensure_ascii=False))
 
-        # V13: Log val_F1 for ModelCheckpoint monitoring (F1-based best checkpoint)
+        # Log val_F1 for ModelCheckpoint monitoring
         if isinstance(metrics_timestamp, dict):
             f1_val = metrics_timestamp.get("F1_SCORE", 0.0)
             if f1_val is not None and np.isfinite(f1_val):
                 pl_module.log("val_F1", float(f1_val), prog_bar=True, sync_dist=True)
 
-        # V9: Track per-epoch metrics for training curves
+        # Track per-epoch metrics for training curves
         curve_rec = {
             "epoch": int(trainer.current_epoch),
             "val_loss": float(trainer.callback_metrics.get("val_loss_main", float("nan"))),

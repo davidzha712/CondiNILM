@@ -1,7 +1,4 @@
-"""REDD dataset device availability analysis -- CondiNILM.
-
-Author: Siyi Li
-"""
+"""REDD dataset device availability analysis -- CondiNILM."""
 
 import pandas as pd
 import numpy as np
@@ -36,18 +33,15 @@ for house in range(1, 7):
     csv_files = sorted(glob.glob(pattern))
 
     if csv_files:
-        # Load first file to get column names
         df_first = pd.read_csv(csv_files[0], nrows=10)
         raw_cols = [c for c in df_first.columns if c not in ["Unnamed: 0", "index"]]
 
-        # Load all data for activity analysis
         all_data = []
         for csv_file in csv_files:
             df = pd.read_csv(csv_file, index_col=0)
             all_data.append(df)
         house_data = pd.concat(all_data, ignore_index=True)
 
-        # Standardize column names
         standardized_cols = {}
         for col in raw_cols:
             if col in REDD_APPLIANCE_MAPPING:
@@ -62,7 +56,6 @@ for house in range(1, 7):
         print(f"House {house} - Standardized devices: {sorted(standardized_cols.values())}")
         print("-" * 60)
 
-        # Check activity level for each device
         activity = {}
         for raw_col, std_col in standardized_cols.items():
             if raw_col in house_data.columns:
@@ -88,12 +81,10 @@ print("Common Devices Analysis")
 print("=" * 80)
 
 if len(house_columns) >= 2:
-    # Find common devices across all houses
     common_all = set.intersection(*house_columns.values())
     print(f"\nDevices in ALL {len(house_columns)} houses:")
     if common_all:
         for dev in sorted(common_all):
-            # Check activity across all houses
             activities = []
             for h in house_columns.keys():
                 act = house_device_activity.get(h, {}).get(dev, {}).get("active_rate", 0)
@@ -102,19 +93,16 @@ if len(house_columns) >= 2:
     else:
         print("  NONE - No device exists in all houses!")
 
-    # Find devices common to subsets of houses
     print("\n" + "-" * 40)
     print("Common devices by house combinations:")
     print("-" * 40)
 
     houses_list = sorted(house_columns.keys())
 
-    # Check combinations from largest to smallest
     for n in range(len(houses_list), 1, -1):
         for combo in combinations(houses_list, n):
             common = set.intersection(*[house_columns[h] for h in combo])
             if common:
-                # Filter to devices with meaningful activity (>0.3%) in ALL houses in combo
                 active_common = []
                 for dev in common:
                     min_activity = min(
@@ -133,14 +121,12 @@ print("\n" + "=" * 80)
 print("RECOMMENDED MULTI-DEVICE TRAINING CONFIGURATIONS")
 print("=" * 80)
 
-# Find best configurations for multi-device training
 best_configs = []
 
 for n_houses in range(len(houses_list), 1, -1):
     for combo in combinations(houses_list, n_houses):
         common = set.intersection(*[house_columns[h] for h in combo])
 
-        # Filter to devices with activity >0.3% in ALL houses
         active_devices = []
         for dev in common:
             activities = [
@@ -167,7 +153,6 @@ for n_houses in range(len(houses_list), 1, -1):
                 "score": score
             })
 
-# Sort by score (devices * houses)
 best_configs.sort(key=lambda x: (x["score"], x["n_devices"]), reverse=True)
 
 print("\nTop 5 configurations (sorted by devices x houses):\n")

@@ -1,7 +1,4 @@
-"""PyTorch Dataset classes and scalers -- CondiNILM.
-
-Author: Siyi Li
-"""
+"""PyTorch Dataset classes and NILM data scalers."""
 
 import torch
 import numpy as np
@@ -9,13 +6,12 @@ import pandas as pd
 
 
 class NILMscaler:
-    """
-    Scale NILM dataset
+    """Scaler for 4D NILM arrays of shape [N, M+1, 2, L].
 
-    Nilm data need to be 4D Numpy array following the convention:
-    [N_sequences, Card[Agg_Power, 1_appliance,.., M_appliance], 2-dim:0:Power/1:States, Window Length]
-
-    Follow sklearn convention (fit/transform/fit_transform) and is callable
+    Axes: [sequences, aggregate+appliances, power/states, time_steps].
+    Supports StandardScaling, MinMax, MeanScaling, MeanMaxScaling, MaxScaling.
+    Appliances can use their own scaling or share the aggregate scaling ("SameAsPower").
+    Follows the sklearn fit/transform/fit_transform convention and is callable.
     """
 
     def __init__(
@@ -282,10 +278,11 @@ class NILMscaler:
 
 
 class TSDatasetScaling(torch.utils.data.Dataset):
-    """
-    MAP-Style PyTorch Time series Dataset
+    """Map-style PyTorch dataset for time series classification.
 
-    Scaling computed on the fly
+    Optionally applies z-score normalization (dataset-wide or per-instance) and
+    appends cyclical or linear time-feature channels computed from start dates.
+    Returns (sample, label) pairs or bare samples when labels are None.
     """
 
     def __init__(
@@ -497,12 +494,12 @@ class TSDatasetScaling(torch.utils.data.Dataset):
 
 
 class NILMDataset(torch.utils.data.Dataset):
-    """
-    Pytorch dataset
+    """Map-style PyTorch dataset for NILM disaggregation.
 
-    - X, 4D Numpy array : N subsequences, M appliances, Power/Activation, Values
-    - st_date, pd.dataframe : Starting date of each subsequence
-    - scaler, Boolean : True if apply scaling
+    Wraps a 4D array of shape [N, M+1, 2, L] (sequences, aggregate+appliances,
+    power/states, time_steps). Each __getitem__ returns:
+      - pretraining=True:  input features only (aggregate + optional temperature/exo/cam)
+      - pretraining=False: (input_features, target_power, target_states, window_labels)
     """
 
     def __init__(
@@ -674,11 +671,6 @@ class NILMDataset(torch.utils.data.Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        """
-        Return Tuple as follow (pretraining=False):
-
-            Aggregate/Temp/Encoding, All App. Power, All App. Activation States, Window-level ON/OFF labels
-        """
         if self.use_temperature:
             tmp_sample = self.samples[idx, 0, :2, :].copy()
         else:

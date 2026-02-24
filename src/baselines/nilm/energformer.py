@@ -1,6 +1,8 @@
-"""Energformer baseline -- CondiNILM.
+"""Energformer: Linear-attention Transformer for non-intrusive load monitoring.
 
-Author: Siyi Li
+Uses a two-layer 1D conv embedding, sinusoidal positional encoding, stacked
+Transformer encoder layers with linear (kernel-based) multi-head attention and
+conv feed-forward blocks (SquaredGELU), followed by a linear output head.
 """
 import math
 import torch
@@ -70,52 +72,44 @@ elu_feature_map = ActivationFunctionFeatureMap.factory(
 
 
 class SquaredReLU(Module):
-    """
-    Squared ReLU activation
-    """
+    """Squared ReLU activation: ReLU(x)^2."""
 
     def __init__(self):
         super().__init__()
         self.relu = nn.ReLU()
 
     def forward(self, x: torch.Tensor):
-        # Apply ReLU
         x = self.relu(x)
-        # Square it
         return x * x
 
 
 class SquaredGELU(Module):
-    """
-    ## Squared GELU activation
-    """
+    """Squared GELU activation: GELU(x)^2."""
 
     def __init__(self):
         super().__init__()
         self.gelu = nn.GELU()
 
     def forward(self, x: torch.Tensor):
-        # Apply GELU
         x = self.gelu(x)
-        # Square it
         return x * x
 
 
 class SpatialDepthWiseConvolution(Module):
-    """
-    ## Spatial Depth Wise Convolution
+    """Depth-wise 1D convolution applied per attention head.
+
+    From Primer (So et al., 2021). Each channel gets its own convolution kernel.
+    Pads both sides then crops the trailing elements to maintain sequence length.
     """
 
     def __init__(self, d_k: int, kernel_size: int = 3):
         """
-        * `d_k` is the number of channels in each head
+        Args:
+            d_k: Number of channels per attention head.
+            kernel_size: Convolution kernel size.
         """
         super().__init__()
         self.kernel_size = kernel_size
-        # We use PyTorch's `Conv1d` module.
-        # We set the number of groups to be equal to the number of channels so that it does a separate convolution
-        # (with different kernels) for each channel.
-        # We add padding to both sides and later crop the right most `kernel_size - 1` results
         self.conv = nn.Conv1d(
             in_channels=d_k,
             out_channels=d_k,
@@ -125,26 +119,11 @@ class SpatialDepthWiseConvolution(Module):
         )
 
     def forward(self, x: torch.Tensor):
-        """
-        'x' has shape '[batch_size, seq_len, heads, d_k]'
-        """
-
-        # Get the shape
+        """Apply depth-wise conv to x of shape (batch, seq_len, heads, d_k)."""
         batch_size, seq_len, heads, d_k = x.shape
-        # Permute to `[batch_size, heads, d_k, seq_len]`
-        x = x.permute(0, 2, 3, 1)
-        # Change the shape to `[batch_size * heads, d_k, seq_len]`
-        x = x.reshape(batch_size * heads, d_k, seq_len)
-
-        # 1D convolution accepts input of the form `[N, channels, sequence]`
-        x = self.conv(x)
-        # Crop the right most `kernel_size - 1` results since we padded both sides
-        x = x[:, :, : -(self.kernel_size - 1)]
-        # Reshape to `[batch_size, heads, d_k, seq_len]`
-        x = x.reshape(batch_size, heads, d_k, seq_len)
-        # Permute to `[batch_size, seq_len, heads, d_k]`
-        x = x.permute(0, 3, 1, 2)
-
+        x = x.permute(0, 2, 3, 1).reshape(batch_size * heads, d_k, seq_len)
+        x = self.conv(x)[:, :, : -(self.kernel_size - 1)]
+        x = x.reshape(batch_size, heads, d_k, seq_len).permute(0, 3, 1, 2)
         return x
 
 
@@ -159,23 +138,11 @@ def linear_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, eps):
 
 
 class LinearMultiHeadAttention(nn.Module):
-    """
-    Implement unmasked attention using dot product of feature maps in
-    O(N D^2) complexity.
-    Given the queries, keys and values as Q, K, V instead of computing
-        V' = softmax(Q.mm(K.t()), dim=-1).mm(V),
-    we make use of a feature map function Φ(.) and perform the following
-    computation
-        V' = normalize(Φ(Q).mm(Φ(K).t())).mm(V).
-    The above can be computed in O(N D^2) complexity where D is the
-    dimensionality of Q, K and V and N is the sequence length. Depending on the
-    feature map, however, the complexity of the attention might be limited.
-    Arguments
-    ---------
-        feature_map: callable, a callable that applies the feature map to the
-                     last dimension of a tensor (default: elu(x)+1)
-        eps: float, a small number to ensure the numerical stability of the
-             denominator (default: 1e-6)
+    """Linear multi-head attention using kernel feature maps for O(N*D^2) complexity.
+
+    Applies ELU+1 feature maps to queries and keys, then computes attention
+    via the associative property of matrix multiplication. Includes
+    SpatialDepthWiseConvolution on Q, K, V projections (from Primer).
     """
 
     def __init__(self, d_model: int, n_head: int, dropout: float, eps: float = 1e-6):
@@ -188,7 +155,6 @@ class LinearMultiHeadAttention(nn.Module):
         assert d_model % n_head == 0, "d_model should be divisible by n_head"
         self.head_dim = d_model // n_head
 
-        # Q, K, V with SpatialDepthWiseConvolution from "Primer: Searching for Efficient Transformers for Language Modeling"
         self.q_proj = nn.Linear(d_model, d_model)
         self.q_sdwc = SpatialDepthWiseConvolution(self.head_dim)
         self.k_proj = nn.Linear(d_model, d_model)
@@ -201,11 +167,7 @@ class LinearMultiHeadAttention(nn.Module):
         self.feature_map = elu_feature_map(d_model)
 
     def forward(self, query, key, value):
-        """
-        :param query: [batch_size, seq_len, d_model]
-        :param key: [batch_size, seq_len, d_model]
-        :param value: [batch_size, seq_len, d_model]
-        """
+        """Compute linear attention. All inputs have shape (batch, seq_len, d_model)."""
         q = self.q_proj(query)
         k = self.k_proj(key)
         v = self.v_proj(value)
@@ -213,7 +175,6 @@ class LinearMultiHeadAttention(nn.Module):
         batch_size, q_len, _ = q.size()
         k_len, v_len = k.size(1), v.size(1)
 
-        # Reshape to [batch_size, seq_len, n_head, head_dim] and apply SpatialDepthWiseConvolution
         q = self.q_sdwc(q.reshape(batch_size, q_len, self.n_head, self.head_dim))
         k = self.k_sdwc(k.reshape(batch_size, k_len, self.n_head, self.head_dim))
         v = self.v_sdwc(v.reshape(batch_size, v_len, self.n_head, self.head_dim))
@@ -231,22 +192,19 @@ class LinearMultiHeadAttention(nn.Module):
 
 
 class ConvFeedForward(nn.Module):
+    """Two-layer 1D conv (kernel=1) feed-forward block with SquaredGELU activation."""
+
     def __init__(self, d_model, d_cc):
         super(ConvFeedForward, self).__init__()
-        """
-        According to the paper "instead of a Feed-forward neural network (FNN) we utilize two 1D convolutional layers with kernel set to 1."
-
-        However, Conv1d with kernel size 1 is equivalent to a Linear ... Nevertheless, they also use a squared GELU instead of a standard one
-        """
         self.layer1 = nn.Conv1d(in_channels=d_model, out_channels=d_cc, kernel_size=1)
         self.layer2 = nn.Conv1d(in_channels=d_cc, out_channels=d_model, kernel_size=1)
         self.act = SquaredGELU()
 
     def forward(self, x):
-        # Input as [batch, seq_length, dmodel]
-        x = self.layer1(x.permute(0, 2, 1))  # Permute as [batch, d_model, seq_length]
+        """Input/output shape: (batch, seq_len, d_model)."""
+        x = self.layer1(x.permute(0, 2, 1))
         x = self.act(x)
-        x = self.layer2(x).permute(0, 2, 1)  # Permute as [batch, seq_length, d_model]
+        x = self.layer2(x).permute(0, 2, 1)
         return x
 
 
@@ -267,27 +225,20 @@ class TransformerLayer(nn.Module):
         self.dropout = nn.Dropout(ffn_dropout)
 
     def forward(self, x) -> torch.Tensor:
-        # x input and output shape [batch, seq_length, d_model] to meet Transformer Convention
-
-        # Attention Block
+        """Input/output shape: (batch, seq_len, d_model)."""
         new_x = self.lmha(x, x, x)
-
-        # Add and Norm
         x = self.norm1(torch.add(x, new_x))
-
-        # PFFN Block
         new_x = self.cffn(x)
-
-        # Add (dropout) and Norm
         x = self.norm2(torch.add(x, self.dropout(new_x)))
 
         return x
 
 
 class PositionalEmbedding(nn.Module):
+    """Fixed sinusoidal positional encoding (Vaswani et al., 2017)."""
+
     def __init__(self, d_model, max_len=5000):
         super(PositionalEmbedding, self).__init__()
-        # Compute the positional encodings once in log space.
         pe = torch.zeros(max_len, d_model).float()
         pe.require_grad = False
 
@@ -320,11 +271,7 @@ class Energformer(nn.Module):
         ffn_dropout=0.2,
     ):
         super().__init__()
-        """
-        PyTorch implementation of Energformer
-        """
 
-        # According to Fig 1 and  Section B "the kernel size for the convolutional layers of our model was set to 3 in both layers and stride was set to 1, with ReLU as activation function."
         self.embedding = nn.Sequential(
             *[
                 nn.Conv1d(
@@ -344,10 +291,8 @@ class Energformer(nn.Module):
             ]
         )
 
-        # Fixed Positional Encoding from Attention is all you Need
         self.pe = PositionalEmbedding(d_model, max_len=5000)
 
-        # Transformer Encoder Block
         self.encoder = nn.Sequential(
             *[
                 TransformerLayer(
@@ -361,7 +306,6 @@ class Energformer(nn.Module):
             ]
         )
 
-        # According to Fig 1 and  Section B "Between linear layers, we apply a ReLU activation function."
         self.output_ffn = nn.Sequential(
             *[
                 nn.Linear(d_model, 64),
@@ -373,16 +317,9 @@ class Energformer(nn.Module):
         )
 
     def forward(self, x):
-        # Input as [batch, c_in, seq_length]
-
-        # Forward embedding, permute and add PE
-        x = self.embedding(x).permute(0, 2, 1)  # [batch, seq_length, d_model]
-        x = x + self.pe(x)  # PE indexes by x.size(1)=seq_length
-
-        # Transformer Block
-        x = self.encoder(x)  # [batch, seq_length, d_model]
-
-        # Final Linear layers and permute
-        x = self.output_ffn(x).permute(0, 2, 1)  # [batch, c_out, seq_length]
-
+        """Forward pass. Input shape: (batch, c_in, seq_len). Output: (batch, c_out, seq_len)."""
+        x = self.embedding(x).permute(0, 2, 1)
+        x = x + self.pe(x)
+        x = self.encoder(x)
+        x = self.output_ffn(x).permute(0, 2, 1)
         return x

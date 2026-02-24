@@ -1,7 +1,4 @@
-"""Appliance electrical statistics analysis -- CondiNILM.
-
-Author: Siyi Li
-"""
+"""Appliance electrical statistics analysis -- CondiNILM."""
 
 import argparse
 import logging
@@ -62,7 +59,7 @@ def compute_appliance_stats_from_array(power: np.ndarray, status: np.ndarray) ->
     mean_all = float(power_flat.mean())
     std_all = float(power_flat.std())
 
-    # ============== Additional advanced statistics ==============
+    # Advanced statistics
 
     # 1. Peak-to-mean power ratio (for detecting high-power devices)
     peak_to_mean_ratio = peak / (mean_on + 1e-6) if mean_on > 0 else 0.0
@@ -83,7 +80,6 @@ def compute_appliance_stats_from_array(power: np.ndarray, status: np.ndarray) ->
     on_starts = np.where(status_diff == 1)[0]
     on_ends = np.where(status_diff == -1)[0]
 
-    # Handle boundary cases
     if status_flat[0]:
         on_starts = np.concatenate([[0], on_starts])
     if status_flat[-1] and len(on_ends) < len(on_starts):
@@ -115,7 +111,7 @@ def compute_appliance_stats_from_array(power: np.ndarray, status: np.ndarray) ->
     # peak power × duty_cycle
     power_density = peak * duty
 
-    # ============== Device type classification ==============
+    # Device type classification
     device_type = classify_device_type(
         duty_cycle=duty,
         peak_power=peak,

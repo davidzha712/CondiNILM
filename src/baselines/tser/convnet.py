@@ -1,6 +1,6 @@
-"""ConvNet baseline for time-series regression -- CondiNILM.
+"""ConvNet: Three-layer 1D CNN baseline for time-series classification/regression.
 
-Author: Siyi Li
+Three conv+BN+ReLU blocks with global average pooling and a linear classifier.
 """
 
 import torch

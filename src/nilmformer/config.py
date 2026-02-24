@@ -1,4 +1,4 @@
-"""NILMFormer configuration dataclass -- CondiNILM.
+"""NILMFormer configuration dataclass for CondiNILM.
 
 Author: Siyi Li
 """
@@ -8,32 +8,45 @@ from typing import List
 
 @dataclass
 class NILMFormerConfig:
-    c_in: int = 1
-    c_embedding: int = 8
-    c_out: int = 1
+    """Configuration for the NILMFormer model.
 
-    kernel_size: int = 3
-    kernel_size_head: int = 3
-    dilations: List[int] = field(default_factory=lambda: [1, 2, 4, 8])
-    conv_bias: bool = True
+    All fields are cast to their declared types in __post_init__ to allow
+    construction from loosely-typed sources (e.g. YAML, JSON).
+    """
 
-    use_efficient_attention: bool = False
-    n_encoder_layers: int = 3
-    d_model: int = 96
-    dp_rate: float = 0.2
-    pffn_ratio: int = 4
-    n_head: int = 8
-    norm_eps: float = 1e-5
-    mask_diagonal: bool = True
-    use_freq_features: bool = True
-    use_elec_features: bool = True
-    use_film: bool = True
-    film_hidden_dim: int = 32
+    # -- Input / output channels --
+    c_in: int = 1                   # Number of input channels (load curve)
+    c_embedding: int = 8            # Number of exogenous embedding channels
+    c_out: int = 1                  # Number of output device channels
 
-    kettle_channel_idx: int | None = None
-    type_ids_per_channel: List[int] | None = None
+    # -- Convolution embedding --
+    kernel_size: int = 3            # Kernel size for the DilatedBlock embedding
+    kernel_size_head: int = 3       # Kernel size for the SharedHead conv layer
+    dilations: List[int] = field(default_factory=lambda: [1, 2, 4, 8])  # Dilation rates for the DilatedBlock
+    conv_bias: bool = True          # Use bias in embedding convolutions
+
+    # -- Transformer encoder --
+    use_efficient_attention: bool = False  # Stored in attention module but not used in current forward
+    n_encoder_layers: int = 3       # Number of stacked EncoderLayer blocks
+    d_model: int = 96               # Hidden dimension (must be divisible by n_head and by 4)
+    dp_rate: float = 0.2            # Dropout rate for attention and feed-forward layers
+    pffn_ratio: int = 4             # Feed-forward expansion ratio (hidden_dim = d_model * pffn_ratio)
+    n_head: int = 8                 # Number of attention heads
+    norm_eps: float = 1e-5          # LayerNorm epsilon
+    mask_diagonal: bool = True      # Mask self-attention diagonal (prevent self-attending)
+
+    # -- FiLM conditioning --
+    use_freq_features: bool = True  # Include frequency-domain features in FiLM conditioning
+    use_elec_features: bool = True  # Include electrical statistics in FiLM conditioning
+    use_film: bool = True           # Enable FiLM modulation on encoder and output
+    film_hidden_dim: int = 32       # Hidden dimension of the FiLM MLP
+
+    # -- Device-specific settings --
+    kettle_channel_idx: int | None = None           # Output channel index for the kettle device
+    type_ids_per_channel: List[int] | None = None   # Group ID per output channel for shared prediction heads
 
     def __post_init__(self):
+        """Cast all fields to their declared types for robustness."""
         self.c_in = int(self.c_in)
         self.c_embedding = int(self.c_embedding)
         self.c_out = int(self.c_out)

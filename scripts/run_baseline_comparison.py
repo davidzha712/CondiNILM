@@ -1,10 +1,9 @@
 """Batch experiment runner for NILMFormer paper -- baseline comparison & ablation.
 
-V9: Per-model baseline configs from baseline_configs.yaml.
-Each baseline gets its own neutral training settings (loss, scheduler, batch_size, lr).
+Per-model baseline configs are loaded from baseline_configs.yaml.
+Each baseline gets its own training settings (loss, scheduler, batch_size, lr).
 NILMFormer keeps its optimized config.
 
-Author: Siyi Li
 Usage:
     python scripts/run_baseline_comparison.py --phase 1      # Table 1: UKDALE single-device per-model best
     python scripts/run_baseline_comparison.py --phase 2      # Table 2: UKDALE multi-device per-model best
@@ -53,10 +52,6 @@ else:
     PYTHON_EXE = sys.executable
 
 
-# ============================================================
-# Load per-model baseline configs
-# ============================================================
-
 def _load_baseline_configs():
     """Load per-model training profiles from baseline_configs.yaml."""
     cfg_path = ROOT_DIR / "configs" / "baseline_configs.yaml"
@@ -72,10 +67,6 @@ def _load_baseline_configs():
 
 BASELINE_CONFIGS = _load_baseline_configs()
 
-
-# ============================================================
-# Experiment definitions
-# ============================================================
 
 UKDALE_DEVICES = ["Kettle", "Microwave", "Fridge", "WashingMachine", "Dishwasher"]
 REFIT_DEVICES = ["Kettle", "Fridge", "WashingMachine", "Dishwasher"]
@@ -140,10 +131,6 @@ ABLATION_CONFIGS = {
 }
 
 
-# ============================================================
-# Command building
-# ============================================================
-
 def _get_model_config(model):
     """Get per-model training config from baseline_configs.yaml.
 
@@ -167,9 +154,9 @@ def _build_cmd(
 ):
     """Build a run_experiment.py command list.
 
-    V9: Automatically injects per-model training config from baseline_configs.yaml.
-    The config sets neutral defaults for baselines (plateau scheduler, SmoothL1 loss,
-    no gate, no anti-collapse) while NILMFormer keeps its optimized settings.
+    Automatically injects per-model training config from baseline_configs.yaml.
+    Baselines get neutral defaults (plateau scheduler, SmoothL1 loss, no gate,
+    no anti-collapse) while NILMFormer keeps its optimized settings.
 
     Priority: explicit args > baseline_configs.yaml > expes.yaml defaults.
     """
@@ -278,10 +265,6 @@ def _run_experiment(cmd, label, dry_run=False, log_dir=None):
         return False
 
 
-# ============================================================
-# Summary collection
-# ============================================================
-
 def _collect_summary(phase_name, results, log_dir=None):
     """Collect results from val_report.jsonl files and write summary CSV."""
     summary_path = ROOT_DIR / "result" / f"baseline_comparison_{phase_name}_summary.csv"
@@ -344,10 +327,6 @@ def _collect_summary(phase_name, results, log_dir=None):
     else:
         logger.info("No results found to summarize.")
 
-
-# ============================================================
-# Phase implementations
-# ============================================================
 
 def run_verify(dry_run=False, log_dir=None):
     """Quick 2-epoch compatibility check for all baselines using their own configs."""
@@ -551,10 +530,6 @@ def _print_summary(phase_name, results):
     logger.info("=" * 70)
 
 
-# ============================================================
-# Main
-# ============================================================
-
 PHASE_MAP = {
     "verify": run_verify,
     "1": run_table1,
@@ -568,7 +543,7 @@ PHASE_MAP = {
 def main():
     parser = argparse.ArgumentParser(
         description="Batch experiment runner for NILMFormer paper comparisons. "
-        "V9: Each model gets per-model training configs from baseline_configs.yaml."
+        "Each model gets per-model training configs from baseline_configs.yaml."
     )
     parser.add_argument(
         "--phase",

@@ -7,7 +7,6 @@ study_name = sys.argv[2] if len(sys.argv) > 2 else None
 
 storage = f"sqlite:///{db_path}"
 
-# List all studies in the DB
 summaries = optuna.study.get_all_study_summaries(storage=storage)
 for s in summaries:
     print(f"Study: {s.study_name}")

@@ -1,6 +1,7 @@
-"""Post-processing for threshold and gate suppression -- CondiNILM.
+"""Post-processing utilities for NILM prediction refinement.
 
-Author: Siyi Li
+Provides threshold-based suppression, gate-based suppression, gap filling,
+power clipping, and OFF-region diagnostic statistics.
 """
 
 import numpy as np
@@ -9,6 +10,16 @@ import torch.nn.functional as F
 
 
 def suppress_short_activations(pred_inv, threshold_small_values, min_on_steps):
+    """Zero out ON segments shorter than min_on_steps to remove spurious activations.
+
+    Args:
+        pred_inv: (B, C, T) prediction tensor in watts.
+        threshold_small_values: Power threshold defining ON state.
+        min_on_steps: Minimum contiguous ON length to keep.
+
+    Returns:
+        Tensor with short ON segments zeroed out.
+    """
     if min_on_steps <= 1:
         return pred_inv
     if pred_inv.dim() != 3:
@@ -32,6 +43,7 @@ def suppress_short_activations(pred_inv, threshold_small_values, min_on_steps):
 
 
 def _pad_same_1d(x, kernel_size):
+    """Apply replicate padding so that a 1D convolution/pool preserves temporal length."""
     k = int(kernel_size)
     if k <= 1:
         return x
@@ -44,6 +56,22 @@ def _pad_same_1d(x, kernel_size):
 
 
 def suppress_long_off_with_gate(pred_inv, gate_prob, kernel_size, gate_avg_thr, gate_max_thr):
+    """Zero predictions where a sliding-window gate probability is low.
+
+    Computes local average and max of gate_prob over a window of kernel_size.
+    Positions where both the local average < gate_avg_thr and local max < gate_max_thr
+    are zeroed in pred_inv.
+
+    Args:
+        pred_inv: (B, C, T) prediction tensor in watts.
+        gate_prob: (B, C, T) gate probability tensor (same shape as pred_inv).
+        kernel_size: Sliding window size for pooling.
+        gate_avg_thr: Threshold on local average gate probability.
+        gate_max_thr: Threshold on local max gate probability.
+
+    Returns:
+        Tensor with low-gate regions zeroed out.
+    """
     if pred_inv is None or gate_prob is None:
         return pred_inv
     if not torch.is_tensor(pred_inv) or not torch.is_tensor(gate_prob):
@@ -147,6 +175,22 @@ def clip_max_power(pred_inv, max_power_per_device):
 
 
 def _off_run_stats(target_np, pred_np, thr, min_len, pred_thr=None):
+    """Compute diagnostic statistics for predictions in target-OFF regions.
+
+    Returns aggregate and long-run (>= min_len contiguous steps) summaries
+    of prediction values where the target is below thr.
+
+    Args:
+        target_np: Target array (arbitrary shape, or (B, C, L) for run analysis).
+        pred_np: Prediction array (same shape as target_np).
+        thr: Target power threshold defining OFF state.
+        min_len: Minimum contiguous OFF length to count as a long run.
+        pred_thr: Optional prediction threshold for nonzero-rate computation.
+
+    Returns:
+        Dict with keys: off_pred_sum, off_pred_max, off_pred_nonzero_rate,
+        off_long_run_pred_sum, off_long_run_pred_max, off_long_run_total_len.
+    """
     off_mask = target_np <= float(thr)
     pred_off = pred_np[off_mask]
     if pred_thr is None:

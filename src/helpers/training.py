@@ -61,7 +61,6 @@ def get_model_instance(name_model, c_in, window_size, **kwargs):
 
 
 def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
-    # V7.5: Deterministic training for reproducibility
     seed = getattr(expes_config, "seed", 42)
     pl.seed_everything(seed, workers=True)
     expes_config.device = get_device()
@@ -115,7 +114,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             freq=expes_config.sampling_rate,
         )
 
-    default_loss_type = "multi_nilm"  # Use AdaptiveDeviceLoss by default
+    default_loss_type = "multi_nilm"
     loss_type = str(getattr(expes_config, "loss_type", default_loss_type))
 
     train_sampler = None
@@ -189,15 +188,13 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                         getattr(expes_config, "balance_window_target_on_frac", 0.5)
                     )
                     base_target_on_frac = min(max(base_target_on_frac, 0.05), 0.95)
-                    # V8: Reduced oversampling to prevent multi-task negative transfer
-                    # Previous 0.4/0.35/200x caused sparse devices to dominate training
                     sparse_target_boost = float(
                         getattr(expes_config, "balance_window_sparse_target_boost", 0.15)
                     )
                     sparse_duty_threshold = float(
                         getattr(expes_config, "balance_window_sparse_duty_threshold", 0.02)
                     )
-                    # NEW: Ultra-sparse threshold for duty < 1% (microwave, kettle)
+                    # Extra boost for devices with very low duty cycles
                     ultra_sparse_threshold = float(
                         getattr(expes_config, "balance_window_ultra_sparse_threshold", 0.01)
                     )
@@ -228,7 +225,6 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                                 "sparse_high_power",
                                 "sparse_medium_power",
                             ):
-                                # ULTRA-SPARSE: duty < 1% (microwave, kettle) gets maximum boost
                                 if duty_cycle < ultra_sparse_threshold:
                                     boost = sparse_target_boost + ultra_sparse_boost
                                     logging.debug(
@@ -253,7 +249,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                         weight_matrix[:, idx] = np.where(
                             on_per_device[:, idx] > 0.5, w_on, w_off
                         )
-                    # V8: Mean aggregation with 75th-percentile cap (was max → sparse dominated)
+                    # Aggregate per-device weights: cap at 75th percentile, then average
                     p75 = np.percentile(weight_matrix, 75, axis=1, keepdims=True)
                     weight_matrix_capped = np.minimum(weight_matrix, p75)
                     weights_np = weight_matrix_capped.mean(axis=1)
@@ -319,7 +315,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     html_callback = ValidationHTMLCallback(valid_loader, scaler, expes_config)
     callbacks = [metric_callback, html_callback]
 
-    # Add RobustLossEpochCallback for losses that need epoch updates (warmup scheduling)
+    # RobustLossEpochCallback updates loss warmup state at each epoch boundary
     loss_type_for_callback = str(getattr(expes_config, "loss_type", "")).lower()
     if loss_type_for_callback == "multi_nilm":
         callbacks.append(RobustLossEpochCallback())
@@ -349,8 +345,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         filename=ckpt_name + "_{epoch:03d}",
     )
     callbacks.append(checkpoint_callback)
-    # V13: Second checkpoint that tracks best F1 score (most important metric)
-    # val_loss_main may not correlate with F1 — save both to avoid losing best F1 model
+    # Separate checkpoint tracking best F1 (may diverge from best loss)
     f1_checkpoint_callback = pl.callbacks.ModelCheckpoint(
         monitor="val_F1",
         mode="max",
@@ -372,7 +367,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             warmup_type=getattr(expes_config, "warmup_type", "linear"),
         )
     else:
-        default_loss_type = "multi_nilm"  # Use AdaptiveDeviceLoss by default
+        default_loss_type = "multi_nilm"
         loss_type = str(getattr(expes_config, "loss_type", default_loss_type))
         threshold_loss_raw = float(
             getattr(expes_config, "loss_threshold", expes_config.threshold)
@@ -411,11 +406,6 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         except (ValueError, TypeError):
             threshold_loss = threshold_loss_raw
         if loss_type == "multi_nilm":
-            # AdaptiveDeviceLoss: Automatically adapts to each device's characteristics
-            # - Device type auto-classification (sparse, cycling, long_cycle, always_on)
-            # - Parameters derived from statistics, not manually tuned
-            # - Kendall uncertainty weighting for automatic device balancing
-            # - Device-specific loss strategies
             n_app = 1
             if scaler is not None:
                 try:
@@ -427,16 +417,13 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             if n_app > 1:
                 threshold_loss = 0.0
 
-            # Get device stats (support dict, DictConfig, and object access)
+            # Retrieve device_stats_for_loss from config (dict, DictConfig, or object)
             device_stats_cfg = None
             try:
-                # Try dict-like access first (works for dict and OmegaConf DictConfig)
                 if hasattr(expes_config, "get"):
                     device_stats_cfg = expes_config.get("device_stats_for_loss")
-                # Fallback to attribute access
                 if device_stats_cfg is None:
                     device_stats_cfg = getattr(expes_config, "device_stats_for_loss", None)
-                # Try direct indexing for DictConfig
                 if device_stats_cfg is None and hasattr(expes_config, "__getitem__"):
                     try:
                         device_stats_cfg = expes_config["device_stats_for_loss"]
@@ -485,10 +472,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             output_ratio = float(getattr(expes_config, "output_ratio", 1.0))
 
             config_overrides = {}
-            # V35f: Removed V10 caps. T5 baseline (F1=0.658, WM=0.257) used UNCAPPED values.
-            # V10's caps (recall→3.0, alpha→1.5) were added "for full data" but caused WM
-            # all-ON collapse in ALL subsequent experiments (V17-V35e, 25+ experiments).
-            # Restoring T5 behavior: pass raw config values as scaling factors.
+            # Pass config values as scaling factors for AdaptiveDeviceLoss
             lambda_energy = float(getattr(expes_config, "loss_lambda_energy", 1.0))
             if lambda_energy > 0.0:
                 config_overrides["energy_weight_scale"] = lambda_energy
@@ -540,37 +524,30 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         else:
             raise ValueError(f"Unsupported loss_type: {loss_type}")
 
-        # V35f: Removed multi_nilm penalty override. T5 baseline trained with penalties ACTIVE
-        # alongside multi_nilm loss. The override (added in V10) disabled all trainer penalties,
-        # but T5's WM stability depended on state_zero_penalty (kernel=32) and off_high_agg_penalty
-        # to prevent all-ON collapse. Removing this override restores T5 behavior.
-        if False:  # was: loss_type == "multi_nilm"
-            pass
-        else:
-            state_zero_penalty_weight = float(
-                getattr(expes_config, "state_zero_penalty_weight", 0.0)
-            )
-            zero_run_kernel = int(getattr(expes_config, "state_zero_kernel", 0))
-            zero_run_ratio = float(getattr(expes_config, "state_zero_ratio", 0.8))
-            off_high_agg_penalty_weight = float(
-                getattr(expes_config, "off_high_agg_penalty_weight", 0.0)
-            )
-            off_state_penalty_weight = float(
-                getattr(expes_config, "off_state_penalty_weight", 0.0)
-            )
-            off_state_margin = float(getattr(expes_config, "off_state_margin", 0.0))
-            off_state_long_penalty_weight = float(
-                getattr(expes_config, "off_state_long_penalty_weight", 0.0)
-            )
-            off_state_long_kernel = int(getattr(expes_config, "off_state_long_kernel", 0))
-            off_state_long_margin = float(
-                getattr(expes_config, "off_state_long_margin", off_state_margin)
-            )
+        # Trainer-level penalties (applied regardless of loss type)
+        state_zero_penalty_weight = float(
+            getattr(expes_config, "state_zero_penalty_weight", 0.0)
+        )
+        zero_run_kernel = int(getattr(expes_config, "state_zero_kernel", 0))
+        zero_run_ratio = float(getattr(expes_config, "state_zero_ratio", 0.8))
+        off_high_agg_penalty_weight = float(
+            getattr(expes_config, "off_high_agg_penalty_weight", 0.0)
+        )
+        off_state_penalty_weight = float(
+            getattr(expes_config, "off_state_penalty_weight", 0.0)
+        )
+        off_state_margin = float(getattr(expes_config, "off_state_margin", 0.0))
+        off_state_long_penalty_weight = float(
+            getattr(expes_config, "off_state_long_penalty_weight", 0.0)
+        )
+        off_state_long_kernel = int(getattr(expes_config, "off_state_long_kernel", 0))
+        off_state_long_margin = float(
+            getattr(expes_config, "off_state_long_margin", off_state_margin)
+        )
 
-        # Configure sparse device CNN bypass for NILMFormer
+        # Enable CNN bypass for sparse devices in NILMFormer
         if expes_config.name_model == "NILMFormer" and hasattr(inst_model, "set_sparse_device_indices"):
             try:
-                # Extract device names from device_stats
                 device_names_for_sparse = []
                 if device_stats:
                     for ds in device_stats:
@@ -628,8 +605,6 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             ),
             gate_focal_gamma=float(getattr(expes_config, "gate_focal_gamma", 2.0)),
             gate_soft_scale=float(getattr(expes_config, "gate_soft_scale", 1.0)),
-            # FIXED: Reduced gate_floor from 0.2 to 0.02 to prevent floor noise in OFF state
-            # High gate_floor caused significant floor noise (tens of watts) when devices should be OFF
             gate_floor=float(getattr(expes_config, "gate_floor", 0.02)),
             gate_duty_weight=float(getattr(expes_config, "gate_duty_weight", 0.0)),
             train_crop_len=int(getattr(expes_config, "train_crop_len", 0) or 0),
@@ -647,7 +622,6 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         use_gcr = bool(getattr(expes_config, "use_gradient_conflict_resolution", False))
         n_devices_for_gcr = getattr(criterion, "n_devices", 1) if criterion is not None else 1
         if use_gcr and n_devices_for_gcr > 1:
-            # Get balance method - default to "soft" for better stability
             balance_method = str(getattr(expes_config, "gradient_conflict_balance_method", "soft"))
             balance_max_ratio = float(getattr(expes_config, "gradient_conflict_balance_max_ratio", 3.0))
             randomize_order = bool(getattr(expes_config, "gradient_conflict_randomize_order", True))
@@ -673,8 +647,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         elif use_gcr and n_devices_for_gcr <= 1:
             logging.info("[PCGRAD] Disabled: single-device training does not need gradient conflict resolution")
 
-        # Configure gradient isolation for multi-device training
-        # This completely separates device heads so gradients don't interfere
+        # Gradient isolation: separate device heads so gradients do not interfere
         use_isolation = bool(getattr(expes_config, "use_gradient_isolation", False))
         if use_isolation and n_devices_for_gcr > 1:
             backbone_training = str(getattr(expes_config, "gradient_isolation_backbone", "frozen"))
@@ -694,19 +667,15 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         elif use_isolation and n_devices_for_gcr <= 1:
             logging.info("[ISOLATION] Disabled: single-device training does not need gradient isolation")
 
-    # ============== Two-Stage Training Support ==============
-    # Stage 1: Pretrain sparse devices (Kettle, Microwave) alone
-    # Stage 2: Load pretrained weights and freeze sparse devices, train frequent devices
+    # Two-stage training: optionally load pretrained weights and freeze selected devices
     load_pretrained_path = getattr(expes_config, "load_pretrained", None)
     freeze_devices_str = getattr(expes_config, "freeze_devices", None)
 
     if load_pretrained_path and os.path.isfile(load_pretrained_path):
-        # Load pretrained weights (only model weights, not optimizer state)
         logging.info("[TWO-STAGE] Loading pretrained weights from: %s", load_pretrained_path)
         try:
             checkpoint = torch.load(load_pretrained_path, map_location="cpu")
             state_dict = checkpoint.get("state_dict", checkpoint)
-            # Filter out incompatible keys if any
             model_state = lightning_module.state_dict()
             filtered_state = {k: v for k, v in state_dict.items() if k in model_state and v.shape == model_state[k].shape}
             missing_keys = set(model_state.keys()) - set(filtered_state.keys())
@@ -759,9 +728,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
     elif accelerator == "gpu":
         device_type = str(getattr(expes_config, "device_type", "") or "")
         appliance_name = str(getattr(expes_config, "appliance", "") or "")
-        # V9: Enable mixed precision for RTX 5090 (32GB VRAM, bf16 native)
-        # Previous force_fp32=True was overly conservative.
-        # bf16-mixed is safe on Ampere+ GPUs and gives ~2x throughput.
+        # Use bf16 if supported, otherwise fp16 mixed precision
         if hasattr(torch.cuda, "is_bf16_supported") and torch.cuda.is_bf16_supported():
             precision = "bf16-mixed"
         else:
@@ -796,10 +763,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
                 "Resume flag is set but no last checkpoint found at %s, train from scratch.",
                 ckpt_last_candidates[0],
             )
-    # Enable gradient clipping to prevent gradient explosion with mixed precision
-    # NOTE: Disable gradient clipping when using PCGrad (manual optimization)
-    # because PyTorch Lightning doesn't support auto gradient clipping with manual optimization.
-    # PCGrad normalizes gradients anyway, so clipping is less critical.
+    # Disable gradient clipping under PCGrad (manual optimization mode)
     use_pcgrad = getattr(lightning_module, "_use_gradient_conflict_resolution", False)
     gradient_clip_val = None if use_pcgrad else 1.0
     if use_pcgrad:
@@ -842,7 +806,6 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         limit_train_batches = 1.0
     if limit_val_batches <= 0:
         limit_val_batches = 1.0
-    # V12: Validate every 2 epochs to reduce overhead (callbacks do full forward + postprocess)
     check_val_n = int(getattr(expes_config, "check_val_every_n_epoch", 1))
     trainer_kwargs = dict(
         max_epochs=max_epochs,
@@ -858,7 +821,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         limit_train_batches=limit_train_batches,
         limit_val_batches=limit_val_batches,
         check_val_every_n_epoch=check_val_n,
-        # deterministic=True causes cascade collapse via AdaptiveTuner
+        # deterministic=True is incompatible with AdaptiveTuner
     )
     trainer = pl.Trainer(**trainer_kwargs)
     if ckpt_path_resume is not None:
@@ -876,7 +839,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
             train_dataloaders=train_loader,
             val_dataloaders=valid_loader,
         )
-    # V13: Prefer F1-best checkpoint over loss-best for final evaluation
+    # Prefer F1-best checkpoint over loss-best for final evaluation
     best_f1_path = getattr(f1_checkpoint_callback, "best_model_path", None)
     best_loss_path = getattr(checkpoint_callback, "best_model_path", None)
     best_model_path = best_f1_path if best_f1_path else best_loss_path
@@ -902,7 +865,7 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         logging.info("Eval model...")
         logging.info("Eval valid split metrics...")
         min_on_steps = int(getattr(expes_config, "postprocess_min_on_steps", 0))
-        # V7.5: Pass criterion with learned per-device gate params for eval consistency
+        # Pass criterion so evaluation uses the same learned gate parameters
         _eval_criterion = getattr(lightning_module, "criterion", None)
         evaluate_nilm_split(
             inst_model,
@@ -999,7 +962,6 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         group_dir = os.path.join(group_dir, str(appliance_name))
     html_path = os.path.join(group_dir, "val_compare.html")
 
-    # V9: Save training curves after training completes
     _save_training_curves(trainer, expes_config)
 
     f1_best_score = getattr(f1_checkpoint_callback, "best_model_score", None)
@@ -1017,7 +979,6 @@ def nilm_model_training(inst_model, tuple_data, scaler, expes_config):
         "test_timestamp": eval_log.get("test_metrics_timestamp", {}),
         "test_win": eval_log.get("test_metrics_win", {}),
     }
-    # Log final eval results as JSON for easy parsing
     import json as _json
     class _NumpyEncoder(_json.JSONEncoder):
         def default(self, obj):
@@ -1251,7 +1212,7 @@ def _save_experiment_config(expes_config):
 
 
 def _save_training_curves(trainer, expes_config):
-    """Save per-epoch training curves (from TensorBoard logged metrics) as JSON."""
+    """Save per-epoch training curves from ValidationNILMMetricCallback as JSON."""
     try:
         result_root = os.path.dirname(
             os.path.dirname(os.path.dirname(expes_config.result_path))
@@ -1267,7 +1228,7 @@ def _save_training_curves(trainer, expes_config):
         os.makedirs(group_dir, exist_ok=True)
         curves_path = os.path.join(group_dir, "training_curves.json")
 
-        # Extract logged metrics from trainer callback_metrics history
+        # Extract per-epoch records from ValidationNILMMetricCallback
         curves = {"epochs": [], "train_loss": [], "val_loss": [], "val_F1": []}
         for cb in trainer.callbacks:
             if isinstance(cb, ValidationNILMMetricCallback) and hasattr(cb, "epoch_records"):
@@ -1292,10 +1253,9 @@ def launch_models_training(data_tuple, scaler, expes_config):
     if "threshold" in expes_config.model_kwargs:
         expes_config.model_kwargs.threshold = expes_config.threshold
 
-    # V9: Save experiment config snapshot before training
     _save_experiment_config(expes_config)
 
-    # Sync model output channels with number of appliances from scaler
+    # Set model output channels to match the number of appliances
     if scaler is not None:
         try:
             n_app = int(getattr(scaler, "n_appliance", 1) or 1)
@@ -1304,9 +1264,7 @@ def launch_models_training(data_tuple, scaler, expes_config):
         if n_app < 1:
             n_app = 1
 
-        # Map c_out to the correct model-specific parameter name
-        # CNN1D/UNET_NILM use "num_classes", BiGRU uses "out_channels",
-        # BERT4NILM/Energformer/STNILM/NILMFormer use "c_out"
+        # Model-specific output channel parameter names (default: "c_out")
         _OUTPUT_PARAM_MAP = {
             "CNN1D": "num_classes",
             "UNET_NILM": "num_classes",
