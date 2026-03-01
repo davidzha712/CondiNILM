@@ -28,36 +28,7 @@ from src.helpers.callbacks import (
     RobustLossEpochCallback,
     ValidationNILMMetricCallback,
 )
-
-
-def _coerce_appliance_names(expes_config, n_app, fallback_name=None):
-    from src.helpers.experiment import _coerce_appliance_names as _impl
-    return _impl(expes_config, n_app, fallback_name)
-
-
-def get_device():
-    from src.helpers.experiment import get_device as _impl
-    return _impl()
-
-
-def _get_num_workers(num_workers):
-    from src.helpers.experiment import _get_num_workers as _impl
-    return _impl(num_workers)
-
-
-def _set_default_thread_env():
-    from src.helpers.experiment import _set_default_thread_env as _impl
-    return _impl()
-
-
-def _dataloader_worker_init(worker_id):
-    from src.helpers.experiment import _dataloader_worker_init as _impl
-    return _impl(worker_id)
-
-
-def get_model_instance(name_model, c_in, window_size, **kwargs):
-    from src.helpers.experiment import get_model_instance as _impl
-    return _impl(name_model, c_in, window_size, **kwargs)
+from src.helpers.experiment import get_device
 
 
 def nilm_model_training(inst_model, tuple_data, scaler, expes_config):

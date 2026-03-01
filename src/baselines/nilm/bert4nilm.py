@@ -15,7 +15,6 @@ import torch.nn.functional as F
 import numpy as np
 
 from torch import nn
-from torch.autograd import Variable
 
 
 class GELU(nn.Module):
